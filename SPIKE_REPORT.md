@@ -230,3 +230,98 @@ Scope (rough):
 ---
 
 *All artifacts: this report. No source code modified. Branch: `spike/cross-platform-compile`. Logs in `/tmp/spike-logs/` (host-local, not committed).*
+
+---
+
+## 2026-05-15 Follow-up: iOS compile pass with Xcode SDK available
+
+(Operator note: gudnuf set up an Xcode 26.2.0 environment so the prior `BLOCKED (env)` iOS rows could be exercised. WASM out of scope per operator direction.)
+
+### Xcode environment
+
+Full Xcode installed at `/Applications/Xcode-26.2.0.app`. However, `xcode-select -p` returns the nix-managed `apple-sdk-14.4` and the shell's `xcrun` is a nix shim (`xcbuild-0.1.1`) that only knows that one SDK. Builds therefore need both `DEVELOPER_DIR` and `PATH` overrides:
+
+```
+DEVELOPER_DIR=/Applications/Xcode-26.2.0.app/Contents/Developer
+PATH=/Users/claude/.cargo/bin:/usr/bin:$PATH    # /usr/bin/xcrun ahead of the nix shim
+```
+
+With that in place, `/usr/bin/xcrun --sdk iphoneos --show-sdk-path` resolves to:
+
+```
+/Applications/Xcode-26.2.0.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.2.sdk
+/Applications/Xcode-26.2.0.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator26.2.sdk
+```
+
+SDK versions: **iPhoneOS 26.2** and **iPhoneSimulator 26.2** (both `26.2`, Xcode 26.2.0). Rust toolchain `1.86.0` (workspace pin). `rustup target add aarch64-apple-ios aarch64-apple-ios-sim` was a no-op — both targets already installed.
+
+### Updated compile matrix (iOS only)
+
+`cargo build` (not `check`) was used so `ring`/`aws-lc-sys` build scripts actually fired and produced object files.
+
+| Crate | aarch64-apple-ios | aarch64-apple-ios-sim |
+|-------|-------------------|------------------------|
+| agicash-domain | OK (14.20s clean / 0.18s warm) | OK (4.72s) |
+| agicash-money | OK (3.05s) | OK (2.55s) |
+| agicash-crypto | OK (13.07s) | OK (1.15s) |
+| agicash-traits | OK (10.15s) | OK (4.05s) |
+| agicash-cache | OK | OK |
+| agicash-cashu | OK | OK |
+| agicash-spark | OK | OK |
+| agicash-services | OK (2.22s) | OK (1.82s) |
+| agicash-wallet | OK | OK |
+| agicash-auth-opensecret | OK (36.82s) | OK (34.59s) |
+| agicash-storage-supabase | OK (10.68s) | OK (11.52s) |
+| agicash-testing | OK | OK |
+| agicash-cli | OK (12.65s) | OK (11.67s) |
+
+Plus `cargo build --workspace --exclude agicash-wasm` for both targets: **OK**. Every non-wasm crate in the workspace compiles cleanly to both iOS device and iOS simulator.
+
+### Detailed failure modes
+
+None. There are no failures in this pass.
+
+Two **surprises** worth flagging:
+
+1. **`keyring 3.6.3` + `security-framework 2.11.1` compile cleanly for iOS.** The prior spike predicted `keyring` would block iOS — that prediction was wrong. The `apple-native` feature on `keyring` 3.x gates `security-framework` for both macOS and iOS via the same `cfg(any(target_os = "macos", target_os = "ios"))` paths in `security-framework-sys`. The slice plan's proposed `agicash-storage-keyring` extract (an iOS-incompatible carve-out) does not appear necessary for compile reasons. `keyring` is consumed only by `agicash-auth-opensecret` (`storage.rs`, for session persistence) — `agicash-cli` does **not** depend on `keyring` directly.
+
+2. **`rustls-native-certs 0.6.3` will compile but malfunction at runtime on iOS.** Source inspection (`~/.cargo/registry/src/.../rustls-native-certs-0.6.3/src/lib.rs`) shows only three cfg branches: `target_os = "macos"`, `windows`, and `all(unix, not(target_os = "macos"))`. iOS is `target_os = "ios"`, so it falls into the unix branch (`src/unix.rs`), which calls `openssl_probe::probe()` and reads `/etc/ssl/cert.pem`-style files. iOS sandboxed apps don't have those files; `openssl_probe` returns `None`; `load_native_certs()` returns `Ok(Vec::new())`. **Result: empty trust store → every TLS handshake fails at runtime.** This only matters for `agicash-storage-supabase` (via the postgrest fork's `rustls-tls-native-roots` feature). `agicash-auth-opensecret` is fine because the opensecret fork uses `rustls-tls` (bundled webpki roots), not native roots.
+
+### Architectural inferences
+
+1. **Pure-Rust core compiles to iOS today**: confirmed. `agicash-domain`, `agicash-money`, `agicash-traits`, `agicash-crypto`, `agicash-cache`, plus the pure orchestration crates (`agicash-services`, `agicash-wallet`, `agicash-cashu`, `agicash-spark`).
+
+2. **`agicash-auth-opensecret` on iOS — does it actually work?** Compile: yes. Dep tree resolves cleanly through `ring 0.17`, `reqwest 0.12`, `hyper-rustls 0.27`, `tokio-rustls 0.26`, `opensecret 3.1.1`, `x509-parser 0.16`, `p256 0.13`, `ecdsa 0.16`, `bip39 2.2`, `chacha20poly1305`-family, **and** `keyring 3.6.3` → `security-framework 2.11.1`. The opensecret fork's `rustls-tls` feature uses bundled webpki roots, which work on iOS without an OS trust store. **STATE.md's prediction was correct** — this is the most important confirmation from this pass.
+
+3. **`agicash-storage-supabase` on iOS — compile yes, runtime no.** The postgrest fork's `rustls-tls-native-roots` pulls `rustls-native-certs 0.6.3`, which has no iOS branch and falls into the unix branch, which returns an empty trust store on iOS. Three fix options ranked by cost: (a) upgrade `rustls-native-certs` to `0.7+` which has a proper `target_vendor = "apple"` branch using `SecTrustCopyAnchorCertificates`; (b) switch the postgrest fork's feature set to `rustls-tls` (webpki roots) — same as opensecret, drops the mkcert-local-CA support; (c) layer reqwest's `rustls-tls-webpki-roots` for production and conditionally enable native-roots only on the host doing local dev. Option (a) is the cleanest and is also a generic upgrade.
+
+4. **`agicash-cli` on iOS — what breaks?** Nothing, at compile time. The prior spike predicted `keyring`-blocks-cli; that's wrong twice over: (i) cli doesn't depend on keyring directly, (ii) keyring compiles to iOS anyway. The cli binary's runtime usefulness on iOS is a different question (an iOS app is not a TTY, `rpassword`/`dotenvy`/`clap` console paths don't reach a user, the `[[bin]]` artifact isn't packaged as an `.app`), but **compile success here means cli-shared logic could be reused inside an iOS app target without code surgery**. Whatever pattern eventually owns iOS-side credential UX won't have to fork the workspace.
+
+5. **What's the minimum surface that compiles to iOS today?** Everything in the workspace except `agicash-wasm` (excluded). The compile boundary is wider than the prior spike claimed. The **runtime** boundary is narrower: `agicash-storage-supabase` over real Supabase will fail until the rustls-native-certs issue is addressed (see #3); `agicash-auth-opensecret` should run end-to-end against an opensecret endpoint that uses a publicly-rooted cert (webpki).
+
+### What this means for the slice plan
+
+- **The architecture is viable for iOS today.** An iOS app target can link against `agicash-domain` + `agicash-money` + `agicash-traits` + `agicash-crypto` + `agicash-services` + `agicash-wallet` + `agicash-auth-opensecret` and have a working auth+wallet core today, with one caveat:
+  - **Don't ship `agicash-storage-supabase` to iOS as-is.** It will compile and silently fail TLS. Either bump `rustls-native-certs` to `>=0.7` (preferred) or switch to webpki roots in the postgrest fork before declaring "iOS-ready". This is a one-PR fix, not an architectural redesign.
+
+- **No need for a separate `agicash-storage-keyring` carve-out for iOS-compat reasons.** `keyring 3.6.3` is iOS-compatible. The crate could still be useful as a service boundary, but the *iOS incompatibility* rationale evaporates. The slice plan should drop that justification (other rationales like testability may still apply).
+
+- **The `agicash-cli` crate is not an obstacle.** It compiles to iOS targets clean; it just won't behave meaningfully there because of the TTY/console model. Treat it as "compiles, doesn't ship" — same status as a development-only test binary.
+
+- **`agicash-wasm` remains the only known incompatible target**, per the prior spike. Out of scope here.
+
+- **For CI**: add `aarch64-apple-ios` + `aarch64-apple-ios-sim` to the workspace build matrix on `macos-latest` runners. The build is fast once `ring` is cached — full workspace cold-compile takes ~70s wall-clock per target. No `Cargo.toml` changes required.
+
+### Verbatim build invocation (for reproducibility)
+
+```
+cd /Users/claude/agicash/.claude/worktrees/rust-spike-crossplatform/crates
+PATH=/Users/claude/.cargo/bin:/usr/bin:$PATH \
+  DEVELOPER_DIR=/Applications/Xcode-26.2.0.app/Contents/Developer \
+  cargo build --workspace --exclude agicash-wasm --target aarch64-apple-ios
+PATH=/Users/claude/.cargo/bin:/usr/bin:$PATH \
+  DEVELOPER_DIR=/Applications/Xcode-26.2.0.app/Contents/Developer \
+  cargo build --workspace --exclude agicash-wasm --target aarch64-apple-ios-sim
+```
+
+Per-crate logs: `/tmp/ios-<crate>.log`, `/tmp/ios-sim-<crate>.log` (host-local, not committed).
