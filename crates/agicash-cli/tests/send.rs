@@ -184,7 +184,7 @@ mod gated {
         let receive = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &sender_service)
-            .args(["receive", &deposit_token])
+            .args(["receive", "token", &deposit_token])
             .output()
             .expect("spawn agicash receive (deposit)");
         if !receive.status.success() {
@@ -237,7 +237,7 @@ mod gated {
         let receive2 = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &receiver_service)
-            .args(["receive", &token])
+            .args(["receive", "token", &token])
             .output()
             .expect("spawn agicash receive (redeem)");
         cleanup(&receiver_service);
@@ -319,7 +319,7 @@ mod gated {
         let receive = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &service)
-            .args(["receive", &deposit_token])
+            .args(["receive", "token", &deposit_token])
             .output()
             .expect("spawn agicash receive");
         if !receive.status.success() {

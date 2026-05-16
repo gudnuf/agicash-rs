@@ -41,9 +41,18 @@ mod gated {
                 || std::env::var("VITE_SUPABASE_ANON_KEY").is_ok())
     }
 
+    /// Compute the input fee (in the keyset's unit) that a swap-style
+    /// operation would incur when consuming `n_inputs` proofs from a
+    /// keyset whose `input_fee_ppk` is `ppk`.
+    ///
+    /// Matches CDK's per-input-fee formula: `ceil(n_inputs * ppk / 1000)`.
+    fn compute_input_fee(n_inputs: u64, ppk: u64) -> u64 {
+        (n_inputs * ppk).div_ceil(1000)
+    }
+
     async fn mint_test_token_via_testnut(
         amount: u64,
-    ) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    ) -> Result<(String, u64, u64), Box<dyn std::error::Error>> {
         let mint_url = MintUrl::from_str(TEST_MINT_URL)?;
         let client = HttpClient::new(mint_url.clone(), None);
 
@@ -121,13 +130,15 @@ mod gated {
             &keyset.keys,
         )?;
 
+        let n_inputs = proofs.len() as u64;
         let token = Token::new(
             mint_url.clone(),
             proofs,
             Some("agicash test".into()),
             CurrencyUnit::Sat,
         );
-        Ok((token.to_string(), amount))
+        let expected_after_fee = amount - compute_input_fee(n_inputs, active.input_fee_ppk);
+        Ok((token.to_string(), amount, expected_after_fee))
     }
 
     /// `auth guest` -> `mint add testnut` -> mint a test token -> `receive`
@@ -143,7 +154,7 @@ mod gated {
         let service = format!("com.agicash.cli.test.{pid}.receive-success");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (token, expected_amount) = runtime
+        let (token, _minted_amount, expected_amount) = runtime
             .block_on(mint_test_token_via_testnut(64))
             .expect("mint test token");
         drop(runtime);
@@ -187,7 +198,7 @@ mod gated {
         let receive = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &service)
-            .args(["receive", &token])
+            .args(["receive", "token", &token])
             .output()
             .expect("spawn agicash receive");
         if !receive.status.success() {
@@ -225,7 +236,7 @@ mod gated {
         let second = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &service)
-            .args(["receive", &token])
+            .args(["receive", "token", &token])
             .output()
             .expect("spawn agicash receive (second)");
         cleanup(&service);
@@ -261,7 +272,7 @@ mod gated {
         let service = format!("com.agicash.cli.test.{pid}.receive-unknown-mint");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (token, _) = runtime
+        let (token, _minted_amount, _expected_after_fee) = runtime
             .block_on(mint_test_token_via_testnut(32))
             .expect("mint test token");
         drop(runtime);
@@ -278,7 +289,7 @@ mod gated {
         let receive = Command::cargo_bin("agicash")
             .unwrap()
             .env("AGICASH_KEYRING_SERVICE", &service)
-            .args(["receive", &token])
+            .args(["receive", "token", &token])
             .output()
             .expect("spawn agicash receive");
 
