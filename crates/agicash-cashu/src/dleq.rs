@@ -31,7 +31,7 @@
 //!    DLEQ is invalid are rejected.
 
 use cdk::nuts::nut12::Error as Nut12Error;
-use cdk::nuts::{BlindSignature, BlindedMessage, KeySet, Proof};
+use cdk::nuts::{BlindSignature, BlindedMessage, KeySet, PreMint, PreMintSecrets, Proof};
 
 /// Why verification failed.
 ///
@@ -72,6 +72,26 @@ pub enum DleqVerificationError {
     /// partial batch.
     #[error("signature/message count mismatch: {sigs} sigs vs {msgs} messages")]
     CountMismatch { sigs: usize, msgs: usize },
+
+    /// Trial-matching ([`match_blind_signatures_to_pre_mints`]) hit a
+    /// signature that carries no DLEQ. NUT-12 is the only mechanism by
+    /// which the change path can disambiguate sigs from blanks when the
+    /// mint returns them in non-deterministic order; without a DLEQ we
+    /// cannot safely pair, so the matcher fails closed. Mirrors the TS
+    /// reference's `'Cannot match blind signatures without DLEQ proofs
+    /// (NUT-12)'` exception
+    /// (`app/lib/cashu/blind-signature-matching.ts:34-38`).
+    #[error("change signature missing DLEQ — mint does not advertise NUT-12 on the change path (amount {amount})")]
+    ChangeSigMissingDleq { amount: u64 },
+
+    /// A returned `BlindSignature` could not be paired with any
+    /// still-unmatched `PreMint` via trial DLEQ verification. Mint
+    /// returned a signature we never asked for, or every candidate
+    /// blank's DLEQ check failed. Mirrors the TS reference's `'No
+    /// matching OutputData found for blind signature'` exception
+    /// (`app/lib/cashu/blind-signature-matching.ts:73-77`).
+    #[error("no matching blank found for change signature (amount {amount})")]
+    NoMatchingBlank { amount: u64 },
 }
 
 /// Verify every blind signature returned by the mint against the matching
@@ -138,6 +158,139 @@ pub fn verify_proof_dleq(proof: &Proof, keyset: &KeySet) -> Result<(), DleqVerif
     proof
         .verify_dleq(mint_pubkey)
         .map_err(|source| DleqVerificationError::ProofInvalid { source })
+}
+
+/// Outcome of [`match_blind_signatures_to_pre_mints`]: signatures paired
+/// with the `PreMint` that produced their matching blinded message,
+/// reordered into matched order so the caller can feed parallel
+/// `(promises, rs, secrets)` triples into [`cdk::dhke::construct_proofs`]
+/// without further bookkeeping.
+///
+/// Unmatched `PreMint`s (when the mint returned fewer change sigs than
+/// we sent blanks) are dropped — NUT-08 permits the mint to skip
+/// change, and the unclaimed counter slots are simply burned (this
+/// mirrors the TS reference behavior; see audit DELTA 1 background).
+#[derive(Debug, Clone)]
+pub struct MatchedChange {
+    /// Mint-returned signatures, reordered to match the position of
+    /// their paired `PreMint` in `pre_mints`.
+    pub signatures: Vec<BlindSignature>,
+    /// `PreMint`s for which a signature was matched, in the same order
+    /// as `signatures`.
+    pub pre_mints: Vec<PreMint>,
+}
+
+impl MatchedChange {
+    /// Convenience: parallel `Vec<SecretKey>` of blinding factors,
+    /// suitable for the `rs` argument of
+    /// [`cdk::dhke::construct_proofs`].
+    pub fn rs(&self) -> Vec<cdk::nuts::SecretKey> {
+        self.pre_mints.iter().map(|pm| pm.r.clone()).collect()
+    }
+
+    /// Convenience: parallel `Vec<Secret>` suitable for the `secrets`
+    /// argument of [`cdk::dhke::construct_proofs`].
+    pub fn secrets(&self) -> Vec<cdk::secret::Secret> {
+        self.pre_mints.iter().map(|pm| pm.secret.clone()).collect()
+    }
+}
+
+/// Trial-match a batch of mint-returned `BlindSignature`s against the
+/// `PreMintSecrets` blanks we sent, pairing by DLEQ verification rather
+/// than positional order.
+///
+/// Ported from TypeScript `matchBlindSignaturesToOutputData`
+/// (`app/lib/cashu/blind-signature-matching.ts:23-89`). The TS reference
+/// exists because both CDK and Nutshell read change rows from SQL without
+/// `ORDER BY`, so the wire order is non-deterministic (see
+/// <https://github.com/cashubtc/cashu-ts/issues/287>). Trial DLEQ-matching
+/// is the only mechanism that survives reordering.
+///
+/// Algorithm:
+///
+/// 1. For each incoming signature, fail closed if it lacks a DLEQ
+///    ([`DleqVerificationError::ChangeSigMissingDleq`]). NUT-12 is the
+///    pairing mechanism; without it we cannot safely match.
+/// 2. Iterate the still-unmatched `PreMint`s and run
+///    [`BlindSignature::verify_dleq`] against each blank's
+///    `blinded_message`. The first one that verifies wins; that index
+///    leaves the unmatched set.
+/// 3. If no candidate verifies, fail with
+///    [`DleqVerificationError::NoMatchingBlank`].
+///
+/// Note we use `verify_dleq` directly against the stored
+/// `blinded_message` rather than the TS reblind step — the TS impl
+/// derives B' from `(secret, r)` because its `OutputData` type doesn't
+/// carry B' independently. Rust's `PreMint` already holds the blinded
+/// message, so the same cryptographic test reduces to one `verify_dleq`
+/// call per candidate.
+///
+/// On success returns [`MatchedChange`] with `signatures.len() ==
+/// pre_mints.len() == signatures_input.len()` — unmatched blanks are
+/// silently dropped (the mint chose not to claim them).
+pub fn match_blind_signatures_to_pre_mints(
+    signatures: &[BlindSignature],
+    pre_mints: &PreMintSecrets,
+    keyset: &KeySet,
+) -> Result<MatchedChange, DleqVerificationError> {
+    use std::collections::BTreeSet;
+
+    let mut unmatched: BTreeSet<usize> = (0..pre_mints.len()).collect();
+    let mut matched_sigs: Vec<BlindSignature> = Vec::with_capacity(signatures.len());
+    let mut matched_pms: Vec<PreMint> = Vec::with_capacity(signatures.len());
+
+    for sig in signatures {
+        let amount = u64::from(sig.amount);
+
+        // Fail closed: change-path matching needs DLEQ.
+        if sig.dleq.is_none() {
+            return Err(DleqVerificationError::ChangeSigMissingDleq { amount });
+        }
+
+        // Per-amount mint pubkey for the trial-verify.
+        let mint_pubkey = keyset.keys.amount_key(sig.amount).ok_or_else(|| {
+            DleqVerificationError::NoKeyForAmount {
+                amount,
+                keyset_id: keyset.id.to_string(),
+            }
+        })?;
+
+        // Trial-verify the DLEQ against each still-unmatched blank.
+        // First match wins.
+        let mut matched_index: Option<usize> = None;
+        for &i in &unmatched {
+            let pm = &pre_mints.secrets[i];
+            if sig
+                .verify_dleq(mint_pubkey, pm.blinded_message.blinded_secret)
+                .is_ok()
+            {
+                matched_index = Some(i);
+                break;
+            }
+        }
+
+        let Some(i) = matched_index else {
+            return Err(DleqVerificationError::NoMatchingBlank { amount });
+        };
+
+        unmatched.remove(&i);
+        matched_sigs.push(sig.clone());
+        matched_pms.push(pre_mints.secrets[i].clone());
+    }
+
+    Ok(MatchedChange {
+        signatures: matched_sigs,
+        pre_mints: matched_pms,
+    })
+}
+
+/// Serialize a [`cdk::nuts::nut12::ProofDleq`] to the opaque
+/// `Option<serde_json::Value>` shape used by `TokenProof.dleq` on the
+/// wire. Returns `None` when the input is `None`. Mirrors the helper
+/// in `receive_swap::service` (kept here so both the receive and melt
+/// paths can preserve inline DLEQs without duplicating it again).
+pub fn dleq_to_json(dleq: Option<&cdk::nuts::nut12::ProofDleq>) -> Option<serde_json::Value> {
+    dleq.and_then(|d| serde_json::to_value(d).ok())
 }
 
 #[cfg(test)]
