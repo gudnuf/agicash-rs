@@ -4,6 +4,23 @@
   # https://devenv.sh/basics/
   env.GREET = "devenv";
 
+  # WASM cross-compile prereqs.
+  #
+  # `secp256k1-sys` and `ring` (transitive deps of cdk + opensecret) compile
+  # C sources for the wasm32-unknown-unknown target. Apple's system clang
+  # does NOT support wasm32, so without a wasm-capable clang on the
+  # appropriate CC env var, `cargo check --target wasm32-unknown-unknown`
+  # fails with "unknown target triple: wasm32-unknown-unknown".
+  #
+  # We point cc-rs at nix's clang_21 + llvm-ar via the well-known per-target
+  # env vars. The rust target itself is declared in `crates/rust-toolchain.toml`
+  # (rustup auto-installs `wasm32-unknown-unknown` when first invoked).
+  #
+  # See: /Users/claude/opensecret-sdk-fork wasm-compat work + the CDK wasm
+  # audit doc (2026-05-15) for the full backstory.
+  env.CC_wasm32_unknown_unknown = "${pkgs.clang_21}/bin/clang";
+  env.AR_wasm32_unknown_unknown = "${pkgs.llvm_21}/bin/llvm-ar";
+
   # https://devenv.sh/packages/
   packages = [
     pkgs.git
@@ -13,6 +30,9 @@
     pkgs.mkcert
     pkgs.nss.tools
     pkgs.gh
+    # wasm cross-compile toolchain (see CC_wasm32_unknown_unknown above).
+    pkgs.clang_21
+    pkgs.llvm_21
     (pkgs.callPackage ./tools/convert-to-webp {})
   ];
 
