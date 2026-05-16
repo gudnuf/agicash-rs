@@ -16,6 +16,8 @@ members = [
     "agicash-testing",
     "agicash-cli",
     "agicash-wasm",
+    "spike-typesafe-supabase",
+    "spike-typesafe-supabase/codegen",
 ]
 
 [workspace.package]

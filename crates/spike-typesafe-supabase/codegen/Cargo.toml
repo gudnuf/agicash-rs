@@ -1,0 +1,25 @@
+[package]
+name = "spike-typesafe-supabase-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Codegen tool. Reads migrations into a temp Postgres (we expect it pre-seeded
+# by `supabase start`), introspects information_schema + pg_catalog, and emits
+# a generated.rs that the spike-typesafe-supabase crate exposes via include!.
+#
+# Run with:
+#   cargo run -p spike-typesafe-supabase-codegen -- \
+#     --database-url postgres://postgres:postgres@127.0.0.1:54322/postgres \
+#     --schema wallet \
+#     --out crates/spike-typesafe-supabase/src/generated.rs
+
+[dependencies]
+postgres = { version = "0.19", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+clap = { workspace = true }
+anyhow = "1"
+heck = "0.5"
+indoc = "2"

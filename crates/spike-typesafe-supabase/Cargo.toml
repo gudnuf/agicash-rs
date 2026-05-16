@@ -1,0 +1,27 @@
+[package]
+name = "spike-typesafe-supabase"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Spike crate. Demonstrates a custom-codegen path to compile-time typed
+# Supabase access while keeping the postgrest crate as the runtime transport.
+# Not wired into the production graph; see docs/superpowers/specs/2026-05-16-typesafe-supabase-spike.md.
+
+[dependencies]
+postgrest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
