@@ -1,11 +1,14 @@
 //! Cashu protocol primitives and per-feature state machines.
 
+pub mod dleq;
 pub mod error;
 pub mod melt_quote;
 pub mod mint_quote;
 pub mod provider;
 pub mod receive_swap;
 pub mod send_swap;
+
+pub use dleq::{verify_blind_signatures, verify_proof_dleq, DleqVerificationError};
 
 pub use melt_quote::{
     Action as MeltQuoteAction, CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState,
