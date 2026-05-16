@@ -338,8 +338,7 @@ mod gated {
         // We don't pin the exact message (clap may reword it), but we
         // do pin that the error mentions the offending arg.
         assert!(
-            stderr.to_lowercase().contains("invalid")
-                || stderr.to_lowercase().contains("error"),
+            stderr.to_lowercase().contains("invalid") || stderr.to_lowercase().contains("error"),
             "expected clap's parse-error language on stderr, got: {stderr}",
         );
 
