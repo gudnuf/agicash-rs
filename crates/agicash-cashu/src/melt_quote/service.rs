@@ -756,6 +756,17 @@ fn construct_change_proofs(
     if sigs.is_empty() {
         return Ok(Vec::new());
     }
+    // NUT-12: verify the change-blank DLEQs before unblinding. The mint
+    // may legitimately return fewer change signatures than we requested
+    // blanks (NUT-08); only verify against the matching prefix of
+    // outgoing blinded messages. `construct_proofs` records but never
+    // checks the DLEQ; without this a malicious mint could sign change
+    // with a key it doesn't commit to.
+    let blinded = pre_mint.blinded_messages();
+    let truncated = &blinded[..sigs.len().min(blinded.len())];
+    crate::dleq::verify_blind_signatures(sigs, truncated, mint_keys)
+        .map_err(MeltQuoteError::DleqVerificationFailed)?;
+
     let proofs = construct_proofs(
         sigs.to_vec(),
         pre_mint.rs(),
