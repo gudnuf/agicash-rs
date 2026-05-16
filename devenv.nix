@@ -16,9 +16,15 @@
   # env vars. The rust target itself is declared in `crates/rust-toolchain.toml`
   # (rustup auto-installs `wasm32-unknown-unknown` when first invoked).
   #
+  # IMPORTANT: use `clang_21.cc` (unwrapped) rather than `clang_21` (wrapped).
+  # The nix cc-wrapper auto-injects darwin-specific flags like
+  # `-fzero-call-used-regs=used-gpr` that wasm32 rejects, and emits a runtime
+  # warning ("cc-wrapper is currently not designed with multi-target compilers
+  # in mind. You may want to use an un-wrapped compiler instead.").
+  #
   # See: /Users/claude/opensecret-sdk-fork wasm-compat work + the CDK wasm
   # audit doc (2026-05-15) for the full backstory.
-  env.CC_wasm32_unknown_unknown = "${pkgs.clang_21}/bin/clang";
+  env.CC_wasm32_unknown_unknown = "${pkgs.clang_21.cc}/bin/clang";
   env.AR_wasm32_unknown_unknown = "${pkgs.llvm_21}/bin/llvm-ar";
 
   # https://devenv.sh/packages/
