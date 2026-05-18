@@ -13,6 +13,34 @@
 //! run against the live stack this constant reads `UNCONFIRMED`.
 use serde_json::Value;
 
+/// **Live wire-confirm finding (Stage-1 Task 9).**
+///
+/// The broadcast frame kind the running local Supabase Realtime server
+/// `v2.74.7` emits for a `realtime.send(..., is_private => true)` on a
+/// private `realtime:wallet:<uid>` channel, observed by
+/// `tests/wire_confirm.rs` against the live stack. One of `"Text"` or
+/// `"Binary"`. `tests/wire_confirm.rs` hard-asserts the observed wire
+/// kind equals this constant, so it cannot silently drift.
+///
+/// Status: confirmed `Text` (JSON-array frame; see commit message + the
+/// captured frame in the test output / fixture below).
+pub const WIRE_CONFIRM_FINDING: &str = "Text";
+
+/// Raw frame fixture **captured live** from Supabase Realtime `v2.74.7`
+/// for an `ACCOUNT_UPDATED` private broadcast (`realtime.send`,
+/// `is_private => true`), recorded by `tests/wire_confirm.rs` on
+/// 2026-05-18 against the running local stack. It is a real Phoenix v2
+/// **string** frame `[join_ref, ref, topic, event, payload]` with
+/// `join_ref=null, ref=null`, Phoenix `event="broadcast"`, and the app
+/// payload `{type:"broadcast", event:"ACCOUNT_UPDATED", payload:<account
+/// jsonb>, meta:{id:<uuid>}}` — note the live server adds a `meta` key
+/// (broadcast id) the spec flags as optional. This proves v2.74.7 uses
+/// the **Text** path for `realtime.send`; `decode_text` parses it (the
+/// `decode_binary` kind=4 path is kept as defensive coverage per spec
+/// §3.2 but is NOT exercised by this server for `realtime.send`).
+/// `name`/`id` values are from the live row; structure is verbatim.
+pub const WIRE_CONFIRM_TEXT_FIXTURE: &str = r#"[null,null,"realtime:wallet:e50b2cb2-6525-4817-8839-a3bc6e33fd1c","broadcast",{"event":"ACCOUNT_UPDATED","meta":{"id":"d05695a7-a69a-4d3a-b3e2-9a634f958f42"},"payload":{"created_at":"2026-05-18T08:02:18.420218+00:00","currency":"BTC","details":{"keyset_counters":{},"mint_url":"https://testnut.cashu.space"},"expires_at":null,"id":"b49682d1-49b7-47be-a832-9a1dabe312e4","name":"wire-confirm-22e","proofs":[],"purpose":"transactional","state":"active","type":"cashu","user_id":"e50b2cb2-6525-4817-8839-a3bc6e33fd1c","version":1},"type":"broadcast"}]"#;
+
 /// Encode an outbound control / heartbeat / join / leave / `access_token`
 /// frame. `join_ref` / `r#ref` are `Option<&str>` → JSON `null` when `None`.
 #[must_use]
@@ -221,5 +249,33 @@ mod tests {
     #[test]
     fn decode_binary_rejects_truncated() {
         assert!(decode_binary(&[4u8, 9, 9, 9, 1]).is_err());
+    }
+
+    /// Stage-1 Task 9 evidence, replayed offline: the frame captured live
+    /// from Supabase Realtime v2.74.7 is a Phoenix v2 **Text** frame and
+    /// `decode_text` parses it to the expected broadcast shape. Locks the
+    /// recorded finding so a future codec change can't silently break the
+    /// real wire format.
+    #[test]
+    fn live_v2_74_7_broadcast_fixture_is_text_and_decodes() {
+        assert_eq!(WIRE_CONFIRM_FINDING, "Text");
+        let m = decode_text(WIRE_CONFIRM_TEXT_FIXTURE).unwrap();
+        assert_eq!(m.join_ref, None);
+        assert_eq!(m.r#ref, None);
+        assert!(m.topic.starts_with("realtime:wallet:"));
+        assert_eq!(m.event, "broadcast");
+        assert_eq!(m.payload["type"], "broadcast");
+        assert_eq!(m.payload["event"], "ACCOUNT_UPDATED");
+        // Live server adds a broadcast-id `meta` (spec §3.6 "optional").
+        assert!(m.payload["meta"]["id"].is_string());
+        assert_eq!(m.payload["payload"]["type"], "cashu");
+        // Routing extracts the app event + opaque payload json (Task 7).
+        assert_eq!(
+            crate::client::classify(&m, None),
+            crate::client::RouterAction::Broadcast {
+                event: "ACCOUNT_UPDATED".into(),
+                payload_json: m.payload["payload"].to_string(),
+            }
+        );
     }
 }
