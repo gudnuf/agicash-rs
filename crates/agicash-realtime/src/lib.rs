@@ -23,5 +23,5 @@ pub use error::{RealtimeError, TransportError};
 // corresponding modules (kept off while those modules are placeholders so the
 // Task-1 skeleton build is green).
 pub use event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
-pub use service::{TransportFactory, WalletRealtimeService};
+pub use service::{TokenProviderJwtSource, TransportFactory, WalletRealtimeService};
 pub use transport::{RealtimeTransport, WsFrame};

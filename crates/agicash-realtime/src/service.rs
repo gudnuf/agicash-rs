@@ -87,7 +87,7 @@ impl std::fmt::Debug for WalletRealtimeService {
 
 impl WalletRealtimeService {
     /// `supabase_url` + `anon_key` build the constant socket URL; the
-    /// rotating user JWT comes from `jwt` (see `TokenProviderJwtSource`).
+    /// rotating user JWT comes from `jwt` (see [`TokenProviderJwtSource`]).
     #[must_use]
     pub fn new(
         supabase_url: &str,
@@ -312,6 +312,37 @@ async fn wasm_sleep_ms(ms: u64) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
+/// Adapts the codebase `agicash_traits::TokenProvider` (the `OpenSecret`
+/// third-party JWT — exactly the realtime join `access_token`, spec
+/// §2.2/§5.6) into the realtime [`JwtSource`]. The native bound carries
+/// `Send + Sync`; the wasm path drops it — mirrors `SupabaseStorage`'s
+/// `tokens` field split (`agicash-storage-supabase/src/client.rs`).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TokenProviderJwtSource(
+    pub Arc<dyn agicash_traits::TokenProvider + Send + Sync>,
+);
+#[cfg(target_arch = "wasm32")]
+pub struct TokenProviderJwtSource(pub Arc<dyn agicash_traits::TokenProvider>);
+
+impl std::fmt::Debug for TokenProviderJwtSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wrapped provider is an opaque trait object (the OpenSecret
+        // token source); we never expose the JWT itself.
+        f.write_str("TokenProviderJwtSource(dyn TokenProvider)")
+    }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl JwtSource for TokenProviderJwtSource {
+    async fn user_jwt(&self) -> Result<String, crate::RealtimeError> {
+        self.0
+            .get_jwt()
+            .await
+            .map_err(|e| crate::RealtimeError::Token(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,4 +548,17 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
     }
 
+    #[tokio::test]
+    async fn token_provider_adapter_yields_jwt() {
+        use agicash_traits::{AuthError, TokenProvider};
+        struct P;
+        #[async_trait::async_trait]
+        impl TokenProvider for P {
+            async fn get_jwt(&self) -> Result<String, AuthError> {
+                Ok("JWT123".into())
+            }
+        }
+        let a = TokenProviderJwtSource(Arc::new(P));
+        assert_eq!(a.user_jwt().await.unwrap(), "JWT123");
+    }
 }
