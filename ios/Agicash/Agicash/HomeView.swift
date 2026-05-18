@@ -17,6 +17,21 @@ import SwiftUI
 struct HomeView: View {
     @Bindable var model: WalletViewModel
 
+    /// App-lifecycle phase. Web's `useAccounts` sets
+    /// `refetchOnWindowFocus:'always'` so the balance re-syncs whenever the
+    /// tab regains focus; the iOS equivalent is refreshing when the scene
+    /// transitions back to `.active`. See
+    /// `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`
+    /// (iOS Tier 1).
+    @Environment(\.scenePhase) private var scenePhase
+
+    /// Interval for the foreground balance poll. Stand-in for web's
+    /// Supabase Realtime channel (`useTrackWalletChanges`) until the Tier-2
+    /// realtime FFI seam lands — keeps Home within a few seconds of an
+    /// out-of-band receive (web/other device/async mint-quote settle) while
+    /// Home is on screen, without any FFI/protocol change.
+    private static let pollInterval: UInt64 = 4_000_000_000 // 4s
+
     /// Drives presentation of `ReceiveCarouselView` as a sheet. The web
     /// routes to `/receive` which is a separate page; on iOS a `.sheet`
     /// is the closer-to-native equivalent and avoids rebuilding the
@@ -48,7 +63,31 @@ struct HomeView: View {
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .refreshable { await model.refreshAccounts() }
-            .task { await model.refreshAccounts() }
+            .task {
+                // Initial load on appear, then a foreground poll loop so
+                // an out-of-band receive (web / another device / an async
+                // mint-quote that settles after the user navigated away)
+                // reflects in the hero without a pull-to-refresh. Mirrors
+                // the `startPolling` loop shape in `LightningReceiveView`
+                // (sleep → cancel-check → work → cancel-check); SwiftUI
+                // cancels this `.task` on disappear, which breaks the loop
+                // the same way `pollTask?.cancel()` does there.
+                await model.refreshAccounts()
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: Self.pollInterval)
+                    if Task.isCancelled { return }
+                    await model.refreshAccounts()
+                }
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                // Re-sync when the app returns to the foreground, matching
+                // web's `refetchOnWindowFocus:'always'`. The poll loop above
+                // is suspended while backgrounded, so this catches anything
+                // that arrived in the meantime as soon as the user is back.
+                if newPhase == .active {
+                    Task { await model.refreshAccounts() }
+                }
+            }
             .sheet(isPresented: $showReceive) {
                 ReceiveCarouselView(
                     model: model,
