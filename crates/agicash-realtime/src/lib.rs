@@ -22,6 +22,6 @@ pub use error::{RealtimeError, TransportError};
 // Re-exports below are restored incrementally as Tasks 5/7/Stage-2 fill the
 // corresponding modules (kept off while those modules are placeholders so the
 // Task-1 skeleton build is green).
-// pub use event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
+pub use event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
 // pub use service::WalletRealtimeService;
 pub use transport::{RealtimeTransport, WsFrame};
