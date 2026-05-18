@@ -94,6 +94,19 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     private val _isWorking = MutableStateFlow(false)
     val isWorking: StateFlow<Boolean> = _isWorking.asStateFlow()
 
+    /**
+     * True while an explicit user-initiated refresh (pull-to-refresh) is
+     * in flight. Drives the Material3 `PullToRefreshBox` spinner on
+     * [com.makeprisms.agicash.ui.screens.HomeScreen]. Distinct from
+     * [isWorking] (auth/mint/send mutations) so a background poll or an
+     * on-resume refresh never spins the pull indicator. iOS gets this for
+     * free from SwiftUI's `.refreshable` awaiting the async closure; on
+     * Android we surface it explicitly because the screen needs a
+     * `isRefreshing` boolean.
+     */
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
     private val _loginErrorMessage = MutableStateFlow<String?>(null)
     val loginErrorMessage: StateFlow<String?> = _loginErrorMessage.asStateFlow()
 
@@ -207,37 +220,78 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    /**
+     * Fire-and-forget account refresh. Re-reads balance from the FFI
+     * (`list_accounts()` → Σ UNSPENT proofs, the correct cross-device
+     * source). Used by the existing call sites that don't need to await
+     * completion: bootstrap session-restore, post-sign-in, `addMint`,
+     * `setDefaultAccount`, and (when the receive lane lands) the future
+     * `receive()` success path — same role as iOS `await refreshAccounts()`
+     * inside `receive`/`completeLightningQuote`/`createSend`.
+     *
+     * The lifecycle-aware on-resume refresh and the foreground poll on
+     * HomeScreen call this too. Pull-to-refresh uses
+     * [refreshAccountsFromPull] instead so it can flip [isRefreshing] for
+     * the Material3 spinner.
+     */
     fun refreshAccounts() {
-        val w = wallet ?: return
-        viewModelScope.launch {
-            try {
-                _accounts.value = withContext(Dispatchers.IO) { w.listAccounts() }
-            } catch (e: FfiException) {
-                _state.value = BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
-                return@launch
-            } catch (e: Throwable) {
-                _state.value = BootState.Ready(Phase.Error("unexpected: ${e.message}"))
-                return@launch
-            }
+        viewModelScope.launch { refreshAccountsSuspending() }
+    }
 
-            // Refresh the user row so per-currency default-account ids are
-            // current. Failure is non-fatal — see iOS WalletViewModel for
-            // rationale (brand-new guests don't have a user row yet, that's
-            // expected).
-            try {
-                _user.value = withContext(Dispatchers.IO) { w.getUser() }
-            } catch (e: FfiException) {
-                if (e is FfiException.Internal &&
-                    (e.message ?: "").contains("user row not found")
-                ) {
-                    _user.value = null
-                } else {
-                    // Other failures: leave user as-is, accounts list is
-                    // still usable.
-                }
-            } catch (_: Throwable) {
-                // Same conservative handling.
+    /**
+     * Pull-to-refresh entry point for `HomeScreen`'s `PullToRefreshBox`.
+     * Suspends until the FFI round-trip completes and toggles
+     * [isRefreshing] around it so the Compose pull indicator shows/hides
+     * in lockstep — the Android analogue of SwiftUI `.refreshable`
+     * awaiting `model.refreshAccounts()` on iOS. Safe to call from a
+     * Compose `rememberCoroutineScope` launch.
+     */
+    suspend fun refreshAccountsFromPull() {
+        _isRefreshing.value = true
+        try {
+            refreshAccountsSuspending()
+        } finally {
+            _isRefreshing.value = false
+        }
+    }
+
+    /**
+     * The actual refresh, suspending so callers (poll loop, pull-to-
+     * refresh, on-resume) can sequence around it. Identical semantics to
+     * the previous fire-and-forget body and to iOS `refreshAccounts()`:
+     * a hard `list_accounts()` failure escalates to the error phase; a
+     * `get_user()` failure is non-fatal (brand-new guests have no user
+     * row yet — expected).
+     */
+    private suspend fun refreshAccountsSuspending() {
+        val w = wallet ?: return
+        try {
+            _accounts.value = withContext(Dispatchers.IO) { w.listAccounts() }
+        } catch (e: FfiException) {
+            _state.value = BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
+            return
+        } catch (e: Throwable) {
+            _state.value = BootState.Ready(Phase.Error("unexpected: ${e.message}"))
+            return
+        }
+
+        // Refresh the user row so per-currency default-account ids are
+        // current. Failure is non-fatal — see iOS WalletViewModel for
+        // rationale (brand-new guests don't have a user row yet, that's
+        // expected).
+        try {
+            _user.value = withContext(Dispatchers.IO) { w.getUser() }
+        } catch (e: FfiException) {
+            if (e is FfiException.Internal &&
+                (e.message ?: "").contains("user row not found")
+            ) {
+                _user.value = null
+            } else {
+                // Other failures: leave user as-is, accounts list is
+                // still usable.
             }
+        } catch (_: Throwable) {
+            // Same conservative handling.
         }
     }
 
