@@ -16,6 +16,8 @@ result-*
 
 /.cache
 .env
+# Runtime artifact written by scripts/cdk-mint-e2e.sh (mint URL export).
+/.cdk-mint-e2e.env
 
 .DS_Store
 

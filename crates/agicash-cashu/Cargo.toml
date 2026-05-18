@@ -12,6 +12,14 @@ agicash-money = { path = "../agicash-money" }
 agicash-traits = { path = "../agicash-traits" }
 async-trait = { workspace = true }
 cdk = { workspace = true }
+# Only pulled when the opt-in `cdk-mint-e2e` feature is on (test-only).
+# Provides `create_fake_invoice` — an externally-signed bolt11 with a
+# random payment hash, needed so the melt E2E pays an invoice the local
+# mint has never settled (a mint-quote invoice is auto-paid by the
+# FakeWallet backend and would be rejected with RequestAlreadyPaid).
+# cdk-fake-wallet only depends on cdk-common (no protoc/tonic), so this
+# does not regress the standard build.
+cdk-fake-wallet = { version = "0.15.1", optional = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 lightning-invoice = { version = "0.34", default-features = false, features = ["std"] }
@@ -46,6 +54,10 @@ tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [features]
 real-mint-tests = []
+# Opt-in money-path E2E against a local cdk-mintd (FakeWallet backend).
+# Gated so `cargo test --workspace` (the standard gate) never needs a
+# running mint. Bring one up with `bash scripts/cdk-mint-e2e.sh start`.
+cdk-mint-e2e = ["dep:cdk-fake-wallet"]
 
 [lints]
 workspace = true

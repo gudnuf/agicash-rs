@@ -86,6 +86,7 @@ dependencies = [
  "agicash-traits",
  "async-trait",
  "cdk",
+ "cdk-fake-wallet",
  "chrono",
  "dotenvy",
  "hex",
@@ -1235,6 +1236,28 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "cdk-fake-wallet"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddc90c6211fced0c7d94a16885cc46a6209832873d864bb5537283299f069a77"
+dependencies = [
+ "async-trait",
+ "bitcoin",
+ "cdk-common",
+ "futures",
+ "lightning",
+ "lightning-invoice",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
