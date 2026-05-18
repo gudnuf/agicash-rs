@@ -315,6 +315,25 @@ fn HomeActionGrid() -> impl IntoView {
 // USD wins over BTC when both are present (matches the iOS historical
 // default).
 
+/// The single shared "which dollar bucket is this?" notion. `"USD"` and
+/// `"USDB"` are distinct first-class domain currencies
+/// (`agicash_domain::Currency`) but the hero shows the user **one dollar
+/// number** (matching `primary_currency` / `secondary_line`'s model), so
+/// both map to the `"USD"` bucket; every other currency is its own
+/// bucket.
+///
+/// `primary_currency` *and* `total_for_currency` route through this so
+/// they can never disagree again: previously `primary_currency` merged
+/// USDB→USD while `total_for_currency` exact-matched `"USD"`, which
+/// dropped every USDB account from the sum and rendered a USDB-only
+/// wallet as `$ 0` (real funds misreported as zero).
+fn currency_bucket(currency: &str) -> &str {
+    match currency {
+        "USD" | "USDB" => "USD",
+        other => other,
+    }
+}
+
 /// Pick a currency symbol from the accounts list. Default `$` because
 /// most users land in USD and a fresh guest has no accounts (so the
 /// hero shows `$ 0`).
@@ -333,8 +352,8 @@ fn primary_currency(accounts: &[AccountSummary]) -> &'static str {
     let mut has_usd = false;
     let mut has_btc = false;
     for a in accounts {
-        match a.currency.as_str() {
-            "USD" | "USDB" => has_usd = true,
+        match currency_bucket(&a.currency) {
+            "USD" => has_usd = true,
             "BTC" => has_btc = true,
             _ => {}
         }
@@ -353,22 +372,16 @@ fn primary_currency(accounts: &[AccountSummary]) -> &'static str {
 /// across many account rows; we cap back to `u64` because that's all
 /// the hero needs to display (and the FFI itself emits `u64`).
 fn total_for_currency(accounts: &[AccountSummary], currency: &str) -> u64 {
+    // Bucket-compare, NOT exact-string-compare: the `"USD"` bucket sums
+    // both `"USD"` and `"USDB"` accounts, exactly as `primary_currency`
+    // merges them. Using the same `currency_bucket` helper on both sides
+    // is what guarantees they can't drift — the previous exact `"USD"`
+    // match here dropped USDB accounts and rendered a USDB-only wallet
+    // as `$ 0`. "Show the user one dollar number."
+    let want = currency_bucket(currency);
     let total: u128 = accounts
         .iter()
-        .filter(|a| {
-            // Map USD/USDB into the same bucket as the symbol — keeps
-            // dollar-and-cent-equivalent accounts adding together. iOS
-            // does the same in `totalForCurrency` (compares against the
-            // primary currency string directly; USD and USDB are
-            // distinct strings there so they sum separately, but the
-            // wider sentiment of "show the user one dollar number" is
-            // what we model here).
-            match currency {
-                "USD" => matches!(a.currency.as_str(), "USD"),
-                "USDB" => matches!(a.currency.as_str(), "USDB"),
-                _ => a.currency == currency,
-            }
-        })
+        .filter(|a| currency_bucket(&a.currency) == want)
         .map(|a| u128::from(a.balance))
         .sum();
     // Saturating cast: hero displays a single number, can't represent
@@ -381,13 +394,17 @@ fn total_for_currency(accounts: &[AccountSummary], currency: &str) -> u64 {
 /// conversion yet). Single-currency wallet collapses to the symmetrical
 /// "≈ 0 sats" placeholder so the hero is always two lines tall.
 fn secondary_line(accounts: &[AccountSummary], primary: &str) -> String {
-    let has_btc = accounts.iter().any(|a| a.currency == "BTC");
+    // Same bucket notion as primary_currency / total_for_currency so the
+    // "other currency" decision stays consistent with the summed total.
+    let has_btc = accounts
+        .iter()
+        .any(|a| currency_bucket(&a.currency) == "BTC");
     let has_usd = accounts
         .iter()
-        .any(|a| matches!(a.currency.as_str(), "USD" | "USDB"));
+        .any(|a| currency_bucket(&a.currency) == "USD");
 
-    let other: Option<&'static str> = match primary {
-        "USD" | "USDB" if has_btc => Some("BTC"),
+    let other: Option<&'static str> = match currency_bucket(primary) {
+        "USD" if has_btc => Some("BTC"),
         "BTC" if has_usd => Some("USD"),
         _ => None,
     };
@@ -502,6 +519,53 @@ mod tests {
     fn unknown_currency_returns_zero() {
         let accounts = vec![account("BTC", 10), account("USD", 100)];
         assert_eq!(total_for_currency(&accounts, "EUR"), 0);
+    }
+
+    // USDB ↔ USD bucket — regression: a USDB-funded wallet rendered
+    // `$ 0` because primary_currency merged USDB→USD but
+    // total_for_currency exact-matched "USD" and dropped USDB. --------
+
+    #[test]
+    fn currency_bucket_merges_usdb_into_usd() {
+        assert_eq!(currency_bucket("USD"), "USD");
+        assert_eq!(currency_bucket("USDB"), "USD");
+        assert_eq!(currency_bucket("BTC"), "BTC");
+        assert_eq!(currency_bucket("EUR"), "EUR");
+    }
+
+    #[test]
+    fn usdb_only_wallet_sums_into_usd_bucket() {
+        // The exact bug from the audit: a wallet holding only USDB.
+        let accounts = vec![account("USDB", 5_000)];
+        // primary_currency collapses to USD ...
+        assert_eq!(primary_currency(&accounts), "USD");
+        assert_eq!(primary_symbol(&accounts), "$");
+        // ... and the USD total MUST include the USDB balance (was 0).
+        assert_eq!(total_for_currency(&accounts, "USD"), 5_000);
+        // Querying the USDB string directly resolves to the same bucket.
+        assert_eq!(total_for_currency(&accounts, "USDB"), 5_000);
+        // The full hero line a USDB-only wallet renders.
+        assert_eq!(secondary_line(&accounts, "USD"), "≈ 0 sats");
+    }
+
+    #[test]
+    fn mixed_usd_and_usdb_accounts_sum_together() {
+        // Plain-USD and USDB accounts add into the one dollar number.
+        let accounts = vec![account("USD", 1_500), account("USDB", 2_500)];
+        assert_eq!(primary_currency(&accounts), "USD");
+        assert_eq!(total_for_currency(&accounts, "USD"), 4_000);
+        assert_eq!(total_for_currency(&accounts, "USDB"), 4_000);
+    }
+
+    #[test]
+    fn usdb_and_btc_wallet_reports_both_sides() {
+        // USDB primary with BTC present: dollar number is the USDB
+        // balance, secondary line is the BTC total (not "≈ 0 sats").
+        let accounts = vec![account("USDB", 5_000), account("BTC", 64)];
+        assert_eq!(primary_currency(&accounts), "USD");
+        assert_eq!(total_for_currency(&accounts, "USD"), 5_000);
+        assert_eq!(secondary_line(&accounts, "USD"), "≈ 64 sats");
+        assert_eq!(secondary_line(&accounts, "BTC"), "≈ 5,000 cents");
     }
 
     // secondary_line ------------------------------------------------------
