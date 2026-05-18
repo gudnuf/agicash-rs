@@ -915,6 +915,27 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
     func setSession(userIdUuid: String, refreshToken: String) async throws 
     
     /**
+     * Install a filesystem-backed `SessionStorage` rooted at the given
+     * directory. On Android the caller passes
+     * `Context.getFilesDir().getAbsolutePath()` — the app's private data
+     * dir, isolated per-app by Linux UID. The directory is expected to
+     * exist (Android's `getFilesDir()` always does).
+     *
+     * Once installed, every successful auth call writes the resulting
+     * `PersistedSession` through to disk (AES-256-GCM blob + sibling
+     * random key file), and `auth_logout` removes both files. Subsequent
+     * calls to `try_restore_session` re-hydrate the in-memory slot from
+     * disk.
+     *
+     * This method is gated on `target_os = "android"` — the underlying
+     * `AndroidFileSessionStorage` type is only re-exported there.
+     * Callers on iOS / wasm / host should not invoke it; the FFI surface
+     * returns an `Internal` error if the storage backend isn't compiled
+     * in on the current target.
+     */
+    func setSessionStorageDir(dir: String) async throws 
+    
+    /**
      * Start a NUT-04 mint quote — request a BOLT-11 invoice from the
      * mint backing the user's Cashu account.
      *
@@ -945,6 +966,21 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func startMintQuote(amount: UInt64, accountId: String?, currency: String?) async throws  -> MintQuoteHandle
+    
+    /**
+     * Attempt to rehydrate a previously-stored session from the
+     * installed `SessionStorage` backend. Returns the rehydrated
+     * `Session` on success, or `None` if no session was persisted (or
+     * no backend is installed). On a stale / unusable refresh token the
+     * stored blob is cleared and `None` is returned so the Kotlin
+     * consumer can route to the login screen without surfacing a fatal
+     * error.
+     *
+     * Internally this calls the existing `set_session(...)` plumbing
+     * once a stored blob is loaded — same OpenSecret handshake + token
+     * refresh chain, same in-memory slot rehydration.
+     */
+    func tryRestoreSession() async throws  -> Session?
     
 }
 open class AgicashWallet: AgicashWalletProtocol, @unchecked Sendable {
@@ -1755,6 +1791,42 @@ open func setSession(userIdUuid: String, refreshToken: String)async throws   {
 }
     
     /**
+     * Install a filesystem-backed `SessionStorage` rooted at the given
+     * directory. On Android the caller passes
+     * `Context.getFilesDir().getAbsolutePath()` — the app's private data
+     * dir, isolated per-app by Linux UID. The directory is expected to
+     * exist (Android's `getFilesDir()` always does).
+     *
+     * Once installed, every successful auth call writes the resulting
+     * `PersistedSession` through to disk (AES-256-GCM blob + sibling
+     * random key file), and `auth_logout` removes both files. Subsequent
+     * calls to `try_restore_session` re-hydrate the in-memory slot from
+     * disk.
+     *
+     * This method is gated on `target_os = "android"` — the underlying
+     * `AndroidFileSessionStorage` type is only re-exported there.
+     * Callers on iOS / wasm / host should not invoke it; the FFI surface
+     * returns an `Internal` error if the storage backend isn't compiled
+     * in on the current target.
+     */
+open func setSessionStorageDir(dir: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_set_session_storage_dir(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(dir)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_void,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_void,
+            freeFunc: ffi_agicash_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Start a NUT-04 mint quote — request a BOLT-11 invoice from the
      * mint backing the user's Cashu account.
      *
@@ -1797,6 +1869,36 @@ open func startMintQuote(amount: UInt64, accountId: String?, currency: String?)a
             completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMintQuoteHandle_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Attempt to rehydrate a previously-stored session from the
+     * installed `SessionStorage` backend. Returns the rehydrated
+     * `Session` on success, or `None` if no session was persisted (or
+     * no backend is installed). On a stale / unusable refresh token the
+     * stored blob is cleared and `None` is returned so the Kotlin
+     * consumer can route to the login screen without surfacing a fatal
+     * error.
+     *
+     * Internally this calls the existing `set_session(...)` plumbing
+     * once a stored blob is loaded — same OpenSecret handshake + token
+     * refresh chain, same in-memory slot rehydration.
+     */
+open func tryRestoreSession()async throws  -> Session?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_try_restore_session(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeSession.lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
@@ -5426,7 +5528,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_session() != 35776) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_session_storage_dir() != 623) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_start_mint_quote() != 60988) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_try_restore_session() != 65288) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_receiveflow_current_state() != 4694) {
