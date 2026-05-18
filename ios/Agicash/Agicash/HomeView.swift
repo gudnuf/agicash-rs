@@ -47,7 +47,7 @@ struct HomeView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: Spacing.xxxl) {
-                    BalanceHero(accounts: model.accounts)
+                    BalanceHero(model: model)
                         .padding(.top, Spacing.hero)
 
                     HomeActionGrid(
@@ -117,20 +117,30 @@ struct HomeView: View {
 }
 
 /// Centered balance display modeled on `MoneyWithConvertedAmount` on the
-/// web home: large numeric on top, smaller converted amount below in muted
-/// gray. Numeric uses `Font.brandNumericHero` (Teko Bold).
+/// web home: large numeric on top, smaller FX-converted amount below in
+/// muted gray. Numeric uses `Font.brandNumericHero` (Teko Bold).
 ///
 /// Web aggregates by currency via `useBalance('BTC') / useBalance('USD')`
 /// in `app/routes/_protected._index.tsx` and renders the user's default
-/// currency. Phase 1 iOS has no user-prefs surface yet, so the primary
-/// currency is inferred from the accounts list (USD wins when both are
-/// present, mirroring the historical default) and only that currency's
-/// per-account balances are summed. The secondary line shows the other
-/// currency's per-unit total without FX conversion (Phase 1 has no rates
-/// wired client-side), which matches the web's "≈" placeholder when rate
-/// data is unavailable.
+/// currency with a converted secondary line via `MoneyWithConvertedAmount`
+/// (`app/features/shared/`). Phase 1 iOS has no user-prefs surface yet, so
+/// the primary currency is inferred from the accounts list (USD wins when
+/// both are present, mirroring the historical default) and only that
+/// currency's per-account balances are summed. The secondary line now
+/// shows the *FX-converted* primary total in the other currency via the
+/// `getExchangeRate` FFI (`ExchangeRateConversion`) — true web parity.
+/// When the rate is unavailable (provider/network blip, single-currency
+/// wallet with nothing meaningful to convert to) the line is simply
+/// omitted; the primary value always renders.
 private struct BalanceHero: View {
-    let accounts: [AccountFfi]
+    @Bindable var model: WalletViewModel
+
+    /// The converted secondary line ("≈ 1,234 sats" / "≈ $12.34"), or
+    /// `nil` while loading / when the rate is unavailable. Refreshed by
+    /// the `.task` below whenever the accounts list changes.
+    @State private var convertedLine: String?
+
+    private var accounts: [AccountFfi] { model.accounts }
 
     var body: some View {
         VStack(spacing: Spacing.s) {
@@ -145,11 +155,64 @@ private struct BalanceHero: View {
                     .foregroundStyle(Color.brandForeground)
                     .monospacedDigit()
             }
-            Text(secondaryLine)
-                .font(.brandLabel)
-                .foregroundStyle(Color.brandMutedForeground)
+            // Rate-unavailable: omit the line entirely rather than render
+            // a stale/placeholder "≈" — the hero stays valid on one line.
+            if let convertedLine {
+                Text(convertedLine)
+                    .font(.brandLabel)
+                    .foregroundStyle(Color.brandMutedForeground)
+            }
         }
         .frame(maxWidth: .infinity)
+        // Re-derive the converted line whenever the balances change (a
+        // receive/send/poll mutates `model.accounts`). `accounts` is
+        // Equatable so `.task(id:)` only re-runs on a real change, not
+        // every SwiftUI re-render.
+        .task(id: accounts) {
+            await refreshConvertedLine()
+        }
+    }
+
+    /// Fetch the rate for primary→secondary and format the ≈ line.
+    /// Clears the line (no FX shown) when there's no meaningful
+    /// conversion target or the rate is unavailable.
+    private func refreshConvertedLine() async {
+        guard let secondaryCurrency else {
+            convertedLine = nil
+            return
+        }
+        let primaryMinor = totalForCurrency(primaryCurrency)
+        guard let conversion = await model.exchangeRate(
+            from: primaryCurrency,
+            to: secondaryCurrency
+        ) else {
+            convertedLine = nil
+            return
+        }
+        guard let convertedMinor = conversion.convert(
+            minorAmount: primaryMinor,
+            from: primaryCurrency,
+            to: secondaryCurrency
+        ) else {
+            convertedLine = nil
+            return
+        }
+        convertedLine = ConvertedAmountFormatter.approxLine(
+            minor: convertedMinor,
+            currency: secondaryCurrency
+        )
+    }
+
+    /// Currency the secondary line converts *into*. We always convert the
+    /// primary total across the BTC⇄USD pair the provider prices: if the
+    /// primary is USD show its sats equivalent, and vice-versa. (USDB has
+    /// no provider pair, so a USDB-only wallet yields `nil` → no line.)
+    private var secondaryCurrency: String? {
+        switch primaryCurrency {
+        case "USD": return "BTC"
+        case "BTC": return "USD"
+        default: return nil
+        }
     }
 
     /// Pick the most prominent currency symbol from the accounts we know
@@ -181,29 +244,6 @@ private struct BalanceHero: View {
         return formatDecimal(total)
     }
 
-    /// Mimics the web's converted-amount line. When the user holds BOTH
-    /// BTC and USD accounts, this line surfaces the other currency's
-    /// per-unit total (e.g. "≈ 64 sats" while primary is USD). With only
-    /// one currency present, it falls back to a sats placeholder — Phase 2
-    /// will replace this with a real FX-converted figure once rates are
-    /// wired client-side.
-    private var secondaryLine: String {
-        let currencies = Set(accounts.map(\.currency))
-        let secondaryCurrency: String? = {
-            if primaryCurrency == "USD" && currencies.contains("BTC") { return "BTC" }
-            if primaryCurrency == "BTC" && currencies.contains("USD") { return "USD" }
-            return nil
-        }()
-        if let secondary = secondaryCurrency {
-            let total = totalForCurrency(secondary)
-            let unit = unitLabel(for: secondary, total: total)
-            return "≈ \(formatDecimal(total)) \(unit)"
-        }
-        // Single-currency wallet — show the symmetrical placeholder so the
-        // hero doesn't collapse to a single line.
-        return "≈ 0 sats"
-    }
-
     /// Walk the accounts list, summing balances for the matching currency.
     /// Decimal parsing tolerates the FFI's string shape (`"0"`, `"64"`)
     /// and silently skips non-numeric entries so a malformed row from a
@@ -214,17 +254,6 @@ private struct BalanceHero: View {
             .reduce(Decimal.zero) { acc, account in
                 acc + (Decimal(string: account.balance) ?? .zero)
             }
-    }
-
-    /// `sat` / `cent` / etc. label, pluralised the same way the web treats
-    /// the converted-amount string. `cent`/`cents` and `sat`/`sats` match
-    /// the FFI's `AccountFfi.unit` for these currencies.
-    private func unitLabel(for currency: String, total: Decimal) -> String {
-        switch currency {
-        case "BTC": return total == 1 ? "sat" : "sats"
-        case "USD", "USDB": return total == 1 ? "cent" : "cents"
-        default: return ""
-        }
     }
 
     private func formatDecimal(_ value: Decimal) -> String {

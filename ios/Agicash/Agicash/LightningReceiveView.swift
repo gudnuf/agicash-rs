@@ -37,13 +37,21 @@ struct LightningReceiveView: View {
 
     @State private var amountBuffer: String = "0"
     @State private var phase: Phase = .amountEntry
+    /// The converted secondary line under the entry hero ("≈ 1,234 sats"
+    /// while entering USD, "≈ $12.34" while entering sats), mirroring the
+    /// web's `converted-money-switcher`. `nil` while the amount is zero /
+    /// the rate is unavailable — in which case the line is simply omitted
+    /// (the primary entry never blocks on the rate). Recomputed by the
+    /// `.task(id:)` below whenever the buffer or entry currency changes.
+    @State private var convertedEntryLine: String?
     /// Currency the numpad enters in. Drives the FFI `currency`
     /// argument directly — the mint is quoted in this currency, no
-    /// client-side conversion. Switching it resets the buffer because
-    /// "100 sats" and "100 cents" aren't the same magnitude and there
-    /// is no exchange rate exposed via FFI to carry the value across
-    /// (the web app's "≈ X sats" secondary line needs that rate; see
-    /// the file footer note).
+    /// client-side conversion (correctness never depends on the rate).
+    /// Switching it resets the buffer because "100 sats" and "100 cents"
+    /// aren't the same magnitude; the converted value is shown as a
+    /// muted secondary line via `getExchangeRate` (see
+    /// `convertedEntryLine` / `ExchangeRateConversion`), matching the
+    /// web's `converted-money-switcher`.
     @State private var entryCurrency: EntryCurrency = .btc
     /// Long-running poll task. Held so we can cancel it when the view
     /// disappears, the user hits Cancel, or the polled state moves
@@ -162,6 +170,16 @@ struct LightningReceiveView: View {
                         .foregroundStyle(Color.brandMutedForeground)
                         .baselineOffset(8)
                 }
+                // Converted equivalent in the *other* currency. Omitted
+                // (not a placeholder) when the amount is zero or the rate
+                // is unavailable so the entry never depends on it.
+                if let convertedEntryLine {
+                    Text(convertedEntryLine)
+                        .font(.brandLabel)
+                        .foregroundStyle(Color.brandMutedForeground)
+                        .monospacedDigit()
+                }
+
                 Text("Receive over Lightning")
                     .font(.brandLabel)
                     .foregroundStyle(Color.brandMutedForeground)
@@ -170,6 +188,12 @@ struct LightningReceiveView: View {
                     .padding(.top, Spacing.xs)
             }
             .frame(maxWidth: .infinity)
+            // Recompute the ≈ line on every keystroke / currency flip.
+            // Composite id so a buffer edit OR a toggle both retrigger;
+            // SwiftUI cancels the in-flight fetch when the id changes.
+            .task(id: "\(amountBuffer)|\(currency)") {
+                await refreshConvertedEntryLine()
+            }
 
             AmountNumpad(value: $amountBuffer, allowsDecimal: allowsDecimal)
                 .padding(.horizontal, Spacing.l)
@@ -189,12 +213,13 @@ struct LightningReceiveView: View {
 
     /// sats ⇄ USD switcher. Mirrors the web's `ConvertedMoneySwitcher`
     /// (`app/features/shared/converted-money-switcher.tsx`) — an
-    /// up/down arrow glyph that flips the entry currency. The web
-    /// renders the *converted* amount next to the arrow ("≈ 1,234
-    /// sats"); we can't here because no exchange-rate symbol is
-    /// exported by the FFI (see footer note), so the pill shows the
-    /// currency you'd switch *to* instead. Tapping flips and clears
-    /// the buffer (the magnitudes aren't comparable without a rate).
+    /// up/down arrow glyph that flips the entry currency. The web's
+    /// *converted* amount ("≈ 1,234 sats") now renders above as
+    /// `convertedEntryLine` (via `getExchangeRate`); this pill carries
+    /// the currency you'd switch *to* as its affordance. Tapping flips
+    /// and clears the buffer (the magnitudes aren't comparable across
+    /// units, and the quote is requested natively in the chosen
+    /// currency — the rate only drives the cosmetic ≈ line).
     private var currencyToggle: some View {
         Button(action: switchCurrency) {
             HStack(spacing: Spacing.xs) {
@@ -285,6 +310,41 @@ struct LightningReceiveView: View {
     private var isAmountValid: Bool {
         guard let n = parsedAmount else { return false }
         return n > 0
+    }
+
+    // MARK: - converted secondary line
+
+    /// Fetch the rate and format the converted equivalent of the current
+    /// entry. Entry minor units match `parsedAmount` (sats for BTC, cents
+    /// for USD); convert into the *other* currency and render via the
+    /// shared formatter. Any failure / zero amount clears the line so the
+    /// numpad keeps working with no rate.
+    private func refreshConvertedEntryLine() async {
+        guard let minor = parsedAmount, minor > 0 else {
+            convertedEntryLine = nil
+            return
+        }
+        let fromCurrency = currency
+        let toCurrency = otherCurrency.ffiCurrency
+        guard let conversion = await model.exchangeRate(
+            from: fromCurrency,
+            to: toCurrency
+        ) else {
+            convertedEntryLine = nil
+            return
+        }
+        guard let convertedMinor = conversion.convert(
+            minorAmount: minor,
+            from: fromCurrency,
+            to: toCurrency
+        ) else {
+            convertedEntryLine = nil
+            return
+        }
+        convertedEntryLine = ConvertedAmountFormatter.approxLine(
+            minor: convertedMinor,
+            currency: toCurrency
+        )
     }
 
     // MARK: - actions
@@ -611,23 +671,23 @@ private struct FailureCard: View {
     }
 }
 
-// MARK: - Known gap: secondary "converted amount" line
+// MARK: - Converted secondary line — realized
 //
 // The web amount-entry screen (`app/features/receive/receive-input.tsx`
 // + `app/features/shared/converted-money-switcher.tsx`) renders a
 // secondary muted line under the hero amount showing the *converted*
-// value ("≈ 1,234 sats" while entering USD, and vice-versa). That
-// requires a sat⇄USD exchange rate. The web app gets it client-side
-// from `app/lib/exchange-rate/` (mempool.space / coinbase / coingecko
-// providers, slice-4 added a mempool.space rate to core).
+// value ("≈ 1,234 sats" while entering USD, and vice-versa). The web
+// app sources the sat⇄USD rate client-side from
+// `app/lib/exchange-rate/` (slice-4 added a mempool.space rate to core).
 //
-// That rate is NOT exported through the UniFFI binding: there is no
-// `exchangeRate` / `btcPrice` / `fiatRate` symbol anywhere in
-// `AgicashSDK/agicash_ffi.swift` (only `startMintQuote`, the
-// poll/complete trio, and the Lightning-address helpers). So this
-// screen ships the toggle WITHOUT the converted secondary line — the
-// quote is requested directly in the chosen currency via
-// `startMintQuote(currency:)` (the FFI quotes the mint in BTC or USD
-// natively, no client conversion needed for correctness). The
-// secondary display is a follow-up that needs an exchange-rate FFI
-// export, not a hardcoded rate.
+// That rate is now exported through the UniFFI binding as
+// `getExchangeRate(from:to:) -> ExchangeRateSnapshot` (see
+// `AgicashSDK/agicash_ffi.swift`). This screen consumes it via
+// `WalletViewModel.exchangeRate(...)` + `ExchangeRateConversion` and
+// renders the converted equivalent as `convertedEntryLine` above. The
+// quote is still requested directly in the chosen currency via
+// `startMintQuote(currency:)` — correctness never depends on the rate,
+// so a provider/network blip just omits the cosmetic ≈ line (it never
+// blocks the numpad or the invoice). Shared with the Home balance hero
+// (`BalanceHero` in `HomeView.swift`), which converts the primary
+// total the same way.
