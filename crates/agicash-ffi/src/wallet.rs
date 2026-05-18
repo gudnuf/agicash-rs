@@ -37,7 +37,8 @@ use agicash_storage_supabase::{
 };
 use agicash_traits::{
     AccountInput, CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
-    ProofEncryption, TokenProvider, UpdateUserDefaults, UpsertUserInput, UserStorage,
+    ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UpsertUserInput,
+    UserStorage,
 };
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::Id as KeysetId;
@@ -88,6 +89,15 @@ pub struct AgicashWallet {
     /// the iOS app stores the `refresh_token` in Keychain and rehydrates this
     /// slot via `set_session` on app launch.
     session: Arc<RwLock<Option<PersistedSession>>>,
+    /// Optional persistent session storage. Populated post-construction
+    /// by `set_session_storage_dir(...)`. When set, every successful
+    /// auth call (`auth_guest`, `auth_login`, `auth_signup`, `set_session`)
+    /// writes the resulting `PersistedSession` through to storage, and
+    /// `auth_logout` clears it. On Android the impl is
+    /// `AndroidFileSessionStorage` (AES-256-GCM blob in the app's private
+    /// data dir); iOS keeps using its `SessionStore` keychain wrapper on
+    /// the Swift side and leaves this slot empty.
+    session_storage: Arc<RwLock<Option<Arc<dyn SessionStorage + Send + Sync>>>>,
 }
 
 impl std::fmt::Debug for AgicashWallet {
@@ -217,6 +227,7 @@ impl AgicashWallet {
             mint_quote_storage,
             send_swap_service,
             session: Arc::new(RwLock::new(None)),
+            session_storage: Arc::new(RwLock::new(None)),
         }))
     }
 
@@ -261,6 +272,107 @@ impl AgicashWallet {
         self.session.read().await.clone().map(Session::from)
     }
 
+    /// Install a filesystem-backed `SessionStorage` rooted at the given
+    /// directory. On Android the caller passes
+    /// `Context.getFilesDir().getAbsolutePath()` — the app's private data
+    /// dir, isolated per-app by Linux UID. The directory is expected to
+    /// exist (Android's `getFilesDir()` always does).
+    ///
+    /// Once installed, every successful auth call writes the resulting
+    /// `PersistedSession` through to disk (AES-256-GCM blob + sibling
+    /// random key file), and `auth_logout` removes both files. Subsequent
+    /// calls to `try_restore_session` re-hydrate the in-memory slot from
+    /// disk.
+    ///
+    /// This method is gated on `target_os = "android"` — the underlying
+    /// `AndroidFileSessionStorage` type is only re-exported there.
+    /// Callers on iOS / wasm / host should not invoke it; the FFI surface
+    /// returns an `Internal` error if the storage backend isn't compiled
+    /// in on the current target.
+    pub async fn set_session_storage_dir(&self, dir: String) -> Result<(), FfiError> {
+        #[cfg(all(feature = "android-file-storage", target_os = "android"))]
+        {
+            use agicash_auth_opensecret::AndroidFileSessionStorage;
+            let storage: Arc<dyn SessionStorage + Send + Sync> =
+                Arc::new(AndroidFileSessionStorage::new(dir));
+            *self.session_storage.write().await = Some(storage);
+            tracing::info!(
+                target: "agicash_ffi::wallet",
+                "set_session_storage_dir: AndroidFileSessionStorage installed"
+            );
+            return Ok(());
+        }
+        #[cfg(not(all(feature = "android-file-storage", target_os = "android")))]
+        {
+            let _ = dir;
+            Err(FfiError::internal(
+                "session storage not available on this target (Android-only)",
+            ))
+        }
+    }
+
+    /// Attempt to rehydrate a previously-stored session from the
+    /// installed `SessionStorage` backend. Returns the rehydrated
+    /// `Session` on success, or `None` if no session was persisted (or
+    /// no backend is installed). On a stale / unusable refresh token the
+    /// stored blob is cleared and `None` is returned so the Kotlin
+    /// consumer can route to the login screen without surfacing a fatal
+    /// error.
+    ///
+    /// Internally this calls the existing `set_session(...)` plumbing
+    /// once a stored blob is loaded — same OpenSecret handshake + token
+    /// refresh chain, same in-memory slot rehydration.
+    pub async fn try_restore_session(&self) -> Result<Option<Session>, FfiError> {
+        let storage_opt = self.session_storage.read().await.clone();
+        let Some(storage) = storage_opt else {
+            return Ok(None);
+        };
+
+        let persisted = match storage.load().await {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    target: "agicash_ffi::wallet",
+                    error = %e,
+                    "try_restore_session: storage.load() failed"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Run the same handshake + refresh chain as `set_session`. On
+        // failure we drop the on-disk blob so the next launch falls
+        // back to the sign-in screen instead of re-trying a dead token.
+        match self
+            .set_session(persisted.user_id.to_string(), persisted.refresh_token.clone())
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    target: "agicash_ffi::wallet",
+                    "try_restore_session: rehydrated session from storage"
+                );
+                Ok(Some(persisted.into()))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "agicash_ffi::wallet",
+                    error = %e,
+                    "try_restore_session: refresh failed, clearing stored blob"
+                );
+                let _ = storage.clear().await;
+                Ok(None)
+            }
+        }
+    }
+
+    // Internal helpers `persist_session` + `clear_persisted_session` live
+    // outside this `#[uniffi::export]` impl block so UniFFI's bindgen
+    // doesn't try to lift `&PersistedSession` across the FFI boundary
+    // (it isn't a UniFFI type). See the bare `impl AgicashWallet` block
+    // below this one.
+
     // ---- auth surface ----
 
     /// Register an anonymous guest account against OpenSecret. Generates a
@@ -274,6 +386,7 @@ impl AgicashWallet {
             refresh_token: resp.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
+        self.persist_session(&persisted).await;
         Ok(persisted.into())
     }
 
@@ -285,6 +398,7 @@ impl AgicashWallet {
             refresh_token: resp.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
+        self.persist_session(&persisted).await;
         Ok(persisted.into())
     }
 
@@ -309,6 +423,7 @@ impl AgicashWallet {
             refresh_token: resp.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
+        self.persist_session(&persisted).await;
         Ok(persisted.into())
     }
 
@@ -326,6 +441,10 @@ impl AgicashWallet {
             }
         }
         *self.session.write().await = None;
+        // Drop the persisted blob too (no-op if storage isn't installed).
+        // Order matters: clear in-memory first so a crash mid-clear still
+        // logs the user out at the in-memory layer.
+        self.clear_persisted_session().await;
         Ok(())
     }
 
@@ -1244,6 +1363,46 @@ impl AgicashWallet {
                 state: crate::send::SendSwapClaimState::Pending,
                 failure_reason: None,
             })
+        }
+    }
+}
+
+// Internal (non-FFI) helpers. Kept out of the `#[uniffi::export]` impl
+// block so UniFFI's bindgen doesn't try to lift `&PersistedSession`
+// across the FFI boundary — it isn't a UniFFI type.
+impl AgicashWallet {
+    /// Write the given session through to the installed
+    /// [`SessionStorage`] (if any). Errors are logged but not surfaced —
+    /// auth methods should succeed even if persistence fails; the
+    /// session is still usable in-memory for the rest of the process
+    /// lifetime, the user just won't survive a cold start.
+    async fn persist_session(&self, session: &PersistedSession) {
+        let storage_opt = self.session_storage.read().await.clone();
+        if let Some(storage) = storage_opt {
+            if let Err(e) = storage.store(session).await {
+                tracing::warn!(
+                    target: "agicash_ffi::wallet",
+                    error = %e,
+                    "persist_session: storage.store() failed (continuing in-memory)"
+                );
+            }
+        }
+    }
+
+    /// Clear any persisted session blob. Called from `auth_logout`.
+    /// Errors are logged but not surfaced — logout always returns Ok so
+    /// the UI can navigate back to the sign-in screen even if the
+    /// on-disk clear failed.
+    async fn clear_persisted_session(&self) {
+        let storage_opt = self.session_storage.read().await.clone();
+        if let Some(storage) = storage_opt {
+            if let Err(e) = storage.clear().await {
+                tracing::warn!(
+                    target: "agicash_ffi::wallet",
+                    error = %e,
+                    "clear_persisted_session: storage.clear() failed"
+                );
+            }
         }
     }
 }

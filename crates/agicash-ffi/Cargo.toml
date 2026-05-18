@@ -11,6 +11,21 @@ description = "FFI bindings for the Agicash wallet SDK"
 crate-type = ["lib", "cdylib", "staticlib"]
 name = "agicash_ffi"
 
+[features]
+default = []
+# Re-export of `agicash-auth-opensecret`'s `android-file-storage` feature.
+# The `AndroidFileSessionStorage` type the FFI wallet installs in
+# `set_session_storage_dir` lives behind this feature. We don't gate it on
+# `target_os = "android"` in this crate's `[features]` table because cargo
+# features must be target-independent; the actual storage type is itself
+# only re-exported on `target_os = "android"` (see
+# `crates/agicash-auth-opensecret/src/lib.rs`), so on iOS / host this
+# feature only pulls in the `aes-gcm` dep at the cost of a few hundred kb.
+# The Kotlin bindings wrapper crate (`bindings/kotlin/rust/Cargo.toml`)
+# enables this feature on the agicash-ffi dep so Android builds get the
+# file backend; iOS bindings + tests leave it off.
+android-file-storage = ["agicash-auth-opensecret/android-file-storage"]
+
 [dependencies]
 agicash-domain = { path = "../agicash-domain" }
 agicash-money = { path = "../agicash-money" }

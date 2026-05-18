@@ -20,7 +20,14 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-agicash-ffi = { path = "../../../crates/agicash-ffi" }
+# Enable the Android file-backed session storage feature so the Kotlin
+# bindings include `AgicashWallet::set_session_storage_dir`'s persistent
+# path (AES-256-GCM blob in the app's private data dir). The underlying
+# `AndroidFileSessionStorage` type is target-gated to `target_os = "android"`
+# at the storage crate's lib.rs; this feature just makes sure the supporting
+# `aes-gcm` dep is compiled in for cross-targets so the same cdylib works
+# across the three Android ABIs cargo-ndk produces.
+agicash-ffi = { path = "../../../crates/agicash-ffi", features = ["android-file-storage"] }
 # `bindgen` + `cli` features pull in the Kotlin binding generator and the
 # multi-language CLI wrapper. The custom `uniffi-bindgen` bin below just
 # invokes uniffi::uniffi_bindgen_main() which dispatches on `--language`.
