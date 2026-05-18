@@ -116,6 +116,16 @@ pub struct AgicashWallet {
     /// data dir); iOS keeps using its `SessionStore` keychain wrapper on
     /// the Swift side and leaves this slot empty.
     session_storage: Arc<RwLock<Option<Arc<dyn SessionStorage + Send + Sync>>>>,
+    /// Realtime subscription supervisor task. Populated by
+    /// `start_wallet_events`; aborted by `stop_wallet_events`. The
+    /// supervisor runs the connect→join→serve→reconnect loop on a
+    /// tokio task and forwards events to the registered listener.
+    realtime_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// The live `WalletRealtimeService` behind `realtime_task`. Held so
+    /// `stop_wallet_events` can `phx_leave` + close the socket before
+    /// the task is aborted (a bare `abort()` would drop the socket
+    /// without a clean leave).
+    realtime_service: Arc<RwLock<Option<Arc<agicash_realtime::WalletRealtimeService>>>>,
 }
 
 impl std::fmt::Debug for AgicashWallet {
@@ -260,6 +270,8 @@ impl AgicashWallet {
             melt_quote_storage,
             session: Arc::new(RwLock::new(None)),
             session_storage: Arc::new(RwLock::new(None)),
+            realtime_task: Arc::new(RwLock::new(None)),
+            realtime_service: Arc::new(RwLock::new(None)),
         }))
     }
 
@@ -1707,6 +1719,106 @@ impl AgicashWallet {
             to_currency,
         ))
     }
+
+    // ---- realtime wallet events (slice 10) ----
+
+    /// Start the realtime wallet-event subscription for the
+    /// currently-logged-in user. Joins `realtime:wallet:<userId>` and
+    /// forwards every DB broadcast + (re)connect signal to `listener`.
+    /// This replaces the platform Tier-1 balance pollers (the
+    /// `on_connected` callback is the no-replay catch-up trigger, spec
+    /// §5.5; `on_event` carries the opaque `(event, payload_json)` the
+    /// caller demuxes).
+    ///
+    /// The supervisor runs on a tokio task; the user JWT comes from the
+    /// **same** `OpenSecretTokenProvider` the wallet builds for storage
+    /// (`new`, wrapped through `TokenProviderJwtSource`), so the
+    /// realtime `access_token` rotates with the rest of the session. A
+    /// prior subscription (if any) is replaced + aborted.
+    ///
+    /// Errors with `FfiError::Auth { UNAUTHENTICATED }` if no session is
+    /// loaded (there is no user id to scope the channel to).
+    pub async fn start_wallet_events(
+        &self,
+        listener: Box<dyn crate::WalletEventListener>,
+    ) -> Result<(), FfiError> {
+        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
+            code: crate::error::auth_code::UNAUTHENTICATED,
+            message: "not authenticated".into(),
+        })?;
+        let user_id = session.user_id.to_string();
+
+        // Reuse the wallet's OpenSecret session: the realtime channel
+        // `access_token` is the same third-party JWT storage uses
+        // (spec §2.2/§5.6). Rebuilt from `self.client` exactly as the
+        // storage token provider is in `new`.
+        let token_provider: Arc<dyn TokenProvider + Send + Sync> =
+            Arc::new(OpenSecretTokenProvider::new(self.client.clone()));
+        let jwt: Arc<dyn agicash_realtime::client::JwtSource> = Arc::new(
+            agicash_realtime::service::TokenProviderJwtSource(token_provider),
+        );
+        let factory: Arc<dyn agicash_realtime::service::TransportFactory> =
+            Arc::new(crate::realtime::NativeTransportFactory);
+        let svc = Arc::new(agicash_realtime::WalletRealtimeService::new(
+            &self.storage.supabase_base_url(),
+            &self.storage.anon_key_for_realtime(),
+            user_id,
+            jwt,
+            factory,
+        ));
+
+        let mut rx = svc.subscribe();
+        // `Box<dyn WalletEventListener>` is `Send + Sync` (UniFFI's
+        // foreign shim); behind an `Arc` so the spawned pump owns a
+        // clone for the lifetime of the task.
+        let listener: Arc<dyn crate::WalletEventListener> = Arc::from(listener);
+        let svc_run = Arc::clone(&svc);
+        let handle = tokio::spawn(async move {
+            // Pump: drain the service's broadcast receiver and fan each
+            // event out to the foreign listener via the FFI bridge.
+            let pump = {
+                let listener = Arc::clone(&listener);
+                async move {
+                    while let Ok(ev) = rx.recv().await {
+                        crate::realtime::dispatch_realtime_event(listener.as_ref(), ev);
+                    }
+                }
+            };
+            // Drive the supervisor + pump together; `stop()` (via
+            // `stop_wallet_events`) ends `run()`, after which the
+            // broadcast sender drops and the pump's `recv()` returns
+            // `Err`, ending the task cleanly even before `abort()`.
+            tokio::join!(svc_run.run(), pump);
+        });
+
+        // Replace + abort any prior subscription.
+        if let Some(old) = self.realtime_task.write().await.replace(handle) {
+            old.abort();
+        }
+        if let Some(old_svc) = self
+            .realtime_service
+            .write()
+            .await
+            .replace(Arc::clone(&svc))
+        {
+            old_svc.stop();
+        }
+        Ok(())
+    }
+
+    /// Stop the realtime subscription: `phx_leave` + close the socket
+    /// (clean), then abort the supervisor task. Idempotent — calling it
+    /// with nothing running is a no-op (the platform calls it
+    /// unconditionally on teardown / sign-out).
+    pub async fn stop_wallet_events(&self) -> Result<(), FfiError> {
+        if let Some(svc) = self.realtime_service.write().await.take() {
+            svc.stop();
+        }
+        if let Some(h) = self.realtime_task.write().await.take() {
+            h.abort();
+        }
+        Ok(())
+    }
 }
 
 // Internal (non-FFI) helpers. Kept out of the `#[uniffi::export]` impl
@@ -3068,5 +3180,112 @@ mod tests {
         assert!(
             matches!(err, FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED)
         );
+    }
+
+    /// `start_wallet_events` must reject (not panic) when no session is
+    /// loaded — the realtime channel is `realtime:wallet:<userId>` and
+    /// there is no user id to join without a session.
+    #[tokio::test]
+    async fn start_wallet_events_requires_session() {
+        struct L;
+        impl crate::WalletEventListener for L {
+            fn on_connected(&self) {}
+            fn on_event(&self, _: String, _: String) {}
+            fn on_status(&self, _: crate::RealtimeStatusFfi) {}
+            fn on_error(&self, _: String) {}
+        }
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        // No session set → must error, not panic.
+        let r = w.start_wallet_events(Box::new(L)).await;
+        assert!(r.is_err());
+        assert!(
+            matches!(r, Err(FfiError::Auth { code, .. }) if code == crate::error::auth_code::UNAUTHENTICATED)
+        );
+    }
+
+    /// `stop_wallet_events` with nothing running is a clean no-op (the
+    /// platform calls it unconditionally on teardown).
+    #[tokio::test]
+    async fn stop_wallet_events_without_start_is_noop() {
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        w.stop_wallet_events().await.expect("stop is a no-op");
+    }
+
+    /// Hermetic bridge smoke test: a fake `WalletEventListener` receives
+    /// the right callback for each synthetic `WalletRealtimeEvent`
+    /// pushed through the FFI bridge (`dispatch_realtime_event`) — no
+    /// socket, tokio task, or live Supabase stack. This proves the
+    /// Stage-3 surface (`WalletRealtimeEvent` → Swift/Kotlin callbacks)
+    /// without depending on Stages 1/2 runtime behavior.
+    #[test]
+    fn bridge_forwards_each_event_variant_to_listener() {
+        use agicash_realtime::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            connected: Mutex<u32>,
+            events: Mutex<Vec<(String, String)>>,
+            statuses: Mutex<Vec<crate::RealtimeStatusFfi>>,
+            errors: Mutex<Vec<String>>,
+        }
+        impl crate::WalletEventListener for Recorder {
+            fn on_connected(&self) {
+                *self.connected.lock().unwrap() += 1;
+            }
+            fn on_event(&self, event: String, payload_json: String) {
+                self.events.lock().unwrap().push((event, payload_json));
+            }
+            fn on_status(&self, status: crate::RealtimeStatusFfi) {
+                self.statuses.lock().unwrap().push(status);
+            }
+            fn on_error(&self, message: String) {
+                self.errors.lock().unwrap().push(message);
+            }
+        }
+
+        let rec = Recorder::default();
+
+        crate::realtime::dispatch_realtime_event(&rec, WalletRealtimeEvent::Connected);
+        crate::realtime::dispatch_realtime_event(
+            &rec,
+            WalletRealtimeEvent::Event(WalletEvent {
+                event: "TRANSACTION_CREATED".into(),
+                payload_json: r#"{"id":"abc"}"#.into(),
+            }),
+        );
+        crate::realtime::dispatch_realtime_event(
+            &rec,
+            WalletRealtimeEvent::StatusChanged(RealtimeStatus::Subscribed),
+        );
+        crate::realtime::dispatch_realtime_event(&rec, WalletRealtimeEvent::Error("boom".into()));
+
+        assert_eq!(*rec.connected.lock().unwrap(), 1);
+        assert_eq!(
+            *rec.events.lock().unwrap(),
+            vec![(
+                "TRANSACTION_CREATED".to_string(),
+                r#"{"id":"abc"}"#.to_string()
+            )]
+        );
+        assert_eq!(
+            *rec.statuses.lock().unwrap(),
+            vec![crate::RealtimeStatusFfi::Subscribed]
+        );
+        assert_eq!(*rec.errors.lock().unwrap(), vec!["boom".to_string()]);
     }
 }

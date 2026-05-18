@@ -158,6 +158,28 @@ impl SupabaseStorage {
         })
     }
 
+    /// Supabase project base URL with the `/rest/v1` suffix stripped
+    /// (e.g. `https://xxx.supabase.co`). The realtime client's
+    /// `build_connect_url` appends `/realtime/v1/websocket`, so it needs
+    /// the project root, not the REST endpoint. Additive read-only
+    /// getter for the slice-10 realtime FFI bridge.
+    #[must_use]
+    pub fn supabase_base_url(&self) -> String {
+        self.rest_url
+            .trim_end_matches('/')
+            .strip_suffix("/rest/v1")
+            .unwrap_or(&self.rest_url)
+            .to_string()
+    }
+
+    /// The Supabase anon (public) API key. Realtime joins it as the
+    /// socket `apikey` query param (the per-user JWT is the channel
+    /// `access_token`, supplied separately). Additive read-only getter.
+    #[must_use]
+    pub fn anon_key_for_realtime(&self) -> String {
+        self.anon_key.clone()
+    }
+
     /// Build a `postgrest::Postgrest` instance scoped to the `wallet` schema
     /// with per-request auth headers. Called once per RPC/select. Reuses the
     /// shared `reqwest::Client` so platform-verifier TLS settings are applied

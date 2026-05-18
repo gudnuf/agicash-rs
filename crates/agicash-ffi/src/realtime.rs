@@ -9,11 +9,11 @@
 //! does). Leptos does NOT use this surface — it consumes
 //! `agicash-realtime` directly (it links the Rust crates, not the FFI).
 //!
-//! `WalletEventListener` is the first UniFFI `callback_interface` in
-//! this crate. UniFFI marshals callbacks across the FFI boundary; the
+//! `WalletEventListener` is the first `UniFFI` `callback_interface` in
+//! this crate. `UniFFI` marshals callbacks across the FFI boundary; the
 //! Swift/Kotlin object MUST be safe to invoke from a background thread
 //! (the realtime supervisor runs on a tokio task — see
-//! [`crate::AgicashWallet::start_wallet_events`]). UniFFI's generated
+//! [`crate::AgicashWallet::start_wallet_events`]). `UniFFI`'s generated
 //! `Box<dyn WalletEventListener>` foreign shim is `Send + Sync`, which
 //! is why the trait carries those bounds: the bridge holds the listener
 //! behind an `Arc` and invokes it from the spawned supervisor task, not
@@ -80,6 +80,26 @@ pub trait WalletEventListener: Send + Sync {
     fn on_status(&self, status: RealtimeStatusFfi);
     /// Non-fatal/observability error string.
     fn on_error(&self, message: String);
+}
+
+/// Map one realtime event onto the listener. This is the entire
+/// FFI-side bridge: the supervisor pump in
+/// [`crate::AgicashWallet::start_wallet_events`] calls this for every
+/// `WalletRealtimeEvent` drained off the service's `async_broadcast`
+/// receiver. Factored out (rather than inlined in the pump) so it is
+/// hermetically smoke-testable: a fake listener + a synthetic event,
+/// no socket / tokio task / live stack required.
+pub(crate) fn dispatch_realtime_event(
+    listener: &dyn WalletEventListener,
+    ev: agicash_realtime::WalletRealtimeEvent,
+) {
+    use agicash_realtime::WalletRealtimeEvent as E;
+    match ev {
+        E::Connected => listener.on_connected(),
+        E::Event(e) => listener.on_event(e.event, e.payload_json),
+        E::StatusChanged(s) => listener.on_status(s.into()),
+        E::Error(m) => listener.on_error(m),
+    }
 }
 
 /// Builds the native (`tokio-tungstenite`) transport on every
