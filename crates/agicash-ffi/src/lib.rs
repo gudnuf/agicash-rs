@@ -16,6 +16,7 @@ pub mod account;
 #[cfg(target_os = "android")]
 pub mod android_tls;
 pub mod error;
+pub mod exchange_rate;
 pub mod lightning_address;
 pub mod melt_quote;
 pub mod mint;
@@ -30,6 +31,7 @@ pub mod wallet;
 
 pub use account::*;
 pub use error::*;
+pub use exchange_rate::*;
 pub use lightning_address::*;
 pub use melt_quote::*;
 pub use mint::*;

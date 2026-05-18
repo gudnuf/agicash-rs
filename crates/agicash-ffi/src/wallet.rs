@@ -12,6 +12,7 @@
 
 use crate::account::AccountFfi;
 use crate::error::FfiError;
+use crate::exchange_rate::ExchangeRateSnapshot;
 use crate::melt_quote::{
     MeltQuoteFfiState, MeltQuoteHandle, MeltQuotePreview as MeltQuotePreviewFfi, MeltQuoteSnapshot,
 };
@@ -35,6 +36,7 @@ use agicash_cashu::{
     TokenProof,
 };
 use agicash_domain::{Account, AccountId, AccountPurpose, AccountType, Currency, UserId};
+use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
 use agicash_money::{Money, Unit};
 use agicash_storage_supabase::{
     SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage, SupabaseCashuReceiveSwapStorage,
@@ -1652,6 +1654,59 @@ impl AgicashWallet {
 
         Ok(melt_quote_snapshot_from_outcome(&outcome))
     }
+
+    // ---- exchange rate (read-only price feed) surface ----
+
+    /// Fetch the current exchange rate for one currency pair.
+    ///
+    /// Mirrors the CLI's `build_exchange_rate_deps` /
+    /// `provider.get_rate(...)` sequence (`crates/agicash-cli/src/{composition,mint}.rs`):
+    /// the slice-4 `MempoolSpaceProvider` is stateless and
+    /// auth-independent (no session, no Supabase row), so it's
+    /// constructed on demand here instead of being held in a wallet
+    /// slot. `from` / `to` are case-insensitive currency codes
+    /// (`BTC`, `USD`, `USDB`); the returned
+    /// [`ExchangeRateSnapshot`] echoes them back canonically
+    /// upper-cased.
+    ///
+    /// The returned `rate` is the price of `1` major unit of `from`
+    /// denominated in major units of `to`, decimal-stringified
+    /// (matching the `ReceiveResult.amount` convention). The
+    /// provider supports `BTC<->USD`; any other pair surfaces as
+    /// `FfiError::Internal` (`unsupported-pair`, mirroring the CLI's
+    /// `classify_rate_error`).
+    ///
+    /// Errors (all funnel to `FfiError::Internal`, matching
+    /// `prepare_melt_quote`'s pattern — no auth/storage layer is
+    /// touched):
+    /// - unknown currency code in `from` / `to`,
+    /// - `unsupported-pair` for a pair the provider can't price,
+    /// - `network-error` / `invalid-response` from the upstream
+    ///   `mempool.space` fetch.
+    pub async fn get_exchange_rate(
+        &self,
+        from: String,
+        to: String,
+    ) -> Result<ExchangeRateSnapshot, FfiError> {
+        let from_currency = Currency::from_str(&from)
+            .map_err(|_| FfiError::internal(format!("unsupported currency: {from}")))?;
+        let to_currency = Currency::from_str(&to)
+            .map_err(|_| FfiError::internal(format!("unsupported currency: {to}")))?;
+
+        // Stateless provider, constructed on demand. Mirrors the CLI's
+        // `build_exchange_rate_deps()` — same `MempoolSpaceProvider::new()`.
+        let provider = MempoolSpaceProvider::new();
+        let rate = provider
+            .get_rate(from_currency, to_currency)
+            .await
+            .map_err(exchange_rate_error_to_ffi)?;
+
+        Ok(exchange_rate_snapshot_from(
+            &rate,
+            from_currency,
+            to_currency,
+        ))
+    }
 }
 
 // Internal (non-FFI) helpers. Kept out of the `#[uniffi::export]` impl
@@ -2247,6 +2302,45 @@ fn melt_quote_snapshot_from_outcome(outcome: &MeltOutcome) -> MeltQuoteSnapshot 
     melt_quote_snapshot_from(quote)
 }
 
+// ---- exchange-rate (read-only price feed) helpers ----
+
+/// Map `ExchangeRateError` down to `FfiError`. Same funneling pattern
+/// as `melt_quote_error_to_ffi` — every variant collapses to
+/// `FfiError::Internal` (the price feed touches no auth/storage
+/// layer, so there's no structured `Auth`/`Storage` bucket to route
+/// to). The message prefixes mirror the CLI's `classify_rate_error`
+/// tags (`network-error` / `invalid-response` / `unsupported-pair`,
+/// `crates/agicash-cli/src/mint.rs`) so operators can grep the same
+/// strings across the CLI and the iOS error surface.
+fn exchange_rate_error_to_ffi(e: ExchangeRateError) -> FfiError {
+    match e {
+        ExchangeRateError::Network(msg) => FfiError::internal(format!("network-error: {msg}")),
+        ExchangeRateError::InvalidResponse(msg) => {
+            FfiError::internal(format!("invalid-response: {msg}"))
+        }
+        ExchangeRateError::UnsupportedPair { from, to } => {
+            FfiError::internal(format!("unsupported-pair: {from} -> {to}"))
+        }
+    }
+}
+
+/// Build the [`ExchangeRateSnapshot`] returned by
+/// `get_exchange_rate`. Decimal-stringifies the rate to match the
+/// `ReceiveResult.amount` / `MeltQuotePreview` convention, and echoes
+/// the parsed pair back as canonical upper-case codes via
+/// `Currency`'s `Display`.
+fn exchange_rate_snapshot_from(
+    rate: &Decimal,
+    from: Currency,
+    to: Currency,
+) -> ExchangeRateSnapshot {
+    ExchangeRateSnapshot {
+        rate: rate.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+    }
+}
+
 // ---- cashu send-swap helpers ----
 
 /// Encode a slice of `TokenProof` into a V4 (`cashuB…`) wire token.
@@ -2807,6 +2901,108 @@ mod tests {
         let outcome = MeltOutcome::Pending(q);
         let snap = melt_quote_snapshot_from_outcome(&outcome);
         assert_eq!(snap.state, MeltQuoteFfiState::Pending);
+    }
+
+    // ---- exchange-rate (read-only price feed) helper tests ----
+
+    #[test]
+    fn exchange_rate_error_to_ffi_maps_network() {
+        let e = exchange_rate_error_to_ffi(ExchangeRateError::Network("timeout".into()));
+        assert!(matches!(
+            e,
+            FfiError::Internal { ref message }
+                if message.contains("network-error") && message.contains("timeout")
+        ));
+    }
+
+    #[test]
+    fn exchange_rate_error_to_ffi_maps_invalid_response() {
+        let e = exchange_rate_error_to_ffi(ExchangeRateError::InvalidResponse("not json".into()));
+        assert!(matches!(
+            e,
+            FfiError::Internal { ref message }
+                if message.contains("invalid-response") && message.contains("not json")
+        ));
+    }
+
+    #[test]
+    fn exchange_rate_error_to_ffi_maps_unsupported_pair() {
+        let e = exchange_rate_error_to_ffi(ExchangeRateError::UnsupportedPair {
+            from: Currency::Btc,
+            to: Currency::Usdb,
+        });
+        assert!(matches!(
+            e,
+            FfiError::Internal { ref message }
+                if message.contains("unsupported-pair")
+                    && message.contains("BTC")
+                    && message.contains("USDB")
+        ));
+    }
+
+    #[test]
+    fn exchange_rate_snapshot_from_stringifies_rate_and_canonicalises_pair() {
+        use rust_decimal::Decimal;
+        let rate = Decimal::new(5_012_345, 2); // 50123.45
+        let snap = exchange_rate_snapshot_from(&rate, Currency::Btc, Currency::Usd);
+        assert_eq!(snap.rate, "50123.45");
+        assert_eq!(snap.from, "BTC");
+        assert_eq!(snap.to, "USD");
+    }
+
+    #[test]
+    fn exchange_rate_snapshot_from_preserves_inverse_precision() {
+        use rust_decimal::Decimal;
+        // 8-dp inverse rate (USD->BTC), as the mempool provider rounds it.
+        let rate = Decimal::new(1995, 8); // 0.00001995
+        let snap = exchange_rate_snapshot_from(&rate, Currency::Usd, Currency::Btc);
+        assert_eq!(snap.rate, "0.00001995");
+        assert_eq!(snap.from, "USD");
+        assert_eq!(snap.to, "BTC");
+    }
+
+    #[tokio::test]
+    async fn get_exchange_rate_rejects_unknown_currency() {
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet
+            .get_exchange_rate("BTC".into(), "XYZ".into())
+            .await
+            .expect_err("unknown target currency");
+        assert!(matches!(
+            err,
+            FfiError::Internal { ref message }
+                if message.contains("unsupported currency") && message.contains("XYZ")
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_exchange_rate_rejects_unsupported_pair_before_network() {
+        // BTC->USDB is a known currency pair the provider can't price.
+        // The provider short-circuits with `UnsupportedPair` before any
+        // HTTP call, so this is deterministic offline.
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet
+            .get_exchange_rate("BTC".into(), "USDB".into())
+            .await
+            .expect_err("unsupported pair");
+        assert!(matches!(
+            err,
+            FfiError::Internal { ref message } if message.contains("unsupported-pair")
+        ));
     }
 
     #[tokio::test]
