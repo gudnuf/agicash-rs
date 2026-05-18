@@ -180,6 +180,7 @@ dependencies = [
  "agicash-exchange-rate",
  "agicash-lightning-address",
  "agicash-money",
+ "agicash-realtime",
  "agicash-storage-supabase",
  "agicash-traits",
  "async-trait",

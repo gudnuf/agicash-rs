@@ -35,6 +35,7 @@ agicash-storage-supabase = { path = "../agicash-storage-supabase" }
 agicash-cashu = { path = "../agicash-cashu" }
 agicash-exchange-rate = { path = "../agicash-exchange-rate" }
 agicash-lightning-address = { path = "../agicash-lightning-address" }
+agicash-realtime = { path = "../agicash-realtime" }
 async-trait = { workspace = true }
 cdk = { workspace = true }
 chrono = { workspace = true }
