@@ -13,56 +13,28 @@
 //! updates after a Receive completes, and no cross-page refetch on
 //! navigation.
 //!
-//! ## Where does the data actually come from today?
+//! ## Where does the data come from now?
 //!
-//! [`WalletData::refresh`] uses a **direct Supabase REST fetch path**
-//! (via [`gloo_net`]) rather than the typed `agicash-storage-supabase`
-//! crate. That crate's `SupabaseStorage` is not yet wasm-compat
-//! because of rustls / ring / tokio-net dependencies; porting it is a
-//! multi-day effort tracked in the followup spec named
-//! `2026-05-17-storage-supabase-wasm-port-design.md`.
+//! [`WalletData::refresh`] uses the typed `agicash-storage-supabase`
+//! crate — the same `SupabaseStorage` the iOS / Android / CLI binaries
+//! call. The previous direct `gloo-net` REST path is gone (spec:
+//! `2026-05-17-storage-supabase-wasm-port-design.md` — port shipped
+//! 2026-05-17 / -18).
 //!
 //! The fetch path:
 //!
 //! 1. Read `user_id` from `BrowserSessionStorage` (already persisted by
 //!    [`LoginView`] on successful auth).
 //! 2. Build an `OpenSecretTokenProvider` from the [`AppConfig`] context
-//!    and call `get_jwt()` to mint a Supabase-compatible JWT
-//!    (`generate_third_party_token` against the enclave).
-//! 3. `GET <supabase-url>/rest/v1/accounts?user_id=eq.<uuid>` with
-//!    `Authorization: Bearer <jwt>` and `apikey: <anon_key>`.
-//! 4. Map each row into [`AccountSummary`] (balance left at zero — see
-//!    the balance follow-up note below).
-//!
-//! ### Why this is acceptable as the interim path
-//!
-//! - The Supabase REST surface is stable (it's just `PostgREST` over
-//!   the `wallet.accounts` table; the typed `SupabaseStorage` calls
-//!   the same endpoint).
-//! - RLS on the server enforces `auth.uid() = user_id`, so a wrong
-//!   JWT just returns an empty list (not a leak).
-//! - When the storage-supabase wasm port lands, only the body of
-//!   [`WalletData::refresh`] changes. The signal shapes, the
-//!   `AccountSummary` struct, the consumers in `pages/home.rs` — all
-//!   stay put. See the `// FOLLOWUP[storage-supabase-wasm]` marker on
-//!   the fetch helpers.
-//!
-//! ## Balance: still zero per account in this slice
-//!
-//! `wallet.accounts` rows do NOT carry a `balance` column. The balance
-//! lives in `wallet.cashu_proofs` (one row per UNSPENT proof) and must
-//! be summed per account after decryption (see
-//! `agicash-ffi::wallet::compute_cashu_balance` and
-//! `agicash_storage_supabase::SupabaseCashuSendSwapStorage::list_unspent_proofs`).
-//!
-//! Decryption uses `agicash-cashu::PassthroughProofEncryption` for now,
-//! but the proof storage also needs the same wasm-compat fixes as
-//! the account storage. So this slice ships **account count + currency
-//! list but zero balances**. The hero will render `$ 0 / ≈ 0 sats`
-//! which is correct for a fresh account and gracefully degrades for
-//! accounts with actual balance — the user sees the account exists,
-//! the demo is visibly working, but the real balance number waits for
-//! the next slice.
+//!    and pass it to `SupabaseStorage::new`. JWTs are minted on
+//!    each call via `OpenSecretClient::generate_third_party_token`
+//!    (cached server-side).
+//! 3. `storage.list_accounts(user_id).await` — typed postgrest call,
+//!    same surface every other platform uses.
+//! 4. Per Cashu account, `send_swap_storage.list_unspent_proofs(account.id)`
+//!    and sum each proof's `.amount` (mirrors
+//!    `agicash_ffi::wallet::compute_cashu_balance`). Spark accounts
+//!    render `balance = 0` until their proof storage lands.
 //!
 //! ## Empty-state correctness
 //!
@@ -123,8 +95,9 @@ impl<T> LoadState<T> {
 pub struct AccountSummary {
     /// `"BTC"` | `"USD"` | `"USDB"`. Same labels as `AccountFfi.currency`.
     pub currency: String,
-    /// Smallest-unit balance. Always 0 in this slice; the proof-sum
-    /// path lands when `agicash-storage-supabase` is wasm-compat.
+    /// Smallest-unit balance. For Cashu accounts this is the sum of the
+    /// account's UNSPENT proofs (decrypted via the storage layer); for
+    /// Spark accounts it's 0 until Spark's proof storage lands.
     pub balance: u64,
 }
 
@@ -155,10 +128,9 @@ impl WalletData {
     /// build (used by `cargo test` on the pure pieces) treats this as a
     /// no-op so unit tests on view helpers don't need a browser.
     ///
-    /// On wasm: loads the session, fetches accounts via the direct
-    /// Supabase REST path (see the module docs for the rationale), and
-    /// populates the signals. Balance stays at 0 per account in this
-    /// slice — see the followup spec.
+    /// On wasm: loads the session, constructs a `SupabaseStorage`, calls
+    /// `list_accounts` + (per Cashu account) `list_unspent_proofs`, and
+    /// populates the signals with real balances.
     pub fn refresh(self) {
         // Loading state visible immediately so the view can show a
         // spinner even before the async work yields.
@@ -187,7 +159,7 @@ impl WalletData {
             match load_session_user_id().await {
                 Ok(Some(uid)) => {
                     self.user_id.set(Some(uid));
-                    match fetch_accounts_via_rest(&config, uid).await {
+                    match fetch_account_summaries(&config, uid).await {
                         Ok(accounts) => {
                             self.accounts.set(LoadState::Ready(accounts));
                         }
@@ -241,30 +213,25 @@ async fn load_session_user_id() -> Result<Option<Uuid>, String> {
     }
 }
 
-// ---- Direct Supabase REST fetch path ----------------------------------
-//
-// FOLLOWUP[storage-supabase-wasm]: when `agicash-storage-supabase`
-// builds on wasm32 (see `2026-05-17-storage-supabase-wasm-port-design.md`),
-// delete this section and call `SupabaseStorage::list_accounts(uid)`
-// directly. The `AccountSummary` mapping is the only piece that needs
-// to stay (the typed `agicash_domain::Account` carries more fields).
-
-/// Account row shape returned by `GET /rest/v1/accounts`. Subset of
-/// the full `wallet.accounts` schema — only the fields the home hero
-/// and accounts page render. Postgres returns ISO timestamp strings
-/// and JSON values directly; we strip `details` since the home page
-/// does not render mint URLs.
+/// Build the typed `SupabaseStorage` + the send-swap storage helper,
+/// fetch the user's accounts, and compute the per-account balance.
+///
+/// Mirrors `agicash_ffi::wallet::list_accounts` + `compute_cashu_balance`.
 #[cfg(target_arch = "wasm32")]
-#[derive(Debug, serde::Deserialize)]
-struct AccountRow {
-    currency: String,
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn fetch_accounts_via_rest(
+async fn fetch_account_summaries(
     config: &AppConfig,
     user_id: Uuid,
 ) -> Result<Vec<AccountSummary>, String> {
+    use std::sync::Arc;
+
+    use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
+    use agicash_cashu::CashuSendSwapStorage;
+    use agicash_domain::{AccountType, UserId};
+    use agicash_storage_supabase::{
+        SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
+    };
+    use agicash_traits::{PassthroughProofEncryption, ProofEncryption, TokenProvider, UserStorage};
+
     if config.supabase_anon_key.is_empty() {
         return Err(
             "Supabase anon key missing — set <meta name=\"supabase-anon-key\"> in \
@@ -273,76 +240,68 @@ async fn fetch_accounts_via_rest(
         );
     }
 
-    let jwt = mint_supabase_jwt(config).await?;
-
-    // Postgrest filter: `user_id=eq.<uuid>`. The `select=currency`
-    // narrows the projection to only the columns we deserialize.
-    let url = format!(
-        "{base}/rest/v1/accounts?user_id=eq.{user_id}&select=currency",
-        base = config.supabase_url.trim_end_matches('/'),
-    );
-
-    let response = gloo_net::http::Request::get(&url)
-        .header("apikey", &config.supabase_anon_key)
-        .header("Authorization", &format!("Bearer {jwt}"))
-        .header("Accept", "application/json")
-        // PostgREST switches schema via the `Accept-Profile` (read) /
-        // `Content-Profile` (write) headers. The typed client (`postgrest::Postgrest::schema`)
-        // does the same thing under the hood; here we set it directly.
-        .header("Accept-Profile", "wallet")
-        .send()
-        .await
-        .map_err(|e| format!("supabase fetch failed: {e}"))?;
-
-    let status = response.status();
-    if !(200..300).contains(&status) {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("supabase returned {status}: {body}"));
-    }
-
-    let rows: Vec<AccountRow> = response
-        .json()
-        .await
-        .map_err(|e| format!("supabase response decode failed: {e}"))?;
-
-    // FOLLOWUP[balances]: per-account balance sums need
-    // `cashu_proofs` + the CashuSendSwapStorage decryption path.
-    // Today every account renders zero, which still gives a visibly
-    // correct hero ($ 0 / ≈ 0 sats) and a populated currency list.
-    let summaries = rows
-        .into_iter()
-        .map(|row| AccountSummary {
-            currency: row.currency,
-            balance: 0,
-        })
-        .collect();
-
-    Ok(summaries)
-}
-
-/// Mint a Supabase-compatible JWT via opensecret's
-/// `generate_third_party_token` (wasm-clean). Wraps the
-/// `OpenSecretTokenProvider` from `agicash-auth-opensecret` so the same
-/// machinery the native FFI uses is exercised on wasm too.
-#[cfg(target_arch = "wasm32")]
-async fn mint_supabase_jwt(config: &AppConfig) -> Result<String, String> {
-    use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
-    use agicash_traits::TokenProvider;
-
+    // OpenSecret-backed token provider: reuses the browser session's
+    // refresh token (in `window.localStorage` via `BrowserSessionStorage`),
+    // mints a fresh Supabase-compatible JWT per call.
     let client = OpenSecretClient::new(OpenSecretConfig {
         base_url: config.opensecret_base_url.clone(),
         client_id: config.opensecret_client_id,
     })
     .map_err(|e| format!("build opensecret client: {e}"))?;
+    let tokens: Arc<dyn TokenProvider> = Arc::new(OpenSecretTokenProvider::new(client));
 
-    // OpenSecretTokenProvider re-uses the client's session (refresh
-    // token in browser localStorage). The handshake is cached, so
-    // back-to-back refresh() calls don't pay it twice.
-    let provider = OpenSecretTokenProvider::new(client);
-    provider
-        .get_jwt()
+    let storage = SupabaseStorage::new(
+        SupabaseStorageConfig {
+            url: config.supabase_url.clone(),
+            anon_key: config.supabase_anon_key.clone(),
+        },
+        tokens,
+    )
+    .map_err(|e| format!("build supabase storage: {e}"))?;
+
+    let accounts = storage
+        .list_accounts(UserId::from(user_id))
         .await
-        .map_err(|e| format!("supabase jwt mint failed: {e}"))
+        .map_err(|e| format!("list_accounts failed: {e}"))?;
+
+    // For per-account balance we need the send-swap storage, which
+    // wraps the same `SupabaseStorage` plus a `ProofEncryption`. The
+    // production stack uses `PassthroughProofEncryption` until the real
+    // encryption layer ships (mirrors CLI + FFI composition root).
+    let storage_arc = Arc::new(storage);
+    let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
+    let send_swap_storage =
+        SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), encryption);
+
+    let mut summaries = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let balance = match account.account_type {
+            AccountType::Cashu => match send_swap_storage.list_unspent_proofs(account.id).await {
+                Ok(proofs) => proofs.iter().map(|p| p.proof.amount).sum::<u64>(),
+                Err(e) => {
+                    // Log and continue — one account's failure shouldn't
+                    // black-hole the whole list. The user sees this
+                    // account's balance as zero with the rest intact.
+                    leptos::logging::log!(
+                        "list_unspent_proofs failed for account {}: {e}",
+                        account.id
+                    );
+                    0
+                }
+            },
+            AccountType::Spark => {
+                // Spark proof storage hasn't been wasm-ported yet (slice 9).
+                // Mirrors the FFI compute_cashu_balance Spark arm.
+                0
+            }
+        };
+        summaries.push(AccountSummary {
+            currency: account.currency.to_string(),
+            balance,
+        });
+    }
+
+    Ok(summaries)
 }
 
 #[cfg(test)]

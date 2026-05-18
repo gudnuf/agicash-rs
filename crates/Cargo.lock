@@ -330,11 +330,14 @@ name = "agicash-web-leptos"
 version = "0.1.0"
 dependencies = [
  "agicash-auth-opensecret",
+ "agicash-cashu",
+ "agicash-domain",
+ "agicash-money",
+ "agicash-storage-supabase",
  "agicash-traits",
  "cdk",
  "console_error_panic_hook",
  "getrandom 0.2.17",
- "gloo-net",
  "gloo-timers",
  "http",
  "js-sys",

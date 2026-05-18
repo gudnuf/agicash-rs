@@ -48,6 +48,17 @@ cdk = { workspace = true }
 # keeps the dep graph clean).
 agicash-auth-opensecret = { path = "../agicash-auth-opensecret", default-features = false }
 agicash-traits = { path = "../agicash-traits" }
+agicash-domain = { path = "../agicash-domain" }
+# Typed Supabase storage — wasm-clean as of the storage-supabase wasm
+# port (spec: docs/superpowers/specs/2026-05-17-storage-supabase-wasm-port-design.md).
+# Replaces the direct gloo-net Supabase REST path that used to live in
+# `WalletData::refresh`.
+agicash-storage-supabase = { path = "../agicash-storage-supabase" }
+# Cashu storage — needed for `CashuSendSwapStorage::list_unspent_proofs`
+# so the home hero can show real per-account balances. Also wasm-clean
+# after the storage-supabase port.
+agicash-cashu = { path = "../agicash-cashu" }
+agicash-money = { path = "../agicash-money" }
 
 # Browser-side runtime deps. Always-on now that ssr is gone — the
 # `target_arch = "wasm32"` cfg in `lib.rs::hydrate` keeps the native
@@ -59,14 +70,6 @@ console_error_panic_hook = "0.1"
 # mocked Cashu redeem path to simulate the WalletClient round-trip
 # (see `// TODO[slice-12]` in `components/cashu_token_paste_view.rs`).
 gloo-timers = { version = "0.3", default-features = false, features = ["futures"] }
-# `gloo-net` — wasm-native fetch wrapper used by `WalletData::refresh`
-# to call Supabase PostgREST directly. Bypasses the
-# `agicash-storage-supabase` typed layer (which is not yet wasm-compat
-# due to rustls/ring/tokio-net pulls — see follow-up spec
-# `2026-05-17-storage-supabase-wasm-port-design.md`). The end-state
-# replaces this with `SupabaseStorage::list_accounts` once the port
-# lands; the signal shape on `WalletData` stays the same.
-gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 # `js-sys` + `web-sys` — used by the `ShareSheet` component to call the
 # Web Share API (`navigator.share`) with a clipboard fallback, and by
 # the LoginView's guest-auth path for getrandom-on-wasm wiring.
