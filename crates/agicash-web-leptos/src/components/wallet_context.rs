@@ -113,22 +113,13 @@ pub struct WalletData {
     /// Account list keyed by load state. `Ready(vec![])` is the
     /// canonical empty-wallet state.
     pub accounts: RwSignal<LoadState<Vec<AccountSummary>>>,
-    /// Idempotency latch for [`WalletData::start_visibility_refresh`].
-    /// The listeners + poll are wired into the page lifetime exactly
-    /// once; a Home remount (client-side nav back to `/`) must not stack
-    /// duplicate `visibilitychange` / `focus` handlers or a second poll
-    /// loop. `false` until the first wiring call flips it.
+    /// Idempotency latch for [`WalletData::start_realtime`]. The
+    /// realtime subscription + pump are wired into the page lifetime
+    /// exactly once; a Home remount (client-side nav back to `/`) must
+    /// not stack a second `WalletRealtimeService` / socket. `false`
+    /// until the first wiring call flips it.
     reactivity_wired: RwSignal<bool>,
 }
-
-/// Foreground balance-poll interval. Mirrors the iOS / Android Tier-1
-/// plan (a ~3-5s poll while the screen is visible) and stands in for the
-/// web canonical model's Supabase Realtime channel until the Tier-2
-/// realtime FFI seam lands. Only fires while the document is visible —
-/// a backgrounded tab does no work and the `visibilitychange` handler
-/// catches it up the instant it returns to the foreground.
-#[cfg(target_arch = "wasm32")]
-const FOREGROUND_POLL_MS: u32 = 4_000;
 
 impl WalletData {
     /// Fresh `WalletData` in `Idle` state. The App root constructs one
@@ -156,9 +147,8 @@ impl WalletData {
     /// `Effect`). A detached caller — a `.forget()`-leaked DOM event
     /// closure or a bare `spawn_local` future — has no owner, so
     /// `use_context` returns `None` and the load fails with the
-    /// `AppConfig context missing` error. Detached callers (the `visibilitychange` /
-    /// `focus` listeners and the foreground poll wired by
-    /// [`WalletData::start_visibility_refresh`]) MUST instead capture the
+    /// `AppConfig context missing` error. The detached realtime pump
+    /// wired by [`WalletData::start_realtime`] MUST instead capture the
     /// `AppConfig` once inside an owner and call
     /// [`WalletData::refresh_with_config`] with the concrete value.
     pub fn refresh(self) {
@@ -179,10 +169,9 @@ impl WalletData {
 
     /// Refresh using an already-captured `AppConfig` instead of reading
     /// it from context. This is the entry point detached callers must
-    /// use: the `visibilitychange` / `focus` listeners and the
-    /// foreground poll installed by [`WalletData::start_visibility_refresh`]
-    /// run **outside** any Leptos reactive owner, so they cannot call
-    /// `use_context` themselves. [`WalletData::refresh`] captures the
+    /// use: the realtime pump spawned by [`WalletData::start_realtime`]
+    /// runs **outside** any Leptos reactive owner, so it cannot call
+    /// `use_context` itself. [`WalletData::refresh`] captures the
     /// context from inside the owner and delegates here; the detached
     /// callers carry a clone of the value captured at wiring time.
     ///
@@ -199,8 +188,8 @@ impl WalletData {
     ///   (mount Effect, the Retry button). Allowed to flip to
     ///   `LoadState::Loading` so the view can show the full-screen
     ///   spinner *while there is no data yet*.
-    /// - `true` — a silent background catch-up (the ~4s foreground poll,
-    ///   the `visibilitychange` / `focus` listeners). Stale-while-
+    /// - `true` — a silent background catch-up (a realtime
+    ///   broadcast / (re)connect catch-up). Stale-while-
     ///   revalidate: the last `Ready` value stays on screen and is only
     ///   swapped when the new fetch resolves; a failure surfaces as a
     ///   quiet `Error` *only if there was nothing to keep showing*, never
@@ -224,12 +213,14 @@ impl WalletData {
     pub fn refresh_with_config(self, config: Option<AppConfig>, background: bool) {
         // Stale-while-revalidate. Only blank the hero with the spinner
         // when this is a foreground refresh AND there is no `Ready`
-        // value to keep showing. Background refreshes (poll / focus /
-        // visibility) NEVER flip to `Loading` — they keep the last
-        // balance on screen until the async fetch below resolves, then
-        // swap in the new data (or surface a quiet inline error). This
-        // mirrors the iOS poll discipline (`refreshAccounts()` never
-        // sets a loading phase) and the web's `refetchOnWindowFocus`.
+        // value to keep showing. Background refreshes (realtime
+        // broadcast / (re)connect catch-up) NEVER flip to `Loading` —
+        // they keep the last balance on screen until the async fetch
+        // below resolves, then swap in the new data (or surface a quiet
+        // inline error). This mirrors the iOS poll discipline
+        // (`refreshAccounts()` never sets a loading phase) and the web's
+        // `refetchOnWindowFocus`. A realtime disconnect is non-fatal:
+        // the last balance stays, and the next `Connected` refetches.
         let has_ready = matches!(self.accounts.get_untracked(), LoadState::Ready(_));
         if !background && !has_ready {
             self.accounts.set(LoadState::Loading);
@@ -296,54 +287,51 @@ impl WalletData {
         });
     }
 
-    /// Wire the Tier-1 reactive-refresh layer: refresh the balance when
-    /// the tab regains focus / becomes visible, plus a slow foreground
-    /// poll. This is the Leptos analogue of the web canonical model's
-    /// `refetchOnWindowFocus:'always'` + Supabase Realtime channel
-    /// (see `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`,
-    /// the Leptos Tier-1 section). It uses **only** the existing
-    /// `fetch_account_summaries()` read path — no FFI / protocol change.
+    /// Wire the realtime reactivity source: a single Supabase-Realtime
+    /// subscription (the all-Rust `agicash-realtime` crate, linked
+    /// directly — no FFI) drives the balance refresh. This **replaces**
+    /// the deleted `start_visibility_refresh` `visibilitychange` /
+    /// `focus` / 4s-poll Tier-1 hack — that apparatus caused the
+    /// `AppConfig context`-missing regression and the spinner flicker;
+    /// realtime is the reactivity source now. The catch-up semantics
+    /// match the web canonical model's React-Query invalidation:
     ///
-    /// Mechanism (wasm only — a no-op on the native test build):
+    /// - on every `WalletRealtimeEvent::Connected` (emitted on every
+    ///   (re)join — there is **no replay**, spec §5.5) we refetch wallet
+    ///   state, catching up anything that landed while disconnected;
+    /// - on every `WalletRealtimeEvent::Event` (a DB `wallet:<uid>`
+    ///   broadcast) we refetch.
     ///
-    /// - a `visibilitychange` listener on `document`: when the document
-    ///   transitions back to visible (tab refocused, OS unlock, app
-    ///   foregrounded) it calls [`WalletData::refresh_with_config`],
-    ///   catching up any out-of-band receive that happened while
-    ///   backgrounded;
-    /// - a `focus` listener on `window`: covers window-manager focus
-    ///   changes that don't toggle `document.hidden` (e.g. alt-tab
-    ///   between two visible windows), mirroring the web app exactly;
-    /// - a ~4s foreground poll (gated on `!document.hidden()`) as the
-    ///   stand-in for the not-yet-built realtime seam, so a receive
-    ///   performed elsewhere shows up within a few seconds without the
-    ///   user touching anything.
+    /// Both refetches go through [`WalletData::refresh_with_config`] in
+    /// **background** mode (SWR / no-flicker discipline from Lane V):
+    /// the last `Ready` balance stays on screen until the new fetch
+    /// resolves; a realtime failure / disconnect is **non-fatal** — no
+    /// error screen, the prior balance is kept, and the next `Connected`
+    /// (after the service's internal reconnect/backoff) refetches.
     ///
-    /// **Owner / context capture.** Every callback above runs *outside*
-    /// any Leptos reactive owner (a `.forget()`-leaked DOM closure / a
-    /// detached `spawn_local` future), so none of them can read
-    /// `use_context::<AppConfig>()` — that always returns `None` off the
-    /// owner tree and is exactly the `AppConfig context missing`
-    /// regression. The caller (the Home mount `Effect`, which *is* inside
-    /// an owner) must pass the already-resolved `AppConfig` in; we clone
-    /// it into each detached callback and route every refresh through
-    /// [`WalletData::refresh_with_config`] so no detached path ever
-    /// touches the context.
+    /// **Owner / context capture.** The event-pump runs inside a
+    /// detached `spawn_local` future (no Leptos reactive owner), so it
+    /// can never read `use_context::<AppConfig>()` — that always returns
+    /// `None` off the owner tree and is exactly the `AppConfig context
+    /// missing` regression. The caller (the Home mount `Effect`, which
+    /// *is* inside an owner) passes the already-resolved `AppConfig`;
+    /// every refetch goes through [`WalletData::refresh_with_config`]
+    /// with the captured value so no detached path touches the context.
     ///
     /// Idempotent: the App root provides a single `WalletData`, but the
-    /// Home page mount Effect can re-run if the user navigates away and
-    /// back client-side. The `reactivity_wired` latch ensures the
-    /// listeners + poll are installed exactly once for the page's
-    /// lifetime (they intentionally outlive any single Home mount —
-    /// balance reactivity is an app-global concern, not a per-view one,
-    /// just as the web app's channel lives above the route tree).
+    /// Home page mount Effect can re-run on client-side nav back to `/`.
+    /// The `reactivity_wired` latch ensures the service + socket are
+    /// constructed exactly once for the page's lifetime (the realtime
+    /// channel is an app-global concern that outlives any single Home
+    /// mount, just as the web app's channel lives above the route tree).
     #[cfg_attr(
         not(target_arch = "wasm32"),
         allow(clippy::needless_pass_by_value, unused_variables)
     )]
-    pub fn start_visibility_refresh(&self, config: Option<AppConfig>) {
+    pub fn start_realtime(&self, config: Option<AppConfig>) {
         // Flip the latch once. If it was already set, another mount
-        // already wired everything — bail without stacking handlers.
+        // already wired the subscription — bail without stacking a
+        // second `WalletRealtimeService` / socket.
         if self.reactivity_wired.get_untracked() {
             return;
         }
@@ -351,95 +339,159 @@ impl WalletData {
 
         #[cfg(target_arch = "wasm32")]
         {
-            use wasm_bindgen::closure::Closure;
-            use wasm_bindgen::JsCast;
+            use std::sync::Arc;
 
-            let Some(window) = web_sys::window() else {
+            use agicash_realtime::{
+                TokenProviderJwtSource, WalletRealtimeEvent, WalletRealtimeService,
+            };
+            use agicash_traits::TokenProvider;
+
+            let Some(config) = config else {
+                // No config off-owner → realtime can't authenticate.
+                // Non-fatal: the on-mount `refresh()` already showed the
+                // balance; we just don't get live updates this session.
+                leptos::logging::log!(
+                    "start_realtime: AppConfig missing — realtime disabled (balance \
+                     stays from the initial refresh)"
+                );
                 return;
             };
-            let Some(document) = window.document() else {
-                return;
-            };
 
-            // `visibilitychange` fires on the document for both
-            // hide and show transitions; only refresh on the
-            // become-visible edge so a backgrounding tab does no work.
-            {
-                let wallet = self.clone();
-                let doc_for_check = document.clone();
-                // Captured at wiring time, inside the owner. The closure
-                // is detached (`.forget()`), so it must NOT read context.
-                let config = config.clone();
-                let on_visibility = Closure::<dyn FnMut()>::new(move || {
-                    if !doc_for_check.hidden() {
-                        // Background catch-up: keep the last balance on
-                        // screen, never flash the spinner.
-                        wallet.clone().refresh_with_config(config.clone(), true);
-                    }
-                });
-                if let Err(e) = document.add_event_listener_with_callback(
-                    "visibilitychange",
-                    on_visibility.as_ref().unchecked_ref(),
-                ) {
-                    leptos::logging::log!("visibilitychange listener attach failed: {e:?}");
-                }
-                // The listener lives for the page's lifetime (the SPA
-                // never tears the document down). Leaking the closure
-                // is the correct ownership here — `on_cleanup` would
-                // detach it on the first Home unmount, which is exactly
-                // the regression we must avoid.
-                on_visibility.forget();
+            if config.supabase_anon_key.is_empty() {
+                leptos::logging::log!(
+                    "start_realtime: supabase anon key missing — realtime disabled \
+                     (balance stays from the initial refresh)"
+                );
+                return;
             }
 
-            // `focus` on the window covers focus changes that don't
-            // toggle `document.hidden` (alt-tab between two visible
-            // windows), matching the web app's
-            // `refetchOnWindowFocus:'always'`.
-            {
-                let wallet = self.clone();
-                let config = config.clone();
-                let on_focus = Closure::<dyn FnMut()>::new(move || {
-                    // Background catch-up: stale-while-revalidate, no
-                    // spinner flash.
-                    wallet.clone().refresh_with_config(config.clone(), true);
-                });
-                let target: &web_sys::EventTarget = window.as_ref();
-                if let Err(e) = target
-                    .add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref())
+            let wallet = self.clone();
+            // The user id / token provider need an async context (the
+            // session load is async + the OpenSecret client builds the
+            // same way `fetch_account_summaries` does). Capture `config`
+            // before the spawn per the documented spawn_local/use_context
+            // gotcha — we never touch context inside the future.
+            wasm_bindgen_futures::spawn_local(async move {
+                let uid = match load_session_user_id().await {
+                    Ok(Some(uid)) => uid,
+                    Ok(None) => {
+                        // No session — ProtectedLayout should have
+                        // redirected; nothing to subscribe to.
+                        return;
+                    }
+                    Err(e) => {
+                        leptos::logging::log!(
+                            "start_realtime: session load failed, realtime \
+                             disabled (balance unaffected): {e}"
+                        );
+                        return;
+                    }
+                };
+
+                // Reuse the SAME OpenSecret token source the storage
+                // layer uses (mirrors `fetch_account_summaries` /
+                // Lane V's rehydration): a fresh Supabase-compatible JWT
+                // is minted per `get_jwt` call from the browser session's
+                // refresh token. `TokenProviderJwtSource` adapts it to
+                // the realtime crate's `JwtSource` (the wasm variant
+                // takes `Arc<dyn TokenProvider>`, no `Send + Sync`).
+                let client = match build_opensecret_client(&config) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        leptos::logging::log!(
+                            "start_realtime: opensecret client build failed, \
+                             realtime disabled (balance unaffected): {e}"
+                        );
+                        return;
+                    }
+                };
+                let tokens: Arc<dyn TokenProvider> = Arc::new(client);
+                let jwt = Arc::new(TokenProviderJwtSource(tokens));
+                let factory = Arc::new(WasmTransportFactory);
+
+                let service = Arc::new(WalletRealtimeService::new(
+                    &config.supabase_url,
+                    &config.supabase_anon_key,
+                    uid.to_string(),
+                    jwt,
+                    factory,
+                ));
+
+                // Pump: on every Connected (no replay → catch up) and
+                // every broadcast Event, refetch in background/SWR mode
+                // — keep the last balance, never flash the spinner, and
+                // a refetch failure is itself non-fatal (the SWR path in
+                // `refresh_with_config` keeps stale data). StatusChanged
+                // / Error are intentionally NOT surfaced to the UI: a
+                // disconnect must keep the last balance with no error
+                // screen; the service reconnects with backoff and emits
+                // a fresh `Connected` we then catch up on.
                 {
-                    leptos::logging::log!("window focus listener attach failed: {e:?}");
-                }
-                on_focus.forget();
-            }
-
-            // Foreground poll — the Tier-1 stand-in for the realtime
-            // channel. Uses the same `gloo-timers` primitive the mocked
-            // redeem path already uses; a self-rescheduling timeout
-            // keeps it a plain wasm future with no extra dependency.
-            {
-                let wallet = self.clone();
-                let config = config.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    loop {
-                        gloo_timers::future::TimeoutFuture::new(FOREGROUND_POLL_MS).await;
-                        let still_visible = web_sys::window()
-                            .and_then(|w| w.document())
-                            .is_some_and(|d| !d.hidden());
-                        if still_visible {
-                            // The Tier-1 poll is a silent background
-                            // catch-up — it must keep the last balance
-                            // visible, not blank it every 4s (the
-                            // regression this fixes).
-                            wallet.clone().refresh_with_config(config.clone(), true);
+                    let service_for_pump = Arc::clone(&service);
+                    let wallet = wallet.clone();
+                    let config = config.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let mut rx = service_for_pump.subscribe();
+                        loop {
+                            match futures_util::StreamExt::next(&mut rx).await {
+                                Some(WalletRealtimeEvent::Connected)
+                                | Some(WalletRealtimeEvent::Event(_)) => {
+                                    wallet
+                                        .clone()
+                                        .refresh_with_config(Some(config.clone()), true);
+                                }
+                                // Lifecycle/transport status is internal:
+                                // the supervisor handles reconnect; the
+                                // UI must NOT show an error or blank the
+                                // balance on a disconnect (non-fatal).
+                                Some(WalletRealtimeEvent::StatusChanged(_))
+                                | Some(WalletRealtimeEvent::Error(_)) => {}
+                                None => break, // sender dropped — service gone.
+                            }
                         }
-                        // When hidden we skip the work but keep looping;
-                        // the `visibilitychange` handler does the
-                        // catch-up refresh the moment the tab returns.
-                    }
+                    });
+                }
+
+                // Drive the connect→join→serve→reconnect supervisor for
+                // the page's lifetime. `run()` borrows `&self`; the
+                // `Arc` keeps the service alive across the spawned task.
+                wasm_bindgen_futures::spawn_local(async move {
+                    service.run().await;
                 });
-            }
+            });
         }
     }
+}
+
+/// Builds the wasm `WebSocket` transport per (re)connect. The realtime
+/// service rebuilds a fresh transport on every reconnect (spec §2.5);
+/// this factory just hands out a default `WasmTransport` each time.
+#[cfg(target_arch = "wasm32")]
+struct WasmTransportFactory;
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait::async_trait(?Send)]
+impl agicash_realtime::TransportFactory for WasmTransportFactory {
+    async fn make(&self) -> Box<dyn agicash_realtime::RealtimeTransport> {
+        Box::new(agicash_realtime::transport_wasm::WasmTransport::new())
+    }
+}
+
+/// Build the OpenSecret client from the resolved [`AppConfig`] — the
+/// same construction `fetch_account_summaries` uses for storage, so the
+/// realtime join JWT comes from the identical token source.
+#[cfg(target_arch = "wasm32")]
+fn build_opensecret_client(
+    config: &AppConfig,
+) -> Result<agicash_auth_opensecret::OpenSecretTokenProvider, String> {
+    use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
+
+    let client = OpenSecretClient::new(OpenSecretConfig {
+        base_url: config.opensecret_base_url.clone(),
+        client_id: config.opensecret_client_id,
+    })
+    .map_err(|e| format!("build opensecret client: {e}"))?;
+    Ok(OpenSecretTokenProvider::new(client))
 }
 
 impl Default for WalletData {

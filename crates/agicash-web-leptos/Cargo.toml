@@ -33,6 +33,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 http = "1"
+# `async-trait` is needed to implement the realtime crate's
+# `TransportFactory` trait for the wasm transport (slice 10).
+async-trait = { workspace = true }
+# `futures-util` — `StreamExt::next` to pump the realtime crate's
+# `async-broadcast` event receiver (slice 10). Already a workspace dep
+# (used by `agicash-realtime` itself); no new third-party crate.
+futures-util = { workspace = true }
 
 # CDK — Cashu Development Kit. We only use the parser side here
 # (`cdk::nuts::Token::from_str` + `.value()/.mint_url()/.unit()/.memo()`),
@@ -59,6 +66,10 @@ agicash-storage-supabase = { path = "../agicash-storage-supabase" }
 # after the storage-supabase port.
 agicash-cashu = { path = "../agicash-cashu" }
 agicash-money = { path = "../agicash-money" }
+# Supabase Realtime client (slice 10). Leptos links the crate directly
+# (no FFI) — it drives the balance refresh, replacing the deleted
+# `start_visibility_refresh` visibilitychange/focus/poll Tier-1 hack.
+agicash-realtime = { path = "../agicash-realtime" }
 
 # Browser-side runtime deps. Always-on now that ssr is gone — the
 # `target_arch = "wasm32"` cfg in `lib.rs::hydrate` keeps the native

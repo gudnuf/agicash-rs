@@ -63,13 +63,13 @@ pub fn HomePage() -> impl IntoView {
     let wallet = expect_context::<WalletData>();
 
     // Resolve `AppConfig` ONCE here, in the component body — a valid
-    // Leptos reactive owner where `use_context` works. The Tier-1
-    // reactive layer (`visibilitychange` / `focus` listeners + the
-    // foreground poll) runs in detached `.forget()` closures / a bare
-    // `spawn_local`, none of which have an owner, so they cannot read
-    // the context themselves (it returns `None` → the "AppConfig context
-    // missing" load error). We capture the concrete value here and hand
-    // it down so every detached refresh path carries its own clone.
+    // Leptos reactive owner where `use_context` works. The realtime
+    // event pump runs in a detached `spawn_local` future (see
+    // `WalletData::start_realtime`) which has no owner, so it cannot
+    // read the context itself (it returns `None` → the "AppConfig
+    // context missing" load error). We capture the concrete value here
+    // and hand it down so the detached refresh path carries its own
+    // clone.
     let app_config = use_context::<AppConfig>();
 
     // Kick off the refresh on mount. Effect (not memo / resource) so it
@@ -77,27 +77,29 @@ pub fn HomePage() -> impl IntoView {
     // signal transitions. `clone` because closures need to own a copy
     // and the retry handler below needs another.
     //
-    // The same Effect installs the Tier-1 reactive layer
-    // (`visibilitychange` / window `focus` listeners + a slow
-    // foreground poll) so the balance tracks out-of-band receives the
-    // way the web canonical model does — see
-    // `WalletData::start_visibility_refresh` for the mechanism and
+    // The same Effect installs the realtime reactivity source (a single
+    // Supabase-Realtime subscription via the all-Rust `agicash-realtime`
+    // crate) so the balance tracks out-of-band receives the way the web
+    // canonical model does — see `WalletData::start_realtime` for the
+    // mechanism and
     // `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`
-    // for the cross-platform diagnosis. The call is idempotent: a
-    // client-side nav back to `/` re-runs this Effect but the listeners
-    // wire exactly once for the page's lifetime.
+    // for the cross-platform diagnosis. This replaces the deleted
+    // `visibilitychange` / `focus` / 4s-poll Tier-1 hack. The call is
+    // idempotent: a client-side nav back to `/` re-runs this Effect but
+    // the subscription is constructed exactly once for the page's
+    // lifetime.
     //
     // `refresh()` runs first (it reads `AppConfig` from context — fine,
     // we're inside the Effect owner) so first paint shows the balance
-    // ASAP; then the detached reactive layer is wired with the
-    // already-resolved `app_config` so its `.forget()` closures / poll
-    // never touch the context off-owner.
+    // ASAP; then the detached realtime pump is wired with the
+    // already-resolved `app_config` so its `spawn_local` future never
+    // touches the context off-owner.
     let wallet_for_mount = wallet.clone();
     let config_for_mount = app_config.clone();
     Effect::new(move |_| {
         let wallet = wallet_for_mount.clone();
         wallet.clone().refresh();
-        wallet.start_visibility_refresh(config_for_mount.clone());
+        wallet.start_realtime(config_for_mount.clone());
     });
 
     // The retry button is a DOM click handler — also detached from the
