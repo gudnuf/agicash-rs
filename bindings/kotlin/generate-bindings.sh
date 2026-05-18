@@ -134,7 +134,12 @@ fi
 GENERATED_KT="$(find "$SOURCES_DIR" -name "*.kt" -print -quit)"
 if [ -n "$GENERATED_KT" ]; then
     /usr/bin/sed -i '' 's/        val `message`: kotlin.String/        override val `message`: kotlin.String/g' "$GENERATED_KT"
-    /usr/bin/perl -i -pe 'BEGIN{undef $/;} s/(\) : FfiException\(\) \{)\n        override val message\n            get\(\) = .+?\n    \}/$1\n    \}/gs' "$GENERATED_KT"
+    # Strip the auxiliary `override val message ... get() = ...` body
+    # from EVERY exception subclass UniFFI emits — not just FfiException.
+    # The constructor takes `override val message`, so the trailing
+    # auxiliary body is a duplicate that Kotlin rejects. Pattern matches
+    # any `: <Type>Exception() {` opener followed by the duplicate body.
+    /usr/bin/perl -i -pe 'BEGIN{undef $/;} s/(\) : \w+Exception\(\) \{)\n\s*override val message\n\s*get\(\) = [^\n]+\n\s*\}/$1\n    \}/gs' "$GENERATED_KT"
 fi
 
 echo

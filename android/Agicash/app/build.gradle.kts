@@ -7,6 +7,11 @@ plugins {
 android {
     namespace = "com.makeprisms.agicash"
     compileSdk = 35
+    // Pin Build Tools to 35.0.0; the nix-managed Android SDK only ships
+    // that version and AGP otherwise tries to download 34.0.0 (read-only
+    // /nix/store; download fails). 35.0.0 is forward-compatible with all
+    // compileSdk = 35 toolchain expectations.
+    buildToolsVersion = "35.0.0"
 
     defaultConfig {
         applicationId = "com.makeprisms.agicash"
@@ -93,7 +98,7 @@ dependencies {
     // are missing.
     // Force the AAR variant: the on-disk Maven repo shipped by the Rust crate
     // contains only `rustls-platform-verifier-0.1.1.aar`, but Gradle's
-    // default resolution looks for .jar first, so without this artifact
+    // default resolution looks for `.jar` first, so without this artifact
     // hint the build errors with "Could not find rustls:rustls-platform-verifier".
     implementation(libs.rustls.platform.verifier) { artifact { type = "aar" } }
 

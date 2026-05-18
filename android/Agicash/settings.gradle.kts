@@ -59,20 +59,32 @@ fun rustlsPlatformVerifierRepo(): String? {
     if (proc.waitFor() != 0) {
         return null
     }
-    // Tiny ad-hoc grep over the JSON to avoid pulling a JSON library into
-    // settings.gradle.kts. The "manifest_path" field for the android crate
-    // is a unique string we can locate by anchoring on the crate name.
-    val anchor = "\"name\":\"rustls-platform-verifier-android\""
-    val idx = json.indexOf(anchor)
-    if (idx < 0) return null
+    // Tiny ad-hoc grep over the JSON to avoid pulling a JSON library
+    // into settings.gradle.kts. We can't safely use a `name`-based
+    // anchor because the `rustls-platform-verifier` non-android crate
+    // declares an `"android"` feature, so the string
+    // `"name":"...android"` literally appears inside its features
+    // object. Instead, walk every `manifest_path` entry and pick the
+    // one whose path contains `rustls-platform-verifier-android-` —
+    // crate manifest paths always live in
+    // `<registry>/rustls-platform-verifier-android-<version>/Cargo.toml`,
+    // a substring unique to the android crate.
     val manifestKey = "\"manifest_path\":\""
-    val mp = json.indexOf(manifestKey, startIndex = idx)
-    if (mp < 0) return null
-    val start = mp + manifestKey.length
-    val end = json.indexOf('"', start)
-    if (end < 0) return null
-    val manifestPath = json.substring(start, end)
-    return java.io.File(java.io.File(manifestPath).parentFile, "maven").absolutePath
+    var cursor = 0
+    while (true) {
+        val mp = json.indexOf(manifestKey, startIndex = cursor)
+        if (mp < 0) return null
+        val start = mp + manifestKey.length
+        val end = json.indexOf('"', start)
+        if (end < 0) return null
+        val manifestPath = json.substring(start, end)
+        if (manifestPath.contains("/rustls-platform-verifier-android-")) {
+            return java.io.File(java.io.File(manifestPath).parentFile, "maven").absolutePath
+        }
+        cursor = end + 1
+    }
+    @Suppress("UNREACHABLE_CODE")
+    return null
 }
 
 rootProject.name = "Agicash"
