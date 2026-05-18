@@ -24,4 +24,4 @@ pub use error::{RealtimeError, TransportError};
 // Task-1 skeleton build is green).
 // pub use event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
 // pub use service::WalletRealtimeService;
-// pub use transport::{RealtimeTransport, WsFrame};
+pub use transport::{RealtimeTransport, WsFrame};
