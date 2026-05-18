@@ -12,6 +12,9 @@
 
 use crate::account::AccountFfi;
 use crate::error::FfiError;
+use crate::melt_quote::{
+    MeltQuoteFfiState, MeltQuoteHandle, MeltQuotePreview as MeltQuotePreviewFfi, MeltQuoteSnapshot,
+};
 use crate::mint::MintAddResult;
 use crate::mint_quote::{MintQuoteFfiState, MintQuoteHandle, MintQuoteSnapshot};
 use crate::receive::{ReceiveResult, ReceiveStatus};
@@ -23,17 +26,19 @@ use agicash_auth_opensecret::{
     OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
 };
 use agicash_cashu::{
+    CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuMintQuote, CashuMintQuoteService, CashuMintQuoteState, CashuMintQuoteStorage,
     CashuReceiveSwapService, CashuReceiveSwapState, CashuReceiveSwapStorage, CashuSeedProvider,
     CashuSendSwapService, CashuSendSwapState, CashuSendSwapStorage, CdkCashuProvider,
-    CompleteMintQuoteOutcome, CompleteOutcome, MintQuoteError, ParsedToken, ReceiveFlowService,
-    ReceiveSwapError, ReceiveSwapStorageError, TokenProof,
+    CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError, MeltQuotePreview,
+    MintQuoteError, ParsedToken, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError,
+    TokenProof,
 };
 use agicash_domain::{Account, AccountId, AccountPurpose, AccountType, Currency, UserId};
 use agicash_money::{Money, Unit};
 use agicash_storage_supabase::{
-    SupabaseCashuMintQuoteStorage, SupabaseCashuReceiveSwapStorage, SupabaseCashuSendSwapStorage,
-    SupabaseStorage, SupabaseStorageConfig,
+    SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage, SupabaseCashuReceiveSwapStorage,
+    SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
 };
 use agicash_traits::{
     AccountInput, CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
@@ -85,6 +90,17 @@ pub struct AgicashWallet {
     ///   `prepare_send_quote`, `create_send_swap`, `check_send_swap_claimed`.
     ///   Mirrors `mint_quote_service`.
     send_swap_service: Arc<CashuSendSwapService>,
+    /// Melt-quote (Lightning send) orchestrator. Wired the same way as
+    /// `mint_quote_service` — same `SupabaseStorage`, same provider,
+    /// same passthrough encryption stub. Drives `prepare_melt_quote`,
+    /// `create_melt_quote`, `execute_melt_quote`, `poll_melt_quote`.
+    /// The symmetric send-side counterpart of `mint_quote_service`.
+    melt_quote_service: Arc<CashuMeltQuoteService>,
+    /// Storage handle for the melt-quote rows. Kept as its own slot so
+    /// `poll_melt_quote` / `execute_melt_quote` can read the persisted
+    /// quote by id without holding the service. Mirrors
+    /// `mint_quote_storage`.
+    melt_quote_storage: Arc<dyn CashuMeltQuoteStorage>,
     /// In-memory session. Phase 1 leaves persistence to the Swift consumer:
     /// the iOS app stores the `refresh_token` in Keychain and rehydrates this
     /// slot via `set_session` on app launch.
@@ -217,6 +233,18 @@ impl AgicashWallet {
             Arc::clone(&cashu_provider),
         ));
 
+        // Melt-quote service wiring mirrors the CLI's
+        // `build_melt_quote_deps` (composition.rs). Same Supabase
+        // storage, same passthrough encryption stub, same CDK provider.
+        // Symmetric with `mint_quote_service` above.
+        let melt_quote_storage: Arc<dyn CashuMeltQuoteStorage> = Arc::new(
+            SupabaseCashuMeltQuoteStorage::new(Arc::clone(&storage), Arc::clone(&encryption)),
+        );
+        let melt_quote_service = Arc::new(CashuMeltQuoteService::new(
+            Arc::clone(&melt_quote_storage),
+            Arc::clone(&cashu_provider),
+        ));
+
         Ok(Arc::new(Self {
             client,
             storage,
@@ -226,6 +254,8 @@ impl AgicashWallet {
             mint_quote_service,
             mint_quote_storage,
             send_swap_service,
+            melt_quote_service,
+            melt_quote_storage,
             session: Arc::new(RwLock::new(None)),
             session_storage: Arc::new(RwLock::new(None)),
         }))
@@ -1369,6 +1399,259 @@ impl AgicashWallet {
             })
         }
     }
+
+    // ---- lightning send (melt quote) surface ----
+
+    /// Compute the fee + amount breakdown for a hypothetical Lightning
+    /// send. Pure preview — no quote row is created, no proofs are
+    /// reserved. Mirrors the CLI's `agicash send lightning <bolt11>
+    /// --dry-run` (`crates/agicash-cli/src/send_lightning.rs`).
+    ///
+    /// `bolt11` is the invoice the user pasted (or that
+    /// `request_lightning_invoice` produced for the LN-address path).
+    /// `account_id` + `currency` together pick the source Cashu
+    /// account; same selector semantics as `prepare_send_quote`. The
+    /// invoice's own msat amount determines what the receiver gets —
+    /// the mint quotes the Lightning fee reserve on top.
+    ///
+    /// Errors:
+    /// - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+    /// - `FfiError::Internal` for invalid bolt11, amountless invoice,
+    ///   expired invoice, currency mismatch, insufficient balance,
+    ///   no/ambiguous matching account, or any mint-protocol failure
+    ///   (mirrors `prepare_send_quote`'s funneling pattern).
+    /// - `FfiError::Storage` for raw Supabase failures.
+    pub async fn prepare_melt_quote(
+        &self,
+        bolt11: String,
+        account_id: Option<String>,
+        currency: Option<String>,
+    ) -> Result<MeltQuotePreviewFfi, FfiError> {
+        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
+            code: crate::error::auth_code::UNAUTHENTICATED,
+            message: "not authenticated".into(),
+        })?;
+        let user_id = UserId::from(session.user_id);
+
+        let currency_str = currency.unwrap_or_else(|| "BTC".to_string());
+        let currency_enum = Currency::from_str(&currency_str)
+            .map_err(|_| FfiError::internal(format!("unsupported currency: {currency_str}")))?;
+
+        let accounts = self.storage.list_accounts(user_id).await?;
+        let account =
+            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?;
+
+        let proofs = self
+            .send_swap_storage
+            .list_unspent_proofs(account.id)
+            .await
+            .map_err(|e| FfiError::internal(format!("list unspent proofs: {e}")))?;
+
+        let preview = self
+            .melt_quote_service
+            .get_quote(account, &proofs, &bolt11)
+            .await
+            .map_err(melt_quote_error_to_ffi)?;
+
+        Ok(melt_quote_preview_from(&preview, account))
+    }
+
+    /// Request a NUT-05 melt quote, persist the UNPAID row, and reserve
+    /// the proofs. Mirrors the CLI's `agicash send lightning <bolt11>`
+    /// up to the "quote issued" step (without `--dry-run` /
+    /// `--no-wait`): the Swift side then calls `execute_melt_quote`
+    /// (which fires `post_melt`) and drives the poll cycle itself so
+    /// the polling cadence + UI feedback stay on the consumer — same
+    /// split as the mint-quote (Lightning receive) surface.
+    ///
+    /// Re-runs `get_quote` internally so the caller passes only the
+    /// bolt11 (the [`MeltQuotePreview`] FFI record carries no
+    /// re-constructable proof handles across the boundary). The second
+    /// quote is cheap (one mint round-trip) and matches the CLI's own
+    /// "preview then create" sequence.
+    ///
+    /// Errors mirror `prepare_melt_quote` plus quote-expired between
+    /// preview and create.
+    pub async fn create_melt_quote(
+        &self,
+        bolt11: String,
+        account_id: Option<String>,
+        currency: Option<String>,
+    ) -> Result<MeltQuoteHandle, FfiError> {
+        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
+            code: crate::error::auth_code::UNAUTHENTICATED,
+            message: "not authenticated".into(),
+        })?;
+        let user_id = UserId::from(session.user_id);
+
+        let currency_str = currency.unwrap_or_else(|| "BTC".to_string());
+        let currency_enum = Currency::from_str(&currency_str)
+            .map_err(|_| FfiError::internal(format!("unsupported currency: {currency_str}")))?;
+
+        let accounts = self.storage.list_accounts(user_id).await?;
+        let account =
+            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?
+                .clone();
+
+        let proofs = self
+            .send_swap_storage
+            .list_unspent_proofs(account.id)
+            .await
+            .map_err(|e| FfiError::internal(format!("list unspent proofs: {e}")))?;
+
+        let preview = self
+            .melt_quote_service
+            .get_quote(&account, &proofs, &bolt11)
+            .await
+            .map_err(melt_quote_error_to_ffi)?;
+
+        let created = self
+            .melt_quote_service
+            .create_quote(user_id, &account, preview)
+            .await
+            .map_err(melt_quote_error_to_ffi)?;
+
+        Ok(melt_quote_handle_from(&created.quote, &created.account))
+    }
+
+    /// Initiate the melt for a previously-created UNPAID quote: marks
+    /// it PENDING, calls NUT-05 `post_melt`, then dispatches on the
+    /// mint's response. Mirrors the `initiate_melt` step of the CLI's
+    /// `cmd_send_lightning` (`crates/agicash-cli/src/send_lightning.rs`).
+    ///
+    /// Single round-trip: returns as soon as the mint replies. A PAID
+    /// reply yields a terminal `Paid` snapshot (preimage + final
+    /// fees); a still-in-flight reply yields `Pending` and the iOS app
+    /// should then drive `poll_melt_quote` on a timer; a mint refusal
+    /// yields a terminal `Failed` snapshot.
+    ///
+    /// `quote_id` is the wallet-side UUID from
+    /// [`MeltQuoteHandle::quote_id`] — NOT the mint-side string id.
+    ///
+    /// Errors:
+    /// - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+    /// - `FfiError::Internal` for invalid UUID, missing quote row,
+    ///   ownership mismatch, missing account, or mint-protocol failure
+    ///   during the melt round-trip.
+    /// - `FfiError::Storage` for raw Supabase failures.
+    pub async fn execute_melt_quote(
+        &self,
+        quote_id: String,
+    ) -> Result<MeltQuoteSnapshot, FfiError> {
+        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
+            code: crate::error::auth_code::UNAUTHENTICATED,
+            message: "not authenticated".into(),
+        })?;
+        let user_id = UserId::from(session.user_id);
+
+        let id = Uuid::parse_str(&quote_id)
+            .map_err(|e| FfiError::internal(format!("invalid quote_id: {e}")))?;
+        let quote = self
+            .melt_quote_storage
+            .get(id)
+            .await
+            .map_err(|e| FfiError::internal(format!("storage error: {e}")))?;
+        if quote.user_id != user_id {
+            return Err(FfiError::internal("quote belongs to a different user"));
+        }
+
+        // Fast-path: terminal rows short-circuit without a mint
+        // round-trip (mirrors `poll_mint_quote`'s persisted-state
+        // fast-path).
+        if !matches!(
+            quote.state,
+            CashuMeltQuoteState::Unpaid | CashuMeltQuoteState::Pending
+        ) {
+            return Ok(melt_quote_snapshot_from(&quote));
+        }
+
+        let accounts = self.storage.list_accounts(user_id).await?;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == quote.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| FfiError::internal("no matching account for quote"))?
+            .clone();
+
+        let seed = self.client.get_cashu_seed().await?;
+        let outcome = self
+            .melt_quote_service
+            .initiate_melt(&account, quote, &seed)
+            .await
+            .map_err(melt_quote_error_to_ffi)?;
+
+        Ok(melt_quote_snapshot_from_outcome(&outcome))
+    }
+
+    /// Poll the mint for the current state of a PENDING melt quote.
+    /// Single-shot: reconciles change proofs + storage on PAID,
+    /// flips the row FAILED on a mint UNPAID/FAILED, returns the
+    /// still-pending snapshot otherwise. Never loops — the iOS app
+    /// owns the polling timer (every 2-3s from a long-running `Task`),
+    /// same contract as `poll_mint_quote`.
+    ///
+    /// Mirrors the `poll_until_complete` step of the CLI's
+    /// `cmd_send_lightning` but with a zero timeout so it returns
+    /// after exactly one mint status check.
+    ///
+    /// `quote_id` is the wallet-side UUID from
+    /// [`MeltQuoteHandle::quote_id`].
+    ///
+    /// Errors:
+    /// - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+    /// - `FfiError::Internal` for invalid UUID, missing quote row,
+    ///   ownership mismatch, missing account, or mint-protocol failure
+    ///   during the single poll round-trip.
+    /// - `FfiError::Storage` for raw Supabase failures.
+    pub async fn poll_melt_quote(&self, quote_id: String) -> Result<MeltQuoteSnapshot, FfiError> {
+        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
+            code: crate::error::auth_code::UNAUTHENTICATED,
+            message: "not authenticated".into(),
+        })?;
+        let user_id = UserId::from(session.user_id);
+
+        let id = Uuid::parse_str(&quote_id)
+            .map_err(|e| FfiError::internal(format!("invalid quote_id: {e}")))?;
+        let quote = self
+            .melt_quote_storage
+            .get(id)
+            .await
+            .map_err(|e| FfiError::internal(format!("storage error: {e}")))?;
+        if quote.user_id != user_id {
+            return Err(FfiError::internal("quote belongs to a different user"));
+        }
+
+        // Fast-path: anything that isn't PENDING is either still
+        // awaiting `execute_melt_quote` (UNPAID) or already terminal —
+        // return the persisted snapshot without a mint round-trip.
+        if !matches!(quote.state, CashuMeltQuoteState::Pending) {
+            return Ok(melt_quote_snapshot_from(&quote));
+        }
+
+        let accounts = self.storage.list_accounts(user_id).await?;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == quote.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| FfiError::internal("no matching account for quote"))?
+            .clone();
+
+        let seed = self.client.get_cashu_seed().await?;
+        // Zero poll-interval + zero timeout → exactly one mint status
+        // check, then return. Same "single status check" contract
+        // `poll_mint_quote` gets from `poll_until_paid(0, 0)`.
+        let outcome = self
+            .melt_quote_service
+            .poll_until_complete(
+                &account,
+                quote,
+                &seed,
+                std::time::Duration::from_millis(0),
+                std::time::Duration::from_millis(0),
+            )
+            .await
+            .map_err(melt_quote_error_to_ffi)?;
+
+        Ok(melt_quote_snapshot_from_outcome(&outcome))
+    }
 }
 
 // Internal (non-FFI) helpers. Kept out of the `#[uniffi::export]` impl
@@ -1807,6 +2090,163 @@ fn mint_url_from_account(account: &Account) -> String {
         .unwrap_or_default()
 }
 
+// ---- melt-quote (Lightning send) helpers ----
+
+/// Map `MeltQuoteError` down to `FfiError`. Same funneling pattern as
+/// `mint_quote_error_to_ffi`: storage/network/protocol failures land in
+/// `Internal` with a discriminator-bearing message; validation
+/// failures (bad invoice, amountless, insufficient balance, currency
+/// mismatch) stay as their own strings so the iOS UI can pattern-match
+/// the prefix.
+fn melt_quote_error_to_ffi(e: MeltQuoteError) -> FfiError {
+    match e {
+        MeltQuoteError::InvalidTransition { from, event } => {
+            FfiError::internal(format!("invalid state transition from {from} on {event}"))
+        }
+        MeltQuoteError::Storage(s) => FfiError::internal(format!("storage error: {s}")),
+        MeltQuoteError::Mint(inner) => cashu_provider_error_to_ffi(inner),
+        MeltQuoteError::InvalidInvoice(msg) => {
+            FfiError::internal(format!("invalid bolt11 invoice: {msg}"))
+        }
+        MeltQuoteError::AmountlessInvoice => FfiError::internal("amountless invoice not supported"),
+        MeltQuoteError::AmountTooSmall => FfiError::internal("amount too small"),
+        MeltQuoteError::CurrencyMismatch { account, request } => FfiError::internal(format!(
+            "currency mismatch: account {account} differs from request {request}",
+        )),
+        MeltQuoteError::InsufficientBalance { needed, have } => {
+            FfiError::internal(format!("insufficient balance: need {needed}, have {have}",))
+        }
+        MeltQuoteError::QuoteExpired => FfiError::internal("quote expired before payment"),
+        MeltQuoteError::QuoteNotPending => FfiError::internal("quote not yet pending"),
+        MeltQuoteError::MeltFailed(msg) => {
+            FfiError::internal(format!("melt failed at mint: {msg}"))
+        }
+        MeltQuoteError::Unrecoverable(msg) => {
+            FfiError::internal(format!("melt unrecoverable: {msg}"))
+        }
+        // NUT-12 DLEQ verification failed on a mint-returned change
+        // blank. Treat as a distinct, security-flavoured error (same
+        // shape as `mint_quote_error_to_ffi`).
+        MeltQuoteError::DleqVerificationFailed(inner) => {
+            FfiError::internal(format!("DLEQ verification failed: {inner}"))
+        }
+    }
+}
+
+/// Build the `MeltQuotePreview` FFI record returned by
+/// `prepare_melt_quote`. Decimal-stringifies the `Money` fields to
+/// match the `ReceiveResult` / `SendQuotePreview` convention. Mirrors
+/// the CLI's `print_dry_run` (`send_lightning.rs`).
+fn melt_quote_preview_from(preview: &MeltQuotePreview, account: &Account) -> MeltQuotePreviewFfi {
+    MeltQuotePreviewFfi {
+        amount: preview.amount_received.amount().to_string(),
+        lightning_fee_reserve: preview.lightning_fee_reserve.amount().to_string(),
+        cashu_fee: preview.cashu_fee.amount().to_string(),
+        total_fee: preview.total_fee.amount().to_string(),
+        total_amount: preview.total_amount.amount().to_string(),
+        unit: preview.amount_received.unit().to_string(),
+        currency: account.currency.to_string(),
+        account_id: account.id.to_string(),
+        payment_hash: preview.payment_hash.clone(),
+    }
+}
+
+/// Build the `MeltQuoteHandle` returned by `create_melt_quote`. Mirrors
+/// the CLI's `print_quote_issued` (`send_lightning.rs`) — same
+/// fields the receipt / in-flight card needs. The `total_fee` is the
+/// worst-case `lightning_fee_reserve + cashu_fee` (the same `try_add`
+/// the CLI uses, falling back to `"0"` on the impossible currency
+/// mismatch).
+fn melt_quote_handle_from(quote: &CashuMeltQuote, account: &Account) -> MeltQuoteHandle {
+    let total_fee = quote
+        .lightning_fee_reserve
+        .try_add(&quote.cashu_fee)
+        .map_or_else(|_| "0".to_string(), |m| m.amount().to_string());
+    MeltQuoteHandle {
+        quote_id: quote.id.to_string(),
+        melt_quote_id: quote.quote_id.clone(),
+        invoice: quote.payment_request.clone(),
+        payment_hash: quote.payment_hash.clone(),
+        amount: quote.amount_received.amount().to_string(),
+        lightning_fee_reserve: quote.lightning_fee_reserve.amount().to_string(),
+        cashu_fee: quote.cashu_fee.amount().to_string(),
+        total_fee,
+        unit: quote.amount_received.unit().to_string(),
+        currency: account.currency.to_string(),
+        account_id: account.id.to_string(),
+        expires_at: quote.expires_at.to_rfc3339(),
+    }
+}
+
+/// Convert a persisted `CashuMeltQuote` into the FFI snapshot. Maps the
+/// per-state Rust enum down to the flat FFI discriminator and surfaces
+/// the PAID receipt fields. Mirrors `mint_quote_snapshot_from`.
+fn melt_quote_snapshot_from(quote: &CashuMeltQuote) -> MeltQuoteSnapshot {
+    match &quote.state {
+        CashuMeltQuoteState::Unpaid => MeltQuoteSnapshot {
+            state: MeltQuoteFfiState::Unpaid,
+            failure_reason: None,
+            payment_preimage: None,
+            lightning_fee: None,
+            amount_spent: None,
+            total_fee: None,
+        },
+        CashuMeltQuoteState::Pending => MeltQuoteSnapshot {
+            state: MeltQuoteFfiState::Pending,
+            failure_reason: None,
+            payment_preimage: None,
+            lightning_fee: None,
+            amount_spent: None,
+            total_fee: None,
+        },
+        CashuMeltQuoteState::Paid {
+            payment_preimage,
+            lightning_fee,
+            amount_spent,
+            total_fee,
+        } => MeltQuoteSnapshot {
+            state: MeltQuoteFfiState::Paid,
+            failure_reason: None,
+            payment_preimage: Some(payment_preimage.clone()),
+            lightning_fee: Some(lightning_fee.amount().to_string()),
+            amount_spent: Some(amount_spent.amount().to_string()),
+            total_fee: Some(total_fee.amount().to_string()),
+        },
+        CashuMeltQuoteState::Expired => MeltQuoteSnapshot {
+            state: MeltQuoteFfiState::Expired,
+            failure_reason: None,
+            payment_preimage: None,
+            lightning_fee: None,
+            amount_spent: None,
+            total_fee: None,
+        },
+        CashuMeltQuoteState::Failed { failure_reason } => MeltQuoteSnapshot {
+            state: MeltQuoteFfiState::Failed,
+            failure_reason: Some(failure_reason.clone()),
+            payment_preimage: None,
+            lightning_fee: None,
+            amount_spent: None,
+            total_fee: None,
+        },
+    }
+}
+
+/// Map a `MeltOutcome` (from `initiate_melt` / `poll_until_complete`)
+/// onto the FFI snapshot. The `Paid`/`Failed` variants carry the
+/// persisted terminal quote so we delegate to `melt_quote_snapshot_from`
+/// for the receipt fields; `Pending` carries the still-in-flight quote.
+fn melt_quote_snapshot_from_outcome(outcome: &MeltOutcome) -> MeltQuoteSnapshot {
+    // Every variant carries the persisted quote whose `state` already
+    // encodes the terminal/in-flight bucket, so the snapshot is built
+    // identically from it regardless of which variant we got.
+    let quote = match outcome {
+        MeltOutcome::Paid { quote, .. }
+        | MeltOutcome::Pending(quote)
+        | MeltOutcome::Failed(quote) => quote,
+    };
+    melt_quote_snapshot_from(quote)
+}
+
 // ---- cashu send-swap helpers ----
 
 /// Encode a slice of `TokenProof` into a V4 (`cashuB…`) wire token.
@@ -2202,5 +2642,227 @@ mod tests {
     fn unit_for_currency_maps_btc_to_sat() {
         assert_eq!(unit_for_currency(Currency::Btc), Unit::Sat);
         assert_eq!(unit_for_currency(Currency::Usd), Unit::Cent);
+    }
+
+    // ---- melt-quote (Lightning send) helper tests ----
+
+    #[test]
+    fn melt_quote_error_to_ffi_maps_invalid_invoice() {
+        let e = melt_quote_error_to_ffi(MeltQuoteError::InvalidInvoice("parse boom".into()));
+        assert!(
+            matches!(e, FfiError::Internal { ref message } if message.contains("invalid bolt11"))
+        );
+    }
+
+    #[test]
+    fn melt_quote_error_to_ffi_maps_amountless_invoice() {
+        let e = melt_quote_error_to_ffi(MeltQuoteError::AmountlessInvoice);
+        assert!(matches!(e, FfiError::Internal { ref message } if message.contains("amountless")));
+    }
+
+    #[test]
+    fn melt_quote_error_to_ffi_maps_insufficient_balance() {
+        let e = melt_quote_error_to_ffi(MeltQuoteError::InsufficientBalance {
+            needed: "100".into(),
+            have: "50".into(),
+        });
+        assert!(matches!(
+            e,
+            FfiError::Internal { ref message }
+                if message.contains("insufficient balance") && message.contains("100")
+        ));
+    }
+
+    #[test]
+    fn melt_quote_error_to_ffi_maps_quote_expired() {
+        let e = melt_quote_error_to_ffi(MeltQuoteError::QuoteExpired);
+        assert!(matches!(e, FfiError::Internal { ref message } if message.contains("expired")));
+    }
+
+    #[test]
+    fn melt_quote_error_to_ffi_maps_quote_not_pending() {
+        let e = melt_quote_error_to_ffi(MeltQuoteError::QuoteNotPending);
+        assert!(
+            matches!(e, FfiError::Internal { ref message } if message.contains("not yet pending"))
+        );
+    }
+
+    fn stub_melt_quote(state: CashuMeltQuoteState) -> CashuMeltQuote {
+        use agicash_money::Money;
+        use chrono::Utc;
+        use rust_decimal::Decimal;
+        let money = |n: u64| Money::new(Decimal::from(n), Currency::Btc, Unit::Sat);
+        CashuMeltQuote {
+            id: Uuid::new_v4(),
+            quote_id: "mint-qid".into(),
+            user_id: UserId::new(),
+            account_id: agicash_domain::AccountId::new(),
+            payment_request: "lnbc640n1...".into(),
+            payment_hash: "deadbeef".into(),
+            amount_requested: money(64),
+            amount_requested_in_msat: 64_000,
+            amount_received: money(64),
+            lightning_fee_reserve: money(2),
+            cashu_fee: money(1),
+            proofs: vec![],
+            amount_reserved: money(67),
+            keyset_id: "ks1".into(),
+            keyset_counter: 0,
+            number_of_change_outputs: 1,
+            transaction_id: Uuid::new_v4(),
+            created_at: Utc::now(),
+            expires_at: Utc::now(),
+            version: 0,
+            state,
+        }
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_unpaid_has_no_receipt_fields() {
+        let q = stub_melt_quote(CashuMeltQuoteState::Unpaid);
+        let snap = melt_quote_snapshot_from(&q);
+        assert_eq!(snap.state, MeltQuoteFfiState::Unpaid);
+        assert!(snap.failure_reason.is_none());
+        assert!(snap.payment_preimage.is_none());
+        assert!(snap.amount_spent.is_none());
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_pending_maps_state() {
+        let q = stub_melt_quote(CashuMeltQuoteState::Pending);
+        let snap = melt_quote_snapshot_from(&q);
+        assert_eq!(snap.state, MeltQuoteFfiState::Pending);
+        assert!(snap.payment_preimage.is_none());
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_paid_carries_preimage_and_fees() {
+        use agicash_money::Money;
+        use rust_decimal::Decimal;
+        let money = |n: u64| Money::new(Decimal::from(n), Currency::Btc, Unit::Sat);
+        let q = stub_melt_quote(CashuMeltQuoteState::Paid {
+            payment_preimage: "abc123".into(),
+            lightning_fee: money(1),
+            amount_spent: money(65),
+            total_fee: money(2),
+        });
+        let snap = melt_quote_snapshot_from(&q);
+        assert_eq!(snap.state, MeltQuoteFfiState::Paid);
+        assert_eq!(snap.payment_preimage.as_deref(), Some("abc123"));
+        assert_eq!(snap.lightning_fee.as_deref(), Some("1"));
+        assert_eq!(snap.amount_spent.as_deref(), Some("65"));
+        assert_eq!(snap.total_fee.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_failed_carries_reason() {
+        let q = stub_melt_quote(CashuMeltQuoteState::Failed {
+            failure_reason: "mint rejected".into(),
+        });
+        let snap = melt_quote_snapshot_from(&q);
+        assert_eq!(snap.state, MeltQuoteFfiState::Failed);
+        assert_eq!(snap.failure_reason.as_deref(), Some("mint rejected"));
+    }
+
+    #[test]
+    fn melt_quote_handle_from_stringifies_money_and_total_fee() {
+        let q = stub_melt_quote(CashuMeltQuoteState::Unpaid);
+        let account = stub_account(Currency::Btc);
+        let handle = melt_quote_handle_from(&q, &account);
+        assert_eq!(handle.quote_id, q.id.to_string());
+        assert_eq!(handle.melt_quote_id, "mint-qid");
+        assert_eq!(handle.amount, "64");
+        assert_eq!(handle.lightning_fee_reserve, "2");
+        assert_eq!(handle.cashu_fee, "1");
+        // total_fee = lightning_fee_reserve + cashu_fee = 2 + 1
+        assert_eq!(handle.total_fee, "3");
+        assert_eq!(handle.unit, "sat");
+        assert_eq!(handle.currency, "BTC");
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_outcome_paid_delegates() {
+        use agicash_money::Money;
+        use rust_decimal::Decimal;
+        let money = |n: u64| Money::new(Decimal::from(n), Currency::Btc, Unit::Sat);
+        let q = stub_melt_quote(CashuMeltQuoteState::Paid {
+            payment_preimage: "pre".into(),
+            lightning_fee: money(1),
+            amount_spent: money(65),
+            total_fee: money(2),
+        });
+        let outcome = MeltOutcome::Paid {
+            quote: q,
+            account: stub_account(Currency::Btc),
+            change_proofs_count: 1,
+        };
+        let snap = melt_quote_snapshot_from_outcome(&outcome);
+        assert_eq!(snap.state, MeltQuoteFfiState::Paid);
+        assert_eq!(snap.payment_preimage.as_deref(), Some("pre"));
+    }
+
+    #[test]
+    fn melt_quote_snapshot_from_outcome_pending_maps_state() {
+        let q = stub_melt_quote(CashuMeltQuoteState::Pending);
+        let outcome = MeltOutcome::Pending(q);
+        let snap = melt_quote_snapshot_from_outcome(&outcome);
+        assert_eq!(snap.state, MeltQuoteFfiState::Pending);
+    }
+
+    #[tokio::test]
+    async fn prepare_melt_quote_without_session_returns_unauthenticated() {
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet
+            .prepare_melt_quote("lnbc1...".into(), None, None)
+            .await
+            .expect_err("no session");
+        assert!(
+            matches!(err, FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_melt_quote_without_session_returns_unauthenticated() {
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet
+            .execute_melt_quote(Uuid::new_v4().to_string())
+            .await
+            .expect_err("no session");
+        assert!(
+            matches!(err, FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED)
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_melt_quote_without_session_returns_unauthenticated() {
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet
+            .poll_melt_quote(Uuid::new_v4().to_string())
+            .await
+            .expect_err("no session");
+        assert!(
+            matches!(err, FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED)
+        );
     }
 }
