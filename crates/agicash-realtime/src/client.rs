@@ -1,9 +1,11 @@
 //! Phoenix-channel client state machine (serializer v2.0.0).
 //! One private broadcast channel, wildcard events. Spec §5.4.
-use crate::codec::{decode_binary, decode_text, PhoenixMessage};
+use crate::codec::{decode_binary, decode_text, encode_outbound, PhoenixMessage};
 use crate::error::RealtimeError;
-use crate::transport::WsFrame;
+use crate::event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
+use crate::transport::{RealtimeTransport, TransportBounds, WsFrame};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 const VSN: &str = "2.0.0";
 const CLIENT_VERSION: &str = "realtime-js/2.95.2";
@@ -110,6 +112,164 @@ pub fn decode_frame(f: &WsFrame) -> Result<PhoenixMessage, RealtimeError> {
     }
 }
 
+/// Async token source — re-uses the codebase `TokenProvider` contract
+/// (spec §5.6). Returns a fresh user JWT.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait JwtSource: TransportBounds {
+    async fn user_jwt(&self) -> Result<String, RealtimeError>;
+}
+
+/// Sink the client pushes `WalletRealtimeEvent`s into (an
+/// `async-broadcast` sender supplied by the service).
+pub type EventSink = async_broadcast::Sender<WalletRealtimeEvent>;
+
+pub struct PhoenixClient<T: RealtimeTransport> {
+    transport: T,
+    url: String,
+    user_id: String,
+    refs: RefGen,
+    join_ref: Option<String>,
+    jwt: Arc<dyn JwtSource>,
+    sink: EventSink,
+}
+
+impl<T: RealtimeTransport> std::fmt::Debug for PhoenixClient<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhoenixClient")
+            .field("url", &self.url)
+            .field("user_id", &self.user_id)
+            .field("join_ref", &self.join_ref)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: RealtimeTransport> PhoenixClient<T> {
+    pub fn new(
+        transport: T,
+        url: String,
+        user_id: String,
+        jwt: Arc<dyn JwtSource>,
+        sink: EventSink,
+    ) -> Self {
+        Self {
+            transport,
+            url,
+            user_id,
+            refs: RefGen::default(),
+            join_ref: None,
+            jwt,
+            sink,
+        }
+    }
+
+    /// One connect→join→serve cycle. Returns `Ok(())` on clean stop,
+    /// `Err` if the socket dropped (caller applies backoff + retries).
+    pub async fn run_once(&mut self) -> Result<(), RealtimeError> {
+        let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
+            RealtimeStatus::Connecting,
+        ));
+        self.transport.connect(&self.url).await?;
+
+        // Join (spec §3.3): join_ref == ref of this push.
+        let jr = self.refs.next();
+        self.join_ref = Some(jr.clone());
+        let token = self.jwt.user_jwt().await?;
+        let topic = topic_for_user(&self.user_id);
+        let frame = encode_outbound(Some(&jr), &jr, &topic, "phx_join", join_payload(&token));
+        self.transport.send_text(frame).await?;
+
+        // Serve loop. Heartbeat cadence is enforced by the service via a
+        // racing timer that calls `send_heartbeat`; here we just route
+        // inbound frames. (Native: tokio::select! in the service; wasm:
+        // gloo-timers interval. The split keeps this fn transport-pure.)
+        while let Some(item) = self.transport.recv().await {
+            let frame = item?;
+            let msg = decode_frame(&frame)?;
+            match classify(&msg, self.join_ref.as_deref()) {
+                RouterAction::JoinReplyOk => {
+                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
+                        RealtimeStatus::Subscribed,
+                    ));
+                    // No replay → tell caller to catch up (spec §5.5).
+                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::Connected);
+                }
+                RouterAction::JoinReplyError(r) => {
+                    let _ = self
+                        .sink
+                        .try_broadcast(WalletRealtimeEvent::Error(format!(
+                            "join rejected: {r}"
+                        )));
+                    return Err(RealtimeError::JoinRejected(r));
+                }
+                RouterAction::Broadcast {
+                    event,
+                    payload_json,
+                } => {
+                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::Event(
+                        WalletEvent {
+                            event,
+                            payload_json,
+                        },
+                    ));
+                }
+                RouterAction::ChannelDown => {
+                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
+                        RealtimeStatus::Reconnecting,
+                    ));
+                    return Err(RealtimeError::Transport(crate::TransportError::Closed(
+                        "channel down".into(),
+                    )));
+                }
+                RouterAction::HeartbeatAck | RouterAction::Ignore => {}
+            }
+        }
+        Err(RealtimeError::Transport(crate::TransportError::Closed(
+            "recv ended".into(),
+        )))
+    }
+
+    /// Send one heartbeat + run the token-refresh check (spec §3.7/§3.9).
+    /// Called by the service's 25s timer. Fire-and-forget for the token
+    /// push (no reply awaited).
+    pub async fn send_heartbeat(&mut self) -> Result<(), RealtimeError> {
+        let jr = self.join_ref.clone();
+        let r = self.refs.next();
+        let hb = encode_outbound(jr.as_deref(), &r, "phoenix", "heartbeat", json!({}));
+        self.transport.send_text(hb).await?;
+        // Token refresh piggyback: re-fetch; push access_token if joined.
+        if let Some(jref) = self.join_ref.clone() {
+            let token = self.jwt.user_jwt().await?;
+            let rr = self.refs.next();
+            let at = encode_outbound(
+                Some(&jref),
+                &rr,
+                &topic_for_user(&self.user_id),
+                "access_token",
+                json!({ "access_token": token }),
+            );
+            self.transport.send_text(at).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn leave_and_close(&mut self) -> Result<(), RealtimeError> {
+        if let Some(jref) = self.join_ref.clone() {
+            let r = self.refs.next();
+            let leave = encode_outbound(
+                Some(&jref),
+                &r,
+                &topic_for_user(&self.user_id),
+                "phx_leave",
+                json!({}),
+            );
+            let _ = self.transport.send_text(leave).await;
+        }
+        self.transport.close(1000, "client leave").await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +338,64 @@ mod tests {
             decode_text(r#"[null,"2","phoenix","phx_reply",{"status":"ok","response":{}}]"#)
                 .unwrap();
         assert_eq!(classify(&m, Some("1")), RouterAction::HeartbeatAck);
+    }
+
+    struct ScriptTransport {
+        outbound: std::sync::Mutex<Vec<String>>,
+        inbound: std::sync::Mutex<std::collections::VecDeque<WsFrame>>,
+    }
+    #[async_trait::async_trait]
+    impl RealtimeTransport for ScriptTransport {
+        async fn connect(&mut self, _u: &str) -> Result<(), crate::TransportError> {
+            Ok(())
+        }
+        async fn send_text(&mut self, f: String) -> Result<(), crate::TransportError> {
+            self.outbound.lock().unwrap().push(f);
+            Ok(())
+        }
+        async fn recv(&mut self) -> Option<Result<WsFrame, crate::TransportError>> {
+            self.inbound.lock().unwrap().pop_front().map(Ok)
+        }
+        async fn close(&mut self, _c: u16, _r: &str) -> Result<(), crate::TransportError> {
+            Ok(())
+        }
+    }
+    struct StubJwt;
+    #[async_trait::async_trait]
+    impl JwtSource for StubJwt {
+        async fn user_jwt(&self) -> Result<String, RealtimeError> {
+            Ok("JWT".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_sends_join_then_emits_connected_and_event() {
+        let inbound = std::collections::VecDeque::from(vec![
+            WsFrame::Text(
+                r#"[null,"1","realtime:wallet:u1","phx_reply",{"status":"ok","response":{"postgres_changes":[]}}]"#.into(),
+            ),
+            WsFrame::Text(
+                r#"[null,null,"realtime:wallet:u1","broadcast",{"type":"broadcast","event":"ACCOUNT_UPDATED","payload":{"a":1}}]"#.into(),
+            ),
+        ]);
+        let t = ScriptTransport {
+            outbound: std::sync::Mutex::default(),
+            inbound: std::sync::Mutex::new(inbound),
+        };
+        let (tx, mut rx) = async_broadcast::broadcast(16);
+        let mut c = PhoenixClient::new(t, "ws://x".into(), "u1".into(), Arc::new(StubJwt), tx);
+        let _ = c.run_once().await; // ends when inbound drains (Err)
+        let got: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(got
+            .iter()
+            .any(|e| matches!(e, WalletRealtimeEvent::Connected)));
+        assert!(got.iter().any(|e| matches!(
+            e, WalletRealtimeEvent::Event(ev) if ev.event == "ACCOUNT_UPDATED"
+        )));
+        // join frame went out, topic + private + jwt present
+        let out = c.transport.outbound.lock().unwrap().clone();
+        assert!(out[0].contains(r#""realtime:wallet:u1","phx_join""#));
+        assert!(out[0].contains(r#""access_token":"JWT""#));
+        assert!(out[0].contains(r#""private":true"#));
     }
 }
