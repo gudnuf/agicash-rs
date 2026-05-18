@@ -163,9 +163,13 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
         }
     }
 
-    /// One connect→join→serve cycle. Returns `Ok(())` on clean stop,
-    /// `Err` if the socket dropped (caller applies backoff + retries).
-    pub async fn run_once(&mut self) -> Result<(), RealtimeError> {
+    /// Connect the socket and send the `phx_join` push (spec §3.3). The
+    /// join ack is observed later by [`Self::serve_step`] (it arrives as
+    /// an inbound `phx_reply`). Split out from the serve loop so the
+    /// service can race the inbound router against its 25s heartbeat
+    /// timer (`run_once`'s monolithic loop holds `&mut self` for its
+    /// whole lifetime, which a racing `send_heartbeat` cannot share).
+    pub async fn connect_and_join(&mut self) -> Result<(), RealtimeError> {
         let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
             RealtimeStatus::Connecting,
         ));
@@ -178,50 +182,68 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
         let topic = topic_for_user(&self.user_id);
         let frame = encode_outbound(Some(&jr), &jr, &topic, "phx_join", join_payload(&token));
         self.transport.send_text(frame).await?;
+        Ok(())
+    }
 
-        // Serve loop. Heartbeat cadence is enforced by the service via a
-        // racing timer that calls `send_heartbeat`; here we just route
-        // inbound frames. (Native: tokio::select! in the service; wasm:
-        // gloo-timers interval. The split keeps this fn transport-pure.)
-        while let Some(item) = self.transport.recv().await {
-            let frame = item?;
-            let msg = decode_frame(&frame)?;
-            match classify(&msg, self.join_ref.as_deref()) {
-                RouterAction::JoinReplyOk => {
-                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
-                        RealtimeStatus::Subscribed,
-                    ));
-                    // No replay → tell caller to catch up (spec §5.5).
-                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::Connected);
-                }
-                RouterAction::JoinReplyError(r) => {
-                    let _ = self
-                        .sink
-                        .try_broadcast(WalletRealtimeEvent::Error(format!("join rejected: {r}")));
-                    return Err(RealtimeError::JoinRejected(r));
-                }
-                RouterAction::Broadcast {
-                    event,
-                    payload_json,
-                } => {
-                    let _ = self
-                        .sink
-                        .try_broadcast(WalletRealtimeEvent::Event(WalletEvent {
-                            event,
-                            payload_json,
-                        }));
-                }
-                RouterAction::ChannelDown => {
-                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
-                        RealtimeStatus::Reconnecting,
-                    ));
-                    return Err(RealtimeError::Transport(crate::TransportError::Closed(
-                        "channel down".into(),
-                    )));
-                }
-                RouterAction::HeartbeatAck | RouterAction::Ignore => {}
+    /// Receive and route exactly one inbound frame. Returns `Ok(true)`
+    /// to keep serving, `Ok(false)` on a clean socket end, `Err` on a
+    /// channel-down / transport error (caller applies backoff + retries).
+    /// The 25s heartbeat is driven by the service racing a timer that
+    /// calls [`Self::send_heartbeat`] — this fn stays transport-pure.
+    pub async fn serve_step(&mut self) -> Result<bool, RealtimeError> {
+        let Some(item) = self.transport.recv().await else {
+            return Err(RealtimeError::Transport(crate::TransportError::Closed(
+                "recv ended".into(),
+            )));
+        };
+        let frame = item?;
+        let msg = decode_frame(&frame)?;
+        match classify(&msg, self.join_ref.as_deref()) {
+            RouterAction::JoinReplyOk => {
+                let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
+                    RealtimeStatus::Subscribed,
+                ));
+                // No replay → tell caller to catch up (spec §5.5).
+                let _ = self.sink.try_broadcast(WalletRealtimeEvent::Connected);
             }
+            RouterAction::JoinReplyError(r) => {
+                let _ = self
+                    .sink
+                    .try_broadcast(WalletRealtimeEvent::Error(format!("join rejected: {r}")));
+                return Err(RealtimeError::JoinRejected(r));
+            }
+            RouterAction::Broadcast {
+                event,
+                payload_json,
+            } => {
+                let _ = self
+                    .sink
+                    .try_broadcast(WalletRealtimeEvent::Event(WalletEvent {
+                        event,
+                        payload_json,
+                    }));
+            }
+            RouterAction::ChannelDown => {
+                let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
+                    RealtimeStatus::Reconnecting,
+                ));
+                return Err(RealtimeError::Transport(crate::TransportError::Closed(
+                    "channel down".into(),
+                )));
+            }
+            RouterAction::HeartbeatAck | RouterAction::Ignore => {}
         }
+        Ok(true)
+    }
+
+    /// One connect→join→serve cycle. Returns `Ok(())` on clean stop,
+    /// `Err` if the socket dropped (caller applies backoff + retries).
+    /// Convenience wrapper over [`Self::connect_and_join`] +
+    /// [`Self::serve_step`] for callers that do not interleave a
+    /// heartbeat timer (the service does — see `service::run`).
+    pub async fn run_once(&mut self) -> Result<(), RealtimeError> {
+        self.connect_and_join().await?;
+        while self.serve_step().await? {}
         Err(RealtimeError::Transport(crate::TransportError::Closed(
             "recv ended".into(),
         )))
