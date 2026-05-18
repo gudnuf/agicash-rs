@@ -55,11 +55,22 @@ use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::components::{AccountSummary, Button, ButtonSize, ButtonVariant, LoadState, WalletData};
+use crate::config::AppConfig;
 use crate::tokens;
 
 #[component]
 pub fn HomePage() -> impl IntoView {
     let wallet = expect_context::<WalletData>();
+
+    // Resolve `AppConfig` ONCE here, in the component body — a valid
+    // Leptos reactive owner where `use_context` works. The Tier-1
+    // reactive layer (`visibilitychange` / `focus` listeners + the
+    // foreground poll) runs in detached `.forget()` closures / a bare
+    // `spawn_local`, none of which have an owner, so they cannot read
+    // the context themselves (it returns `None` → the "AppConfig context
+    // missing" load error). We capture the concrete value here and hand
+    // it down so every detached refresh path carries its own clone.
+    let app_config = use_context::<AppConfig>();
 
     // Kick off the refresh on mount. Effect (not memo / resource) so it
     // runs exactly once post-hydration and the spawned future drives the
@@ -75,16 +86,30 @@ pub fn HomePage() -> impl IntoView {
     // for the cross-platform diagnosis. The call is idempotent: a
     // client-side nav back to `/` re-runs this Effect but the listeners
     // wire exactly once for the page's lifetime.
+    //
+    // `refresh()` runs first (it reads `AppConfig` from context — fine,
+    // we're inside the Effect owner) so first paint shows the balance
+    // ASAP; then the detached reactive layer is wired with the
+    // already-resolved `app_config` so its `.forget()` closures / poll
+    // never touch the context off-owner.
     let wallet_for_mount = wallet.clone();
+    let config_for_mount = app_config.clone();
     Effect::new(move |_| {
         let wallet = wallet_for_mount.clone();
-        wallet.start_visibility_refresh();
-        wallet.refresh();
+        wallet.clone().refresh();
+        wallet.start_visibility_refresh(config_for_mount.clone());
     });
 
+    // The retry button is a DOM click handler — also detached from the
+    // reactive owner — so it must use the captured config, not `refresh()`
+    // (which would re-trigger the exact "AppConfig context missing"
+    // failure off-owner and leave Retry permanently broken).
     let wallet_for_retry = wallet.clone();
+    let config_for_retry = app_config.clone();
     let on_retry = move |_| {
-        wallet_for_retry.clone().refresh();
+        wallet_for_retry
+            .clone()
+            .refresh_with_config(config_for_retry.clone());
     };
 
     let accounts = wallet.accounts;

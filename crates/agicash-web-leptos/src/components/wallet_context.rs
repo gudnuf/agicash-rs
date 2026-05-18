@@ -45,7 +45,9 @@
 use leptos::prelude::*;
 use uuid::Uuid;
 
-#[cfg(target_arch = "wasm32")]
+// `AppConfig` is part of the public `refresh_with_config` signature, so
+// it must be in scope on every target (it is `cfg`-free and the native
+// build constructs a dev-defaults instance).
 use crate::config::AppConfig;
 
 /// Loading state envelope. Replaces a tri-state Option pattern so the
@@ -147,17 +149,57 @@ impl WalletData {
     /// On wasm: loads the session, constructs a `SupabaseStorage`, calls
     /// `list_accounts` + (per Cashu account) `list_unspent_proofs`, and
     /// populates the signals with real balances.
+    ///
+    /// **Owner requirement.** This entry point reads
+    /// `use_context::<AppConfig>()` synchronously, so it MUST be called
+    /// from within a valid Leptos reactive owner (a component body or an
+    /// `Effect`). A detached caller — a `.forget()`-leaked DOM event
+    /// closure or a bare `spawn_local` future — has no owner, so
+    /// `use_context` returns `None` and the load fails with the
+    /// `AppConfig context missing` error. Detached callers (the `visibilitychange` /
+    /// `focus` listeners and the foreground poll wired by
+    /// [`WalletData::start_visibility_refresh`]) MUST instead capture the
+    /// `AppConfig` once inside an owner and call
+    /// [`WalletData::refresh_with_config`] with the concrete value.
     pub fn refresh(self) {
+        // Read the context here, while we are still guaranteed to be
+        // inside the owner that provided it (the Home mount Effect / the
+        // retry handler runs under the component owner). The concrete
+        // value is then threaded through to the detached future.
+        #[cfg(target_arch = "wasm32")]
+        let config = use_context::<AppConfig>();
+        #[cfg(target_arch = "wasm32")]
+        self.refresh_with_config(config);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh_with_config(None);
+    }
+
+    /// Refresh using an already-captured `AppConfig` instead of reading
+    /// it from context. This is the entry point detached callers must
+    /// use: the `visibilitychange` / `focus` listeners and the
+    /// foreground poll installed by [`WalletData::start_visibility_refresh`]
+    /// run **outside** any Leptos reactive owner, so they cannot call
+    /// `use_context` themselves. [`WalletData::refresh`] captures the
+    /// context from inside the owner and delegates here; the detached
+    /// callers carry a clone of the value captured at wiring time.
+    ///
+    /// `config` is `Option` only so the native test build (which has no
+    /// browser and no real config) can pass `None` and settle into the
+    /// same `Ready(empty)` shape view tests expect; on wasm a `None`
+    /// surfaces the `AppConfig context missing` error exactly as before.
+    //
+    // `config` is moved into the spawned future on wasm (the build that
+    // ships); the native test build cfg's that block out, so to clippy
+    // it then looks pass-by-value-but-unused. Allow it there only.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::needless_pass_by_value, unused_variables)
+    )]
+    pub fn refresh_with_config(self, config: Option<AppConfig>) {
         // Loading state visible immediately so the view can show a
         // spinner even before the async work yields.
         self.accounts.set(LoadState::Loading);
-
-        // Capture context BEFORE spawning — `spawn_local` futures run
-        // outside the reactive owner that provided the context, so
-        // `use_context` inside the async block always returns None.
-        // Reading it sync here threads the value through to the future.
-        #[cfg(target_arch = "wasm32")]
-        let config = use_context::<AppConfig>();
 
         // Wasm uses wasm_bindgen_futures directly because `leptos::task::
         // spawn_local` requires the leptos Executor to be installed, and
@@ -217,8 +259,9 @@ impl WalletData {
     ///
     /// - a `visibilitychange` listener on `document`: when the document
     ///   transitions back to visible (tab refocused, OS unlock, app
-    ///   foregrounded) it calls [`WalletData::refresh`], catching up any
-    ///   out-of-band receive that happened while backgrounded;
+    ///   foregrounded) it calls [`WalletData::refresh_with_config`],
+    ///   catching up any out-of-band receive that happened while
+    ///   backgrounded;
     /// - a `focus` listener on `window`: covers window-manager focus
     ///   changes that don't toggle `document.hidden` (e.g. alt-tab
     ///   between two visible windows), mirroring the web app exactly;
@@ -227,6 +270,17 @@ impl WalletData {
     ///   performed elsewhere shows up within a few seconds without the
     ///   user touching anything.
     ///
+    /// **Owner / context capture.** Every callback above runs *outside*
+    /// any Leptos reactive owner (a `.forget()`-leaked DOM closure / a
+    /// detached `spawn_local` future), so none of them can read
+    /// `use_context::<AppConfig>()` — that always returns `None` off the
+    /// owner tree and is exactly the `AppConfig context missing`
+    /// regression. The caller (the Home mount `Effect`, which *is* inside
+    /// an owner) must pass the already-resolved `AppConfig` in; we clone
+    /// it into each detached callback and route every refresh through
+    /// [`WalletData::refresh_with_config`] so no detached path ever
+    /// touches the context.
+    ///
     /// Idempotent: the App root provides a single `WalletData`, but the
     /// Home page mount Effect can re-run if the user navigates away and
     /// back client-side. The `reactivity_wired` latch ensures the
@@ -234,7 +288,11 @@ impl WalletData {
     /// lifetime (they intentionally outlive any single Home mount —
     /// balance reactivity is an app-global concern, not a per-view one,
     /// just as the web app's channel lives above the route tree).
-    pub fn start_visibility_refresh(&self) {
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::needless_pass_by_value, unused_variables)
+    )]
+    pub fn start_visibility_refresh(&self, config: Option<AppConfig>) {
         // Flip the latch once. If it was already set, another mount
         // already wired everything — bail without stacking handlers.
         if self.reactivity_wired.get_untracked() {
@@ -260,9 +318,12 @@ impl WalletData {
             {
                 let wallet = self.clone();
                 let doc_for_check = document.clone();
+                // Captured at wiring time, inside the owner. The closure
+                // is detached (`.forget()`), so it must NOT read context.
+                let config = config.clone();
                 let on_visibility = Closure::<dyn FnMut()>::new(move || {
                     if !doc_for_check.hidden() {
-                        wallet.clone().refresh();
+                        wallet.clone().refresh_with_config(config.clone());
                     }
                 });
                 if let Err(e) = document.add_event_listener_with_callback(
@@ -285,8 +346,9 @@ impl WalletData {
             // `refetchOnWindowFocus:'always'`.
             {
                 let wallet = self.clone();
+                let config = config.clone();
                 let on_focus = Closure::<dyn FnMut()>::new(move || {
-                    wallet.clone().refresh();
+                    wallet.clone().refresh_with_config(config.clone());
                 });
                 let target: &web_sys::EventTarget = window.as_ref();
                 if let Err(e) = target
@@ -303,6 +365,7 @@ impl WalletData {
             // keeps it a plain wasm future with no extra dependency.
             {
                 let wallet = self.clone();
+                let config = config.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     loop {
                         gloo_timers::future::TimeoutFuture::new(FOREGROUND_POLL_MS).await;
@@ -310,7 +373,7 @@ impl WalletData {
                             .and_then(|w| w.document())
                             .is_some_and(|d| !d.hidden());
                         if still_visible {
-                            wallet.clone().refresh();
+                            wallet.clone().refresh_with_config(config.clone());
                         }
                         // When hidden we skip the work but keep looping;
                         // the `visibilitychange` handler does the
