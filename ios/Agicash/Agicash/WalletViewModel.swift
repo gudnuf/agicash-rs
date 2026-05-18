@@ -560,6 +560,32 @@ final class WalletViewModel {
         }
     }
 
+    // MARK: - Exchange rate (converted-amount display)
+
+    /// Fetch the current BTC⇄USD rate as a parsed
+    /// `ExchangeRateConversion`, or `nil` when the rate is unavailable
+    /// (provider/network blip, unsupported pair, unparseable response).
+    ///
+    /// This deliberately collapses every failure — and an unparseable
+    /// snapshot — to `nil` rather than the usual `…Outcome` enum: the
+    /// converted "≈ X" line is a purely cosmetic secondary display
+    /// (`getExchangeRate` never feeds an FFI argument), so the only thing
+    /// a caller can do with a failure is omit the line. Surfacing a
+    /// presentation string would just tempt callers to render it where a
+    /// blank is correct. Does NOT flip `isWorking` — the rate is fetched
+    /// in the background next to a primary value that must render
+    /// regardless.
+    func exchangeRate(from: String, to: String) async -> ExchangeRateConversion? {
+        do {
+            let snapshot = try await wallet.getExchangeRate(from: from, to: to)
+            return ExchangeRateConversion(snapshot: snapshot)
+        } catch {
+            // Provider down / unsupported pair / network — the secondary
+            // line just doesn't render. Never escalates.
+            return nil
+        }
+    }
+
     // MARK: - Lightning Address (LUD-16) resolution
 
     /// Outcome for the LN-address → bolt11 resolve step. Success
