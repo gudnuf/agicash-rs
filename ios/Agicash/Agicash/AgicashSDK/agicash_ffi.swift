@@ -653,6 +653,36 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
     func executeMeltQuote(quoteId: String) async throws  -> MeltQuoteSnapshot
     
     /**
+     * Fetch the current exchange rate for one currency pair.
+     *
+     * Mirrors the CLI's `build_exchange_rate_deps` /
+     * `provider.get_rate(...)` sequence (`crates/agicash-cli/src/{composition,mint}.rs`):
+     * the slice-4 `MempoolSpaceProvider` is stateless and
+     * auth-independent (no session, no Supabase row), so it's
+     * constructed on demand here instead of being held in a wallet
+     * slot. `from` / `to` are case-insensitive currency codes
+     * (`BTC`, `USD`, `USDB`); the returned
+     * [`ExchangeRateSnapshot`] echoes them back canonically
+     * upper-cased.
+     *
+     * The returned `rate` is the price of `1` major unit of `from`
+     * denominated in major units of `to`, decimal-stringified
+     * (matching the `ReceiveResult.amount` convention). The
+     * provider supports `BTC<->USD`; any other pair surfaces as
+     * `FfiError::Internal` (`unsupported-pair`, mirroring the CLI's
+     * `classify_rate_error`).
+     *
+     * Errors (all funnel to `FfiError::Internal`, matching
+     * `prepare_melt_quote`'s pattern — no auth/storage layer is
+     * touched):
+     * - unknown currency code in `from` / `to`,
+     * - `unsupported-pair` for a pair the provider can't price,
+     * - `network-error` / `invalid-response` from the upstream
+     * `mempool.space` fetch.
+     */
+    func getExchangeRate(from: String, to: String) async throws  -> ExchangeRateSnapshot
+    
+    /**
      * Return the currently-loaded session, or `None` if the wallet is
      * logged out. Lets the Swift consumer re-sync its Keychain copy after
      * a `auth_guest` / `auth_login` call.
@@ -1262,6 +1292,51 @@ open func executeMeltQuote(quoteId: String)async throws  -> MeltQuoteSnapshot  {
             completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMeltQuoteSnapshot_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Fetch the current exchange rate for one currency pair.
+     *
+     * Mirrors the CLI's `build_exchange_rate_deps` /
+     * `provider.get_rate(...)` sequence (`crates/agicash-cli/src/{composition,mint}.rs`):
+     * the slice-4 `MempoolSpaceProvider` is stateless and
+     * auth-independent (no session, no Supabase row), so it's
+     * constructed on demand here instead of being held in a wallet
+     * slot. `from` / `to` are case-insensitive currency codes
+     * (`BTC`, `USD`, `USDB`); the returned
+     * [`ExchangeRateSnapshot`] echoes them back canonically
+     * upper-cased.
+     *
+     * The returned `rate` is the price of `1` major unit of `from`
+     * denominated in major units of `to`, decimal-stringified
+     * (matching the `ReceiveResult.amount` convention). The
+     * provider supports `BTC<->USD`; any other pair surfaces as
+     * `FfiError::Internal` (`unsupported-pair`, mirroring the CLI's
+     * `classify_rate_error`).
+     *
+     * Errors (all funnel to `FfiError::Internal`, matching
+     * `prepare_melt_quote`'s pattern — no auth/storage layer is
+     * touched):
+     * - unknown currency code in `from` / `to`,
+     * - `unsupported-pair` for a pair the provider can't price,
+     * - `network-error` / `invalid-response` from the upstream
+     * `mempool.space` fetch.
+     */
+open func getExchangeRate(from: String, to: String)async throws  -> ExchangeRateSnapshot  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_get_exchange_rate(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(from),FfiConverterString.lower(to)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeExchangeRateSnapshot_lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
@@ -2189,6 +2264,106 @@ public func FfiConverterTypeAuthStatus_lift(_ buf: RustBuffer) throws -> AuthSta
 #endif
 public func FfiConverterTypeAuthStatus_lower(_ value: AuthStatus) -> RustBuffer {
     return FfiConverterTypeAuthStatus.lower(value)
+}
+
+
+/**
+ * A single exchange-rate reading for one currency pair.
+ *
+ * `rate` is decimal-stringified to match the
+ * [`crate::receive::ReceiveResult`] / [`crate::melt_quote::MeltQuotePreview`]
+ * convention so Swift consumers don't thread Rust's `Decimal`
+ * through the FFI boundary. It is the price of `1` major unit of
+ * `from` denominated in major units of `to` — e.g.
+ * `get_exchange_rate("BTC", "USD")` yields the BTC->USD price
+ * (~50000 today); `get_exchange_rate("USD", "BTC")` yields its
+ * 8-dp inverse.
+ *
+ * `from` / `to` echo the requested pair as canonical upper-case
+ * currency codes (`BTC`, `USD`, `USDB`) — the iOS converted-display
+ * layer labels the figure off these instead of re-deriving the pair
+ * it asked for. They are the parsed-and-normalised forms, so a
+ * lower-case request comes back upper-cased.
+ */
+public struct ExchangeRateSnapshot: Equatable, Hashable {
+    /**
+     * Price of `1` major unit of `from` in major units of `to`.
+     * Decimal-stringified (matches the `ReceiveResult.amount`
+     * convention).
+     */
+    public var rate: String
+    /**
+     * Canonical upper-case source currency code (`BTC`, `USD`,
+     * `USDB`).
+     */
+    public var from: String
+    /**
+     * Canonical upper-case target currency code (`BTC`, `USD`,
+     * `USDB`).
+     */
+    public var to: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Price of `1` major unit of `from` in major units of `to`.
+         * Decimal-stringified (matches the `ReceiveResult.amount`
+         * convention).
+         */rate: String, 
+        /**
+         * Canonical upper-case source currency code (`BTC`, `USD`,
+         * `USDB`).
+         */from: String, 
+        /**
+         * Canonical upper-case target currency code (`BTC`, `USD`,
+         * `USDB`).
+         */to: String) {
+        self.rate = rate
+        self.from = from
+        self.to = to
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension ExchangeRateSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeExchangeRateSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExchangeRateSnapshot {
+        return
+            try ExchangeRateSnapshot(
+                rate: FfiConverterString.read(from: &buf), 
+                from: FfiConverterString.read(from: &buf), 
+                to: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ExchangeRateSnapshot, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.rate, into: &buf)
+        FfiConverterString.write(value.from, into: &buf)
+        FfiConverterString.write(value.to, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExchangeRateSnapshot_lift(_ buf: RustBuffer) throws -> ExchangeRateSnapshot {
+    return try FfiConverterTypeExchangeRateSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeExchangeRateSnapshot_lower(_ value: ExchangeRateSnapshot) -> RustBuffer {
+    return FfiConverterTypeExchangeRateSnapshot.lower(value)
 }
 
 
@@ -5210,6 +5385,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_execute_melt_quote() != 47960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_get_exchange_rate() != 3587) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_get_persisted_session() != 4899) {

@@ -111,12 +111,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agicash-exchange-rate"
+version = "0.1.0"
+dependencies = [
+ "agicash-domain",
+ "async-trait",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "agicash-ffi"
 version = "0.1.0"
 dependencies = [
  "agicash-auth-opensecret",
  "agicash-cashu",
  "agicash-domain",
+ "agicash-exchange-rate",
  "agicash-lightning-address",
  "agicash-money",
  "agicash-storage-supabase",
