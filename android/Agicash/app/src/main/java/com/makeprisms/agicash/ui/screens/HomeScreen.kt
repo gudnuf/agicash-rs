@@ -15,7 +15,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -23,11 +22,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.repeatOnLifecycle
 import com.makeprisms.agicash.ui.theme.BrandButton
 import com.makeprisms.agicash.ui.theme.BrandButtonSize
 import com.makeprisms.agicash.ui.theme.BrandButtonVariant
@@ -37,8 +33,6 @@ import com.makeprisms.agicash.ui.theme.Spacing
 import com.makeprisms.agicash.wallet.WalletViewModel
 import java.math.BigDecimal
 import java.math.RoundingMode
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import uniffi.agicash_ffi.AccountFfi
 
@@ -69,41 +63,23 @@ fun HomeScreen(
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
     val refreshError by viewModel.refreshError.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
-    val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Refresh balance every time Home returns to the foreground. Replaces
-    // the old `LaunchedEffect(Unit)` (which fired ONCE per composition and
-    // never again, leaving Home stuck at $0 until the process was killed).
-    // Mirrors iOS `.task { await model.refreshAccounts() }`, which re-runs
-    // on every appear, plus the web canonical `refetchOnWindowFocus:'always'`.
-    // ON_RESUME fires on first entry AND on every return from background or
-    // from another screen, so this both seeds the initial balance and
-    // re-syncs on navigation/foregrounding.
+    // One-shot foreground re-sync. ON_RESUME fires on first entry AND on
+    // every return from background / another screen, so this seeds the
+    // initial balance and re-syncs on navigation/foregrounding. Mirrors
+    // iOS `.task { await model.refreshAccounts() }` and the web
+    // `refetchOnWindowFocus:'always'`.
+    //
+    // The Tier-1 5s `repeatOnLifecycle(STARTED)` poll that used to live
+    // here is DELETED: out-of-band receives are now caught by the
+    // all-Rust Supabase Realtime subscription wired in `WalletViewModel`
+    // (`onConnected` is the no-replay catch-up — it refetches on every
+    // (re)connect; `onEvent` refetches on each broadcast). This
+    // resume-effect remains only as the initial-paint / on-return seed,
+    // never as a recurring poller.
     LifecycleResumeEffect(Unit) {
         viewModel.refreshAccounts()
         onPauseOrDispose { }
-    }
-
-    // Foreground poll: while Home is at least STARTED (visible), re-read
-    // the balance every 5s. This is the Tier-1 stand-in for the web app's
-    // Supabase Realtime channel — it picks up out-of-band receives (funds
-    // arriving from web / another device / a Lightning quote that settled
-    // after navigation) without any user gesture, within ~5s. The
-    // `repeatOnLifecycle(STARTED)` block runs only while Home is visible and
-    // its coroutine is cancelled the moment Home drops below STARTED
-    // (backgrounded / navigated away) and restarted on return, so no
-    // network work happens off-screen. This is the documented idiom for a
-    // lifecycle-bound repeating task; same role as iOS's `.task`-driven
-    // single-shot pollers (pollLightningQuote / pollSendClaim), just
-    // driving refreshAccounts on a fixed cadence. `isActive` keeps the
-    // loop honest if the enclosing scope is cancelled mid-delay.
-    LaunchedEffect(lifecycleOwner) {
-        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            while (isActive) {
-                delay(POLL_INTERVAL_MS)
-                viewModel.refreshAccounts()
-            }
-        }
     }
 
     PullToRefreshBox(
@@ -128,12 +104,14 @@ fun HomeScreen(
                 verticalArrangement = Arrangement.spacedBy(Spacing.xxxl),
             ) {
                 Spacer(Modifier.padding(top = Spacing.hero))
-                // Non-fatal transient-refresh banner. A background-poll /
-                // on-resume `list_accounts()` blip keeps the last-known
-                // balance on screen (BalanceHero below still renders the
-                // cached `accounts`) and surfaces here instead of routing
-                // to the session-destroying ErrorView. Clears itself on
-                // the next successful 5s poll tick.
+                // Non-fatal transient-refresh banner. An on-resume /
+                // realtime-driven `list_accounts()` blip keeps the
+                // last-known balance on screen (BalanceHero below still
+                // renders the cached `accounts`) and surfaces here
+                // instead of routing to the session-destroying
+                // ErrorView. Clears itself on the next successful
+                // refresh (next resume, realtime onConnected/onEvent, or
+                // pull-to-refresh).
                 if (refreshError != null) {
                     Text(
                         text = "Showing last known balance — couldn't reach the server.",
@@ -155,16 +133,6 @@ fun HomeScreen(
         }
     }
 }
-
-/**
- * Foreground balance-poll cadence. 5s matches the plan's "within ~5s of
- * an out-of-band receive" target and the iOS Tier-1 poll interval. Long
- * enough that the per-tick `list_accounts()` Supabase round-trip is
- * negligible battery/network; short enough that an incoming receive feels
- * near-immediate. Tier 2 (a real Supabase Realtime FFI seam) makes this
- * poll redundant — see 2026-05-18-balance-tracking-parity.md.
- */
-private const val POLL_INTERVAL_MS = 5_000L
 
 /**
  * Centered balance display modeled on iOS `BalanceHero`. Teko numeric

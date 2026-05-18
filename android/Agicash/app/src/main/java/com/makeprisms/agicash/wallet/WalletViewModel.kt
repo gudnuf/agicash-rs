@@ -13,8 +13,10 @@ import uniffi.agicash_ffi.AccountFfi
 import uniffi.agicash_ffi.AgicashWallet
 import uniffi.agicash_ffi.FfiException
 import uniffi.agicash_ffi.MintAddResult
+import uniffi.agicash_ffi.RealtimeStatusFfi
 import uniffi.agicash_ffi.Session
 import uniffi.agicash_ffi.UserFfi
+import uniffi.agicash_ffi.WalletEventListener
 
 /**
  * Mirrors `ios/Agicash/Agicash/WalletViewModel.swift` in Android idiom.
@@ -98,7 +100,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
      * True while an explicit user-initiated refresh (pull-to-refresh) is
      * in flight. Drives the Material3 `PullToRefreshBox` spinner on
      * [com.makeprisms.agicash.ui.screens.HomeScreen]. Distinct from
-     * [isWorking] (auth/mint/send mutations) so a background poll or an
+     * [isWorking] (auth/mint/send mutations) so a realtime-driven or an
      * on-resume refresh never spins the pull indicator. iOS gets this for
      * free from SwiftUI's `.refreshable` awaiting the async closure; on
      * Android we surface it explicitly because the screen needs a
@@ -113,7 +115,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     /**
      * Transient, non-fatal refresh failure surfaced to a soft banner on
      * Home while the user stays signed in (last-known balance preserved).
-     * Set when a background poll / on-resume / post-mutation
+     * Set when a realtime-driven / on-resume / post-mutation
      * `list_accounts()` blip fails *without* being a genuine auth
      * expiry; cleared on the next successful refresh. Distinct from
      * [loginErrorMessage] (login screen) and from the session-destroying
@@ -127,8 +129,110 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     private var wallet: AgicashWallet? = null
 
+    /**
+     * Tracks whether a realtime subscription is currently active so the
+     * two session-establishing paths (cold-start restore + interactive
+     * sign-in) don't double-start it, and so [signOut] only tears it
+     * down when one is running. Touched only from `viewModelScope`
+     * coroutines (single-threaded main dispatcher confinement), so a
+     * plain `Boolean` is sufficient — no atomics needed.
+     */
+    private var realtimeStarted = false
+
+    /**
+     * Forwards Supabase-Realtime activity (delivered on the Rust
+     * realtime supervisor's tokio task — see the `WalletEventListener`
+     * UniFFI callback-interface doc) onto the existing
+     * [refreshAccounts] path. `onConnected` is the **no-replay catch-up**
+     * (spec §5.5): on every (re)connect we refetch wallet+balance, which
+     * is exactly why the Tier-1 foreground poll on `HomeScreen` is
+     * deleted — a fresh connect already does the catch-up the poll used
+     * to do. `onEvent` is a DB-originated broadcast; the wallet layer
+     * demuxes by name, so here we just refetch (mirrors the React
+     * `useTrackWalletChanges` → React-Query-invalidate behavior).
+     *
+     * `onStatus`/`onError` are **non-fatal** by construction: they only
+     * log. A realtime drop/error must NEVER route to the
+     * session-destroying [Phase.Error]/`ErrorView` — the tiered
+     * non-destructive model in [refreshAccountsSuspending]
+     * (`isBootstrap`/`isSignedIn` discipline) is preserved untouched.
+     * Realtime down → last-known balance stays on screen; the next
+     * `onConnected` refetches on reconnect.
+     *
+     * [refreshAccounts] is fire-and-forget on `viewModelScope`, so these
+     * callbacks never block the realtime supervisor task and the bridge
+     * holds no `WalletViewModel` strong ref beyond the enclosing
+     * instance (it's an `inner class`; its lifetime is the ViewModel's,
+     * and `stopWalletEvents()` in [signOut]/`onCleared` drops the
+     * Rust-side `Arc` to it).
+     */
+    private inner class WalletEventBridge : WalletEventListener {
+        override fun onConnected() {
+            refreshAccounts()
+        }
+
+        override fun onEvent(event: String, payloadJson: String) {
+            refreshAccounts()
+        }
+
+        override fun onStatus(status: RealtimeStatusFfi) {
+            android.util.Log.d("WalletViewModel", "realtime status: $status")
+        }
+
+        override fun onError(message: String) {
+            // Observability only — explicitly NOT escalated to Phase.Error.
+            android.util.Log.w("WalletViewModel", "realtime error (non-fatal): $message")
+        }
+    }
+
     init {
         bootstrap()
+    }
+
+    /**
+     * Start the realtime subscription once a session is established
+     * (the FFI rejects with `FfiException.Auth` if called without one,
+     * so this is only invoked from the two post-auth paths). Idempotent
+     * via [realtimeStarted]; the suspend FFI call is confined to
+     * `Dispatchers.IO` like every other UniFFI hop in this class
+     * (RustFuture::poll must not run on the main looper). A failure to
+     * start is **non-fatal**: log and continue on last-known balance —
+     * it must not destroy or block the session.
+     */
+    private suspend fun startRealtime() {
+        if (realtimeStarted) return
+        val w = wallet ?: return
+        try {
+            withContext(Dispatchers.IO) { w.startWalletEvents(WalletEventBridge()) }
+            realtimeStarted = true
+        } catch (e: Throwable) {
+            android.util.Log.w(
+                "WalletViewModel",
+                "startWalletEvents failed (continuing without realtime): ${e.message}",
+            )
+        }
+    }
+
+    /**
+     * Stop the realtime subscription on logout. The FFI call is an
+     * idempotent no-op when nothing is running, but we still gate on
+     * [realtimeStarted] to skip the `Dispatchers.IO` hop in the common
+     * signed-out-already case. Best-effort: a failure here never blocks
+     * the local sign-out state transition.
+     */
+    private suspend fun stopRealtime() {
+        if (!realtimeStarted) return
+        val w = wallet ?: return
+        try {
+            withContext(Dispatchers.IO) { w.stopWalletEvents() }
+        } catch (e: Throwable) {
+            android.util.Log.w(
+                "WalletViewModel",
+                "stopWalletEvents failed (ignored): ${e.message}",
+            )
+        } finally {
+            realtimeStarted = false
+        }
     }
 
     private fun bootstrap() {
@@ -183,6 +287,11 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
                 // back to yet, so a hard failure here legitimately routes
                 // to the initial-load error surface.
                 refreshAccountsSuspending(isBootstrap = true)
+                // Session is established (cold-start restore succeeded):
+                // attach the realtime subscription. This replaces the
+                // deleted Tier-1 HomeScreen poll — on (re)connect the
+                // bridge's onConnected does the no-replay catch-up.
+                startRealtime()
             } else {
                 _state.value = BootState.Ready(Phase.SignedOut)
             }
@@ -211,6 +320,10 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
                 val session = withContext(Dispatchers.IO) { call(w) }
                 _state.value = BootState.Ready(Phase.SignedIn(session.userId))
                 refreshAccounts()
+                // Post-login session established: attach realtime. Same
+                // catch-up role as the bootstrap path; replaces the
+                // deleted Tier-1 poll.
+                startRealtime()
             } catch (e: FfiException) {
                 _loginErrorMessage.value = ffiErrorMessage(e)
             } catch (e: Throwable) {
@@ -225,6 +338,10 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
         val w = wallet ?: return
         _isWorking.value = true
         viewModelScope.launch {
+            // Tear down the realtime subscription BEFORE the server
+            // logout so the channel's access_token is still valid for
+            // the clean phx_leave + socket close.
+            stopRealtime()
             try {
                 withContext(Dispatchers.IO) { w.authLogout() }
             } catch (_: Throwable) {
@@ -248,8 +365,8 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
      * `receive()` success path — same role as iOS `await refreshAccounts()`
      * inside `receive`/`completeLightningQuote`/`createSend`.
      *
-     * The lifecycle-aware on-resume refresh and the foreground poll on
-     * HomeScreen call this too. Pull-to-refresh uses
+     * The lifecycle-aware on-resume refresh and the realtime bridge
+     * (`onConnected`/`onEvent`) call this too. Pull-to-refresh uses
      * [refreshAccountsFromPull] instead so it can flip [isRefreshing] for
      * the Material3 spinner.
      */
@@ -288,11 +405,11 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * The actual refresh, suspending so callers (poll loop, pull-to-
-     * refresh, on-resume) can sequence around it.
+     * The actual refresh, suspending so callers (realtime bridge,
+     * pull-to-refresh, on-resume) can sequence around it.
      *
      * Failure handling is now tiered so a transient blip on the
-     * foreground poll / on-resume / post-mutation refresh can no longer
+     * realtime-driven / on-resume / post-mutation refresh can no longer
      * destroy a live session (the old behavior: ANY `list_accounts()`
      * throw → [Phase.Error] → `ErrorView` whose only action is the
      * session-destroying `signOut()`):
@@ -307,11 +424,12 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
      *    there is no last-known balance to fall back to, so escalate to
      *    [Phase.Error] — the initial-load error surface is appropriate
      *    here (and is the only path that still reaches `ErrorView`).
-     *  - **Non-auth failure while already signed in** (poll / on-resume
-     *    / addMint / setDefault): NON-FATAL. Keep the last-good
-     *    `_accounts`, surface a transient [refreshError] banner, and
-     *    leave `_state` untouched. The 5s Home poll keeps running and
-     *    self-heals on the next tick when the network recovers.
+     *  - **Non-auth failure while already signed in** (realtime
+     *    onConnected/onEvent / on-resume / addMint / setDefault):
+     *    NON-FATAL. Keep the last-good `_accounts`, surface a transient
+     *    [refreshError] banner, and leave `_state` untouched. The next
+     *    realtime (re)connect / broadcast or on-resume self-heals it
+     *    when the network recovers.
      *
      * A `get_user()` failure remains non-fatal (brand-new guests have no
      * user row yet — expected).
@@ -338,7 +456,8 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
                     BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
             } else {
                 // Transient blip while signed in: keep last-known balance,
-                // soft banner, self-heal on the next poll tick.
+                // soft banner, self-heal on the next realtime
+                // (re)connect / broadcast or on-resume.
                 _refreshError.value = "Couldn't refresh balance: ${ffiErrorMessage(e)}"
             }
             return
@@ -472,5 +591,34 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
         is FfiException.Auth -> "auth/${e.code}: ${e.message}"
         is FfiException.Storage -> "storage/${e.code}: ${e.message}"
         is FfiException.Internal -> e.message ?: "internal error"
+    }
+
+    /**
+     * The Rust realtime supervisor runs on a detached tokio task owned
+     * by the [AgicashWallet]; a `tokio::spawn` handle does NOT abort on
+     * drop, so if this ViewModel is cleared while still signed in
+     * (`viewModelScope` is already cancelled by the time `onCleared`
+     * runs), that task would outlive the UI it feeds. Drain it on a
+     * process-lifetime scope so the supervisor + its listener `Arc` are
+     * released. Best-effort and fire-and-forget — process teardown
+     * doesn't wait on it, and the FFI stop is an idempotent no-op when
+     * nothing is running.
+     */
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    override fun onCleared() {
+        super.onCleared()
+        if (!realtimeStarted) return
+        val w = wallet ?: return
+        realtimeStarted = false
+        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+            try {
+                w.stopWalletEvents()
+            } catch (e: Throwable) {
+                android.util.Log.w(
+                    "WalletViewModel",
+                    "stopWalletEvents on onCleared failed (ignored): ${e.message}",
+                )
+            }
+        }
     }
 }
