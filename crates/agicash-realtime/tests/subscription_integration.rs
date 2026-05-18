@@ -129,15 +129,10 @@ impl RealtimeTransport for ForceDropTransport {
     async fn connect(&mut self, u: &str) -> Result<(), agicash_realtime::TransportError> {
         self.inner.connect(u).await
     }
-    async fn send_text(
-        &mut self,
-        f: String,
-    ) -> Result<(), agicash_realtime::TransportError> {
+    async fn send_text(&mut self, f: String) -> Result<(), agicash_realtime::TransportError> {
         self.inner.send_text(f).await
     }
-    async fn recv(
-        &mut self,
-    ) -> Option<Result<WsFrame, agicash_realtime::TransportError>> {
+    async fn recv(&mut self) -> Option<Result<WsFrame, agicash_realtime::TransportError>> {
         // Only this (the first) connection honours the drop. After the
         // reconnect, `armed` is false so the new socket runs normally.
         // The drop must interrupt a *parked* recv (an idle live socket
@@ -159,18 +154,12 @@ impl RealtimeTransport for ForceDropTransport {
         });
         match select(real, dropped).await {
             Either::Left((frame, _)) => frame,
-            Either::Right(((), _)) => Some(Err(
-                agicash_realtime::TransportError::Closed(
-                    "forced drop (integration test)".into(),
-                ),
-            )),
+            Either::Right(((), _)) => Some(Err(agicash_realtime::TransportError::Closed(
+                "forced drop (integration test)".into(),
+            ))),
         }
     }
-    async fn close(
-        &mut self,
-        c: u16,
-        r: &str,
-    ) -> Result<(), agicash_realtime::TransportError> {
+    async fn close(&mut self, c: u16, r: &str) -> Result<(), agicash_realtime::TransportError> {
         self.inner.close(c, r).await
     }
 }
@@ -260,8 +249,7 @@ async fn db_change_yields_wallet_event_and_reconnect_yields_second_connected() {
     //    / user_storage_integration): we mutate an existing account so
     //    the ACCOUNT_UPDATED trigger fires for a user whose id we control
     //    as the JWT `sub` (RLS join policy: topic == 'wallet:'||sub).
-    let accounts_url =
-        format!("{base}/rest/v1/accounts?select=id,user_id&limit=1");
+    let accounts_url = format!("{base}/rest/v1/accounts?select=id,user_id&limit=1");
     let body = curl(&[
         &accounts_url,
         "-H",
@@ -271,8 +259,7 @@ async fn db_change_yields_wallet_event_and_reconnect_yields_second_connected() {
         "-H",
         "Accept-Profile: wallet",
     ]);
-    let rows: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let row = rows
         .as_array()
         .and_then(|a| a.first())
@@ -345,8 +332,7 @@ async fn db_change_yields_wallet_event_and_reconnect_yields_second_connected() {
         match next_event(&mut rx, 15, "broadcast Event").await {
             WalletRealtimeEvent::Event(e) => {
                 assert!(
-                    e.event.starts_with("ACCOUNT_")
-                        || e.event.starts_with("TRANSACTION_"),
+                    e.event.starts_with("ACCOUNT_") || e.event.starts_with("TRANSACTION_"),
                     "unexpected event name: {}",
                     e.event
                 );
@@ -423,10 +409,7 @@ async fn db_change_yields_wallet_event_and_reconnect_yields_second_connected() {
     for _ in 0..12 {
         match next_event(&mut rx, 15, "post-reconnect Event").await {
             WalletRealtimeEvent::Event(e) => {
-                eprintln!(
-                    "[sub-int] ✓ delivery continues post-rotation: {}",
-                    e.event
-                );
+                eprintln!("[sub-int] ✓ delivery continues post-rotation: {}", e.event);
                 saw_post_rotation_event = true;
                 break;
             }

@@ -10,9 +10,7 @@
 //! `wasm-bindgen-futures` over a global-`setTimeout`-backed `js_sys::Promise`
 //! (the codebase's approved wasm async primitive — we deliberately do NOT
 //! pull in `gloo-timers`).
-use crate::client::{
-    build_connect_url, JwtSource, PhoenixClient, BACKOFF_MS, HEARTBEAT_MS,
-};
+use crate::client::{build_connect_url, JwtSource, PhoenixClient, BACKOFF_MS, HEARTBEAT_MS};
 use crate::event::{RealtimeStatus, WalletRealtimeEvent};
 use crate::transport::RealtimeTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,9 +177,9 @@ impl WalletRealtimeService {
                 attempt += 1;
             }
         }
-        let _ = self.tx.try_broadcast(WalletRealtimeEvent::StatusChanged(
-            RealtimeStatus::Closed,
-        ));
+        let _ = self
+            .tx
+            .try_broadcast(WalletRealtimeEvent::StatusChanged(RealtimeStatus::Closed));
     }
 
     /// Connect+join, then serve inbound frames while a 25s timer
@@ -197,8 +195,7 @@ impl WalletRealtimeService {
     ) -> Result<(), crate::RealtimeError> {
         use futures_util::StreamExt;
         client.connect_and_join().await?;
-        let mut hb =
-            tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_MS));
+        let mut hb = tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_MS));
         hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         hb.tick().await; // consume the immediate first tick
         let mut stop_rx = self.stop_rx.clone();
@@ -278,9 +275,7 @@ impl WalletRealtimeService {
         use futures_util::StreamExt;
         let mut stop_rx = self.stop_rx.clone();
         #[cfg(not(target_arch = "wasm32"))]
-        let delay = std::pin::pin!(tokio::time::sleep(
-            std::time::Duration::from_millis(ms)
-        ));
+        let delay = std::pin::pin!(tokio::time::sleep(std::time::Duration::from_millis(ms)));
         #[cfg(target_arch = "wasm32")]
         let delay = std::pin::pin!(wasm_sleep_ms(ms));
         let _ = select(delay, std::pin::pin!(stop_rx.next())).await;
@@ -295,12 +290,9 @@ impl WalletRealtimeService {
 async fn wasm_sleep_ms(ms: u64) {
     use wasm_bindgen::{closure::Closure, JsCast, JsValue};
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let set_timeout = js_sys::Reflect::get(
-            &js_sys::global(),
-            &JsValue::from_str("setTimeout"),
-        )
-        .ok()
-        .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
         if let Some(set_timeout) = set_timeout {
             // Keep the resolver alive until the timer fires.
             let cb = Closure::once_into_js(move || {
@@ -327,9 +319,7 @@ async fn wasm_sleep_ms(ms: u64) {
 /// `Send + Sync`; the wasm path drops it — mirrors `SupabaseStorage`'s
 /// `tokens` field split (`agicash-storage-supabase/src/client.rs`).
 #[cfg(not(target_arch = "wasm32"))]
-pub struct TokenProviderJwtSource(
-    pub Arc<dyn agicash_traits::TokenProvider + Send + Sync>,
-);
+pub struct TokenProviderJwtSource(pub Arc<dyn agicash_traits::TokenProvider + Send + Sync>);
 #[cfg(target_arch = "wasm32")]
 pub struct TokenProviderJwtSource(pub Arc<dyn agicash_traits::TokenProvider>);
 
@@ -401,12 +391,7 @@ mod tests {
     #[async_trait::async_trait]
     impl TransportFactory for FakeFactory {
         async fn make(&self) -> Box<dyn RealtimeTransport> {
-            let inbound = self
-                .script
-                .lock()
-                .unwrap()
-                .pop()
-                .unwrap_or_default();
+            let inbound = self.script.lock().unwrap().pop().unwrap_or_default();
             Box::new(ScriptTransport {
                 outbound: Arc::clone(&self.outbound),
                 inbound: Mutex::new(inbound),
@@ -487,9 +472,7 @@ mod tests {
         let drain = async {
             loop {
                 match futures_util::StreamExt::next(&mut rx).await {
-                    Some(WalletRealtimeEvent::StatusChanged(RealtimeStatus::Closed)) => {
-                        break
-                    }
+                    Some(WalletRealtimeEvent::StatusChanged(RealtimeStatus::Closed)) => break,
                     Some(_) => {}
                     None => break,
                 }
@@ -502,7 +485,8 @@ mod tests {
 
         let out = outbound.lock().unwrap().clone();
         assert!(
-            out.iter().any(|f| f.contains(r#""realtime:wallet:u1","phx_join""#)),
+            out.iter()
+                .any(|f| f.contains(r#""realtime:wallet:u1","phx_join""#)),
             "join was sent: {out:?}"
         );
         assert!(
