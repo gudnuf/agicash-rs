@@ -13,6 +13,7 @@ members = [
     "agicash-auth-opensecret",
     "agicash-cache",
     "agicash-services",
+    "agicash-realtime",
     "agicash-wallet",
     "agicash-testing",
     "agicash-cli",
@@ -74,6 +75,12 @@ bip39 = "2"
 parking_lot = "0.12"
 dotenvy = "0.15"
 getrandom = "0.2"
+
+# Realtime (Supabase / Phoenix v2 client) — slice 10
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+tungstenite = { version = "0.24", default-features = false }
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event", "ErrorEvent"] }
+futures-util = "0.3"
 
 # Storage
 postgrest = "1.6"
