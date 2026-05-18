@@ -23,6 +23,16 @@ use agicash_exchange_rate::ExchangeRateError;
 use agicash_lightning_address::LightningAddressError;
 use agicash_traits::{AuthError, CashuProviderError, StorageError};
 
+/// Retry classification for a `WalletError`. Consumers branch on this
+/// instead of pattern-matching error variants. Spec §11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPolicy {
+    /// Never retry — domain rejection, bad input, auth, bug, unsupported.
+    Never,
+    /// Retry with exponential backoff (100ms/400ms/1.6s + jitter), capped.
+    ExponentialBackoff { max_attempts: u8 },
+}
+
 /// Facade-level error type. Every public `WalletClient` method returns
 /// `Result<_, WalletError>`.
 #[derive(Debug, thiserror::Error)]
@@ -44,6 +54,17 @@ pub enum WalletError {
     /// `MeltQuoteError`, `CashuProviderError`, `ReceiveFlowError`.
     #[error("cashu error: {0}")]
     Cashu(String),
+
+    /// Transport/connectivity failure (DNS, timeout, connection reset,
+    /// offline mint). Retry-able with backoff. Spec §11 `Network`.
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// State moved between read and write (quote already spent/expired,
+    /// stale version, conflict). Retry-able after re-fetch. Spec §11
+    /// `Concurrency`.
+    #[error("concurrency error: {0}")]
+    Concurrency(String),
 
     /// LUD-16 Lightning Address resolution failure.
     #[error("lightning-address error: {0}")]
@@ -79,6 +100,18 @@ impl WalletError {
         Self::Validation {
             code: code.into(),
             message: message.into(),
+        }
+    }
+
+    /// Spec §11 retry policy. Default is conservative `Never`; only
+    /// `Network` and `Concurrency` are retry-able.
+    #[must_use]
+    pub fn retry_policy(&self) -> RetryPolicy {
+        match self {
+            Self::Network(_) | Self::Concurrency(_) => {
+                RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+            }
+            _ => RetryPolicy::Never,
         }
     }
 }
@@ -182,5 +215,37 @@ mod tests {
         let e = WalletError::Unsupported("spark accounts available in slice 9");
         let msg = e.to_string();
         assert!(msg.contains("spark"));
+    }
+
+    #[test]
+    fn retry_policy_network_is_backoff_max_3() {
+        let e = WalletError::Network("connection reset".into());
+        assert_eq!(
+            e.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn retry_policy_concurrency_is_capped_retry() {
+        let e = WalletError::Concurrency("quote moved to EXPIRED".into());
+        assert_eq!(
+            e.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn retry_policy_never_for_domain_and_catchall() {
+        for e in [
+            WalletError::Cashu("token already spent".into()),
+            WalletError::Unauthenticated,
+            WalletError::NotFound("acct".into()),
+            WalletError::validation("bad_uuid", "x"),
+            WalletError::Internal("bug".into()),
+            WalletError::Unsupported("slice 9"),
+        ] {
+            assert_eq!(e.retry_policy(), RetryPolicy::Never, "{e:?} must not retry");
+        }
     }
 }
