@@ -215,7 +215,7 @@ pub enum AccountCommand {
     /// List active accounts for the current user.
     List,
     /// Set the per-currency default account. Currency is inferred from
-    /// the account row (BTC -> default_btc_account_id, USD -> ditto).
+    /// the account row (BTC -> `default_btc_account_id`, USD -> ditto).
     Default {
         /// Account ID (UUID).
         id: String,
@@ -313,7 +313,7 @@ mod tests {
                 AccountCommand::Default { id } => {
                     assert_eq!(id, "00000000-0000-0000-0000-000000000000");
                 }
-                other => panic!("unexpected: {other:?}"),
+                other @ AccountCommand::List => panic!("unexpected: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }

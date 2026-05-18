@@ -289,6 +289,10 @@ impl AgicashWallet {
     /// Callers on iOS / wasm / host should not invoke it; the FFI surface
     /// returns an `Internal` error if the storage backend isn't compiled
     /// in on the current target.
+    // The `.await` lives in the `target_os = "android"` cfg branch; on
+    // host/non-android targets that branch is compiled out, so clippy sees
+    // no await. `async` is part of the UniFFI surface and must stay.
+    #[allow(clippy::unused_async)]
     pub async fn set_session_storage_dir(&self, dir: String) -> Result<(), FfiError> {
         #[cfg(all(feature = "android-file-storage", target_os = "android"))]
         {
@@ -345,7 +349,10 @@ impl AgicashWallet {
         // failure we drop the on-disk blob so the next launch falls
         // back to the sign-in screen instead of re-trying a dead token.
         match self
-            .set_session(persisted.user_id.to_string(), persisted.refresh_token.clone())
+            .set_session(
+                persisted.user_id.to_string(),
+                persisted.refresh_token.clone(),
+            )
             .await
         {
             Ok(()) => {
@@ -1108,11 +1115,8 @@ impl AgicashWallet {
         let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
 
         let accounts = self.storage.list_accounts(user_id).await?;
-        let account = pick_cashu_account_for_lightning(
-            &accounts,
-            account_id.as_deref(),
-            currency_enum,
-        )?;
+        let account =
+            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?;
         let mint_url = account
             .details
             .get("mint_url")
@@ -1176,12 +1180,9 @@ impl AgicashWallet {
         let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
 
         let accounts = self.storage.list_accounts(user_id).await?;
-        let account = pick_cashu_account_for_lightning(
-            &accounts,
-            account_id.as_deref(),
-            currency_enum,
-        )?
-        .clone();
+        let account =
+            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?
+                .clone();
         let mint_url_str = account
             .details
             .get("mint_url")
@@ -1345,7 +1346,10 @@ impl AgicashWallet {
             .map_err(|e| FfiError::internal(format!("mint check_state: {e}")))?;
 
         let all_spent = !resp.states.is_empty()
-            && resp.states.iter().all(|s| matches!(s.state, CdkProofState::Spent));
+            && resp
+                .states
+                .iter()
+                .all(|s| matches!(s.state, CdkProofState::Spent));
 
         if all_spent {
             // PENDING → COMPLETED so subsequent polls short-circuit on
@@ -1655,9 +1659,9 @@ fn send_swap_error_to_ffi(e: agicash_cashu::SendSwapError) -> FfiError {
         SendSwapError::CurrencyMismatch { account, request } => FfiError::internal(format!(
             "currency mismatch: account {account} differs from request {request}",
         )),
-        SendSwapError::InsufficientBalance { needed, have } => FfiError::internal(format!(
-            "insufficient balance: need {needed}, have {have}",
-        )),
+        SendSwapError::InsufficientBalance { needed, have } => {
+            FfiError::internal(format!("insufficient balance: need {needed}, have {have}",))
+        }
         SendSwapError::InvalidTransition { from, event } => {
             FfiError::internal(format!("invalid state transition from {from} on {event}"))
         }
@@ -1834,8 +1838,8 @@ fn cashu_unit_for_currency(currency: Currency) -> CurrencyUnit {
 fn token_proof_to_cdk_proof(proof: &TokenProof) -> Result<Proof, String> {
     use cdk::nuts::PublicKey;
     use cdk::secret::Secret;
-    let keyset_id = KeysetId::from_str(&proof.id)
-        .map_err(|e| format!("keyset id {}: {e}", proof.id))?;
+    let keyset_id =
+        KeysetId::from_str(&proof.id).map_err(|e| format!("keyset id {}: {e}", proof.id))?;
     let secret = Secret::from_str(&proof.secret).map_err(|e| format!("secret: {e}"))?;
     let c = PublicKey::from_hex(&proof.c).map_err(|e| format!("C: {e}"))?;
     Ok(Proof {

@@ -65,13 +65,10 @@ pub async fn cmd_set_default(
             default_usd_account_id: Some(Some(account_id)),
             ..Default::default()
         },
-        other => return Err(AccountCmdError::UnsupportedCurrency(other)),
+        other @ Currency::Usdb => return Err(AccountCmdError::UnsupportedCurrency(other)),
     };
 
     let user = storage.storage.update_user_defaults(user_id, patch).await?;
-    println!(
-        "{}",
-        serde_json::to_string(&user).expect("serialize user")
-    );
+    println!("{}", serde_json::to_string(&user).expect("serialize user"));
     Ok(())
 }
