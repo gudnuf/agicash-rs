@@ -10,8 +10,23 @@ repository.workspace = true
 agicash-domain = { path = "../agicash-domain" }
 agicash-money = { path = "../agicash-money" }
 agicash-traits = { path = "../agicash-traits" }
-agicash-cache = { path = "../agicash-cache" }
-agicash-services = { path = "../agicash-services" }
+agicash-cashu = { path = "../agicash-cashu" }
+agicash-exchange-rate = { path = "../agicash-exchange-rate" }
+agicash-lightning-address = { path = "../agicash-lightning-address" }
+async-trait = { workspace = true }
+cdk = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

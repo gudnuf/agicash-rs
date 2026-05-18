@@ -338,11 +338,22 @@ dependencies = [
 name = "agicash-wallet"
 version = "0.1.0"
 dependencies = [
- "agicash-cache",
+ "agicash-cashu",
  "agicash-domain",
+ "agicash-exchange-rate",
+ "agicash-lightning-address",
  "agicash-money",
- "agicash-services",
  "agicash-traits",
+ "async-trait",
+ "cdk",
+ "chrono",
+ "hex",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
