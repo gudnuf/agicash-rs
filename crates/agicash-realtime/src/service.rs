@@ -231,36 +231,50 @@ impl WalletRealtimeService {
         use futures_util::StreamExt;
         client.connect_and_join().await?;
         let mut stop_rx = self.stop_rx.clone();
+
+        // What the serve-vs-timer race resolved to. Computing this in an
+        // inner scope lets the `client.serve_step()` borrow (held by the
+        // pinned race future) end *before* the heartbeat branch needs a
+        // second `&mut client` — mirrors `tokio::select!`'s drop of the
+        // unselected future, which `futures_util::select` does not do
+        // while the result is still being matched.
+        enum Tick {
+            Served(bool),
+            Heartbeat,
+            Stop,
+        }
+
         loop {
             if self.stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
             // Race serve_step vs the heartbeat timer; the stop signal is
             // folded into the timer side so a parked socket still wakes.
-            let step = std::pin::pin!(client.serve_step());
-            let timer = std::pin::pin!(async {
-                select(
-                    std::pin::pin!(wasm_sleep_ms(HEARTBEAT_MS)),
-                    std::pin::pin!(stop_rx.next()),
-                )
-                .await
-            });
-            match select(step, timer).await {
-                Either::Left((res, _)) => {
-                    if !res? {
-                        return Err(crate::RealtimeError::Transport(
-                            crate::TransportError::Closed("recv ended".into()),
-                        ));
-                    }
+            let tick = {
+                let step = std::pin::pin!(client.serve_step());
+                // `Box::pin` (alloc only, no new dep) sidesteps the
+                // `pin!`-of-temporary lifetime trap inside the inner
+                // future: the heap-pinned timer outlives the `.await`.
+                let timer = std::pin::pin!(async {
+                    let sleep = Box::pin(wasm_sleep_ms(HEARTBEAT_MS));
+                    let stop = Box::pin(stop_rx.next());
+                    select(sleep, stop).await
+                });
+                match select(step, timer).await {
+                    Either::Left((res, _)) => Tick::Served(res?),
+                    Either::Right((Either::Left(((), _)), _)) => Tick::Heartbeat,
+                    Either::Right((Either::Right((_, _)), _)) => Tick::Stop,
                 }
-                // Heartbeat tick elapsed first.
-                Either::Right((Either::Left(((), _)), _)) => {
-                    client.send_heartbeat().await?;
+            };
+            match tick {
+                Tick::Served(true) => {}
+                Tick::Served(false) => {
+                    return Err(crate::RealtimeError::Transport(
+                        crate::TransportError::Closed("recv ended".into()),
+                    ));
                 }
-                // Stop signalled.
-                Either::Right((Either::Right((_, _)), _)) => {
-                    return Ok(());
-                }
+                Tick::Heartbeat => client.send_heartbeat().await?,
+                Tick::Stop => return Ok(()),
             }
         }
     }
@@ -472,9 +486,10 @@ mod tests {
         let drain = async {
             loop {
                 match futures_util::StreamExt::next(&mut rx).await {
-                    Some(WalletRealtimeEvent::StatusChanged(RealtimeStatus::Closed)) => break,
+                    Some(WalletRealtimeEvent::StatusChanged(RealtimeStatus::Closed)) | None => {
+                        break
+                    }
                     Some(_) => {}
-                    None => break,
                 }
             }
         };
