@@ -56,7 +56,14 @@ fun LoginScreen(viewModel: WalletViewModel) {
     val isWorking by viewModel.isWorking.collectAsStateWithLifecycle()
     val errorMessage by viewModel.loginErrorMessage.collectAsStateWithLifecycle()
     var email by rememberSaveable { mutableStateOf("") }
-    var password by rememberSaveable { mutableStateOf("") }
+    // Plain `remember`, NOT `rememberSaveable`: the account password is a
+    // fund-gating secret. `rememberSaveable` serializes into the
+    // saved-instance-state Bundle, which Android persists to disk on a
+    // system-initiated process death (low-memory kill while backgrounded)
+    // — that would write the cleartext password at rest. Keeping it in
+    // the in-memory composition means it never outlives the process.
+    // `email` stays saveable (non-sensitive, restores the typed address).
+    var password by remember { mutableStateOf("") }
 
     Box(
         modifier = Modifier
