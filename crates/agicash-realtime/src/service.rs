@@ -165,6 +165,15 @@ impl WalletRealtimeService {
             if result.is_ok() {
                 attempt = 0;
             } else {
+                // The serve cycle failed (socket/channel down) and we are
+                // NOT stopping → we will back off and reconnect. Surface
+                // `Reconnecting` here so a *transport-level* drop (a bare
+                // `recv` error, which `serve_step` propagates without a
+                // protocol `phx_close`) still tells the UI it lost the
+                // channel — not just the protocol-level `ChannelDown`.
+                let _ = self.tx.try_broadcast(WalletRealtimeEvent::StatusChanged(
+                    RealtimeStatus::Reconnecting,
+                ));
                 let idx = attempt.min(BACKOFF_MS.len() - 1);
                 self.backoff_sleep(BACKOFF_MS[idx]).await;
                 attempt += 1;
