@@ -139,12 +139,22 @@ impl WalletClient {
 
     /// Single-account lookup.
     pub async fn get_account(&self, account_id: AccountId) -> Result<AccountSummary, WalletError> {
-        let _session = self.require_session().await?;
+        let session = self.require_session().await?;
         let account = self
             .user_storage
             .get_account(account_id)
             .await?
             .ok_or_else(|| WalletError::NotFound(format!("account {account_id}")))?;
+        // `get_account` is not user-scoped at the storage layer (unlike
+        // `list_accounts`), so re-check ownership here — same guard the
+        // quote methods use (see `complete_send_lightning`,
+        // `poll_receive_lightning`).
+        if account.user_id != session.user_id {
+            return Err(WalletError::Validation {
+                code: "wrong_owner".into(),
+                message: "account belongs to a different user".into(),
+            });
+        }
         let balance = compute_cashu_balance(self.cashu_send_storage.as_ref(), &account).await?;
         Ok(AccountSummary::from_account(&account, balance))
     }
@@ -653,6 +663,20 @@ impl WalletClient {
         address: String,
         amount: Money,
     ) -> Result<SendLightningReceipt, WalletError> {
+        // Lightning send always settles against a BTC Cashu account
+        // (see `send_lightning` → `pick_cashu_account(.., Currency::Btc)`).
+        // Guard the requested currency BEFORE conversion so a non-BTC
+        // amount fails fast with a clear error instead of producing a
+        // misleading msat figure.
+        if amount.currency() != Currency::Btc {
+            return Err(WalletError::validation(
+                "currency_mismatch",
+                format!(
+                    "Lightning send requires a BTC amount; got {}",
+                    amount.currency()
+                ),
+            ));
+        }
         // Resolve the address → BOLT-11.
         let info = agicash_lightning_address::resolve(&address).await?;
         // amount.amount() is in the account's minor unit; convert to msat.
@@ -1155,23 +1179,28 @@ fn melt_paid_to_receipt(
 }
 
 fn money_to_msat(amount: &Money) -> Result<u64, WalletError> {
-    let raw = amount.amount();
-    match amount.unit() {
-        Unit::Msat => raw
-            .try_into()
-            .map_err(|_| WalletError::validation("bad_amount", "amount overflows u64")),
-        Unit::Sat => {
-            let n: u64 = raw
-                .try_into()
-                .map_err(|_| WalletError::validation("bad_amount", "amount overflows u64"))?;
-            n.checked_mul(1000)
-                .ok_or_else(|| WalletError::validation("bad_amount", "amount overflows u64 msat"))
-        }
-        other => Err(WalletError::validation(
-            "unsupported_unit",
-            format!("cannot convert {other} to msat for Lightning send"),
-        )),
+    use rust_decimal::prelude::ToPrimitive;
+    // Canonical conversion (mirrors `money_to_minor_units` in
+    // agicash-cashu/src/mint_quote/service.rs and `amount_as_u64` in
+    // send_swap/service.rs): normalize to the target unit, then read the
+    // integer. `to_unit` handles every unit the rest of the system handles
+    // (Major / Sat / Msat / Cent), so a BTC `Unit::Major` input converts
+    // correctly instead of being rejected as `unsupported_unit`.
+    let normalized = amount
+        .to_unit(Unit::Msat)
+        .map_err(|e| WalletError::validation("unsupported_unit", format!("to msat: {e}")))?;
+    let dec = normalized.amount();
+    // Precision loss must be explicit: a non-integer msat amount is a
+    // caller error, not something we silently truncate (the old
+    // `Decimal::try_into` rounded fractional values away).
+    if dec.fract() != Decimal::ZERO {
+        return Err(WalletError::validation(
+            "bad_amount",
+            format!("amount {dec} msat is not a whole number of msat"),
+        ));
     }
+    dec.to_u64()
+        .ok_or_else(|| WalletError::validation("bad_amount", "amount overflows u64 msat"))
 }
 
 // `MeltQuoteError` already implements `From` to `WalletError`; this alias
@@ -1266,4 +1295,41 @@ mod tests {
         let m = Money::new(Decimal::from(1u64), Currency::Usd, Unit::Cent);
         assert!(money_to_msat(&m).is_err());
     }
+
+    // H1 regression: a BTC `Unit::Major` amount must convert, not be
+    // rejected as `unsupported_unit`. 0.00000001 BTC = 1 sat = 1000 msat.
+    #[test]
+    fn money_to_msat_handles_btc_major_unit() {
+        let m = Money::new(
+            Decimal::from_str("0.00000001").unwrap(),
+            Currency::Btc,
+            Unit::Major,
+        );
+        assert_eq!(money_to_msat(&m).unwrap(), 1_000);
+    }
+
+    // H1 regression: a fractional msat amount must be an explicit error,
+    // not silently truncated (the old `Decimal::try_into` rounded it away).
+    // 1500.5 msat at Unit::Msat has a non-zero fractional part.
+    #[test]
+    fn money_to_msat_rejects_fractional_msat() {
+        let m = Money::new(
+            Decimal::from_str("1500.5").unwrap(),
+            Currency::Btc,
+            Unit::Msat,
+        );
+        let err = money_to_msat(&m).unwrap_err();
+        assert!(
+            matches!(err, WalletError::Validation { ref code, .. } if code == "bad_amount"),
+            "expected bad_amount validation error, got {err:?}"
+        );
+    }
+
+    // M1 follow-up: a `get_account` ownership-mismatch test would require
+    // constructing a full `WalletClient` (11 `Arc<dyn …>` deps incl. 4
+    // concrete cashu service structs + an `AuthClient` for `require_session`)
+    // — well over the ~50 LOC inline-double budget, and there is no test
+    // builder / `UserStorage` fake yet. Deferred to the fakes lane.
+    // TODO[slice-12-followup]: add get_account wrong_owner test once a
+    // lightweight WalletClient test harness / UserStorage fake exists.
 }
