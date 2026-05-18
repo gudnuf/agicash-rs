@@ -37,18 +37,64 @@ struct LightningReceiveView: View {
 
     @State private var amountBuffer: String = "0"
     @State private var phase: Phase = .amountEntry
+    /// Currency the numpad enters in. Drives the FFI `currency`
+    /// argument directly — the mint is quoted in this currency, no
+    /// client-side conversion. Switching it resets the buffer because
+    /// "100 sats" and "100 cents" aren't the same magnitude and there
+    /// is no exchange rate exposed via FFI to carry the value across
+    /// (the web app's "≈ X sats" secondary line needs that rate; see
+    /// the file footer note).
+    @State private var entryCurrency: EntryCurrency = .btc
     /// Long-running poll task. Held so we can cancel it when the view
     /// disappears, the user hits Cancel, or the polled state moves
     /// past UNPAID.
     @State private var pollTask: Task<Void, Never>?
     /// Auto-dismiss timer on the success state.
     @State private var autoDismissTask: Task<Void, Never>?
-    /// Display unit. Sat-mode (BTC) only for now — the FFI accepts
-    /// `currency: "USD"` but the LightningReceiveView ships sats-only
-    /// to keep the numpad opinionated. USD support is a follow-up.
-    private let currency = "BTC"
-    private let unitLabel = "sats"
-    private var allowsDecimal: Bool { false } // sats are integer
+
+    /// Currencies the receive numpad can enter in. Maps 1:1 onto the
+    /// `startMintQuote` `currency` argument (`"BTC"` / `"USD"`); the
+    /// FFI takes the amount in the account's minor unit (integer sats
+    /// for BTC, integer cents for USD).
+    enum EntryCurrency: CaseIterable {
+        case btc
+        case usd
+
+        /// Wallet currency string the FFI expects.
+        var ffiCurrency: String {
+            switch self {
+            case .btc: return "BTC"
+            case .usd: return "USD"
+            }
+        }
+        /// Unit label rendered next to the hero amount.
+        var unitLabel: String {
+            switch self {
+            case .btc: return "sats"
+            case .usd: return "USD"
+            }
+        }
+        /// Short label for the toggle pill.
+        var shortLabel: String {
+            switch self {
+            case .btc: return "sats"
+            case .usd: return "USD"
+            }
+        }
+        /// USD enters dollars-with-cents (two decimals); sats are
+        /// integer. Drives both the numpad decimal key and the
+        /// minor-unit conversion below.
+        var allowsDecimal: Bool {
+            switch self {
+            case .btc: return false
+            case .usd: return true
+            }
+        }
+    }
+
+    private var currency: String { entryCurrency.ffiCurrency }
+    private var unitLabel: String { entryCurrency.unitLabel }
+    private var allowsDecimal: Bool { entryCurrency.allowsDecimal }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -119,6 +165,9 @@ struct LightningReceiveView: View {
                 Text("Receive over Lightning")
                     .font(.brandLabel)
                     .foregroundStyle(Color.brandMutedForeground)
+
+                currencyToggle
+                    .padding(.top, Spacing.xs)
             }
             .frame(maxWidth: .infinity)
 
@@ -135,6 +184,49 @@ struct LightningReceiveView: View {
             .padding(.horizontal, Spacing.l)
 
             Spacer(minLength: Spacing.l)
+        }
+    }
+
+    /// sats ⇄ USD switcher. Mirrors the web's `ConvertedMoneySwitcher`
+    /// (`app/features/shared/converted-money-switcher.tsx`) — an
+    /// up/down arrow glyph that flips the entry currency. The web
+    /// renders the *converted* amount next to the arrow ("≈ 1,234
+    /// sats"); we can't here because no exchange-rate symbol is
+    /// exported by the FFI (see footer note), so the pill shows the
+    /// currency you'd switch *to* instead. Tapping flips and clears
+    /// the buffer (the magnitudes aren't comparable without a rate).
+    private var currencyToggle: some View {
+        Button(action: switchCurrency) {
+            HStack(spacing: Spacing.xs) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(otherCurrency.shortLabel)
+                    .font(.brandLabel)
+            }
+            .foregroundStyle(Color.brandMutedForeground)
+            .padding(.horizontal, Spacing.m)
+            .padding(.vertical, Spacing.s)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(Color.brandMuted)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Switch to entering the amount in \(otherCurrency.shortLabel)")
+    }
+
+    /// The currency the toggle would switch *to*.
+    private var otherCurrency: EntryCurrency {
+        entryCurrency == .btc ? .usd : .btc
+    }
+
+    private func switchCurrency() {
+        UISelectionFeedbackGenerator().selectionChanged()
+        withAnimation(.easeInOut(duration: 0.18)) {
+            entryCurrency = otherCurrency
+            // Reset — "100 sats" and "100 USD" aren't equivalent and
+            // there's no FFI rate to carry the value across.
+            amountBuffer = "0"
         }
     }
 
@@ -155,10 +247,39 @@ struct LightningReceiveView: View {
         return formatter.string(from: NSNumber(value: n)) ?? amountBuffer
     }
 
+    /// The numpad value converted into the FFI's minor unit:
+    ///   - BTC  → integer sats (buffer is already integer sats).
+    ///   - USD  → cents (buffer is dollars-with-decimals; "12.5" →
+    ///     1250, "12" → 1200). The FFI takes the amount "in the
+    ///     account's minor unit (sats for BTC, cents for USD)" per
+    ///     `startMintQuote`'s doc-comment, so we scale here rather
+    ///     than passing dollars.
+    ///
+    /// Returns `nil` for empty / mid-decimal / unparseable buffers so
+    /// the CTA stays disabled until the value is well-formed.
     private var parsedAmount: UInt64? {
-        // Drop a trailing dot ("12." → "12") and parse.
-        let clean = amountBuffer.trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        return UInt64(clean)
+        switch entryCurrency {
+        case .btc:
+            // Drop a trailing dot ("12." → "12") and parse.
+            let clean = amountBuffer.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return UInt64(clean)
+        case .usd:
+            // "12" → 1200, "12.5" → 1250, "12.50" → 1250. Reject more
+            // than two fractional digits (sub-cent isn't mintable).
+            let parts = amountBuffer.split(separator: ".", omittingEmptySubsequences: false)
+            guard let whole = UInt64(parts.first ?? "0") else { return nil }
+            if parts.count == 1 {
+                return whole * 100
+            }
+            guard parts.count == 2 else { return nil }
+            let fracRaw = String(parts[1])
+            guard fracRaw.count <= 2 else { return nil }
+            // Pad "5" → "50" so the scale is always /100.
+            let fracPadded = fracRaw.padding(toLength: 2, withPad: "0", startingAt: 0)
+            // Empty fraction ("12.") is treated as ".00".
+            let frac = fracPadded.isEmpty ? 0 : UInt64(fracPadded) ?? 0
+            return whole * 100 + frac
+        }
     }
 
     private var isAmountValid: Bool {
@@ -489,3 +610,24 @@ private struct FailureCard: View {
         }
     }
 }
+
+// MARK: - Known gap: secondary "converted amount" line
+//
+// The web amount-entry screen (`app/features/receive/receive-input.tsx`
+// + `app/features/shared/converted-money-switcher.tsx`) renders a
+// secondary muted line under the hero amount showing the *converted*
+// value ("≈ 1,234 sats" while entering USD, and vice-versa). That
+// requires a sat⇄USD exchange rate. The web app gets it client-side
+// from `app/lib/exchange-rate/` (mempool.space / coinbase / coingecko
+// providers, slice-4 added a mempool.space rate to core).
+//
+// That rate is NOT exported through the UniFFI binding: there is no
+// `exchangeRate` / `btcPrice` / `fiatRate` symbol anywhere in
+// `AgicashSDK/agicash_ffi.swift` (only `startMintQuote`, the
+// poll/complete trio, and the Lightning-address helpers). So this
+// screen ships the toggle WITHOUT the converted secondary line — the
+// quote is requested directly in the chosen currency via
+// `startMintQuote(currency:)` (the FFI quotes the mint in BTC or USD
+// natively, no client conversion needed for correctness). The
+// secondary display is a follow-up that needs an exchange-rate FFI
+// export, not a hardcoded rate.
