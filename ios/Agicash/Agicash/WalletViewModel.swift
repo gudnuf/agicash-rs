@@ -1,5 +1,72 @@
 import Foundation
 import Observation
+import os
+
+/// Bridges the Rust realtime event stream (`WalletEventListener` callback
+/// interface, regenerated into the FFI bindings in slice 10 Stage 3) to
+/// the existing `refreshAccounts` path.
+///
+/// The core is the source of truth: a DB-originated broadcast (or a
+/// (re)connect catch-up) only needs to trigger a single balance/accounts
+/// refetch — the same refresh every send/receive already performs. So
+/// every signal here collapses to one `onChange()` call rather than
+/// trying to apply a diff from the payload.
+///
+/// `onConnected` is the no-replay catch-up: Supabase Realtime has no
+/// backlog, so on first join *and* on every reconnect we refetch once to
+/// close the gap. This is precisely what replaces the deleted Tier-1
+/// 4s/scenePhase poll — instead of polling every 4s on the off chance
+/// something changed, we refetch exactly when the channel says "you may
+/// have missed something" (join) or "something changed" (broadcast).
+///
+/// `onStatus` / `onError` are observability only — logged, never
+/// escalated. A dropped channel is non-fatal by construction: the Rust
+/// side keeps reconnecting and will emit `onConnected` again, at which
+/// point the catch-up refetch runs. Nothing here ever touches `phase`,
+/// so a realtime fault can never reach the fatal sign-out teardown.
+///
+/// `@unchecked Sendable`: the only stored member is an immutable
+/// `@Sendable` closure; the closure itself hops to the `@MainActor`
+/// before touching any view-model state.
+final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
+    private static let log = Logger(
+        subsystem: "app.agicash.rust", category: "realtime"
+    )
+
+    private let onChange: @Sendable () -> Void
+
+    init(onChange: @escaping @Sendable () -> Void) {
+        self.onChange = onChange
+    }
+
+    /// Channel (re)connected & joined. No replay → refetch once to
+    /// catch up. This is the catch-up that replaces the Tier-1 poll.
+    func onConnected() {
+        Self.log.info("realtime connected — catch-up refetch")
+        onChange()
+    }
+
+    /// A DB-originated broadcast. We don't diff the payload — the core
+    /// row is already authoritative; just trigger the same refresh a
+    /// local send/receive performs.
+    func onEvent(event: String, payloadJson: String) {
+        Self.log.debug("realtime event \(event, privacy: .public)")
+        onChange()
+    }
+
+    /// UI-affordance status transitions. Non-fatal: logged only. A
+    /// disconnect/reconnect never escalates — the Rust side retries and
+    /// re-emits `onConnected`.
+    func onStatus(status: RealtimeStatusFfi) {
+        Self.log.info("realtime status \(String(describing: status), privacy: .public)")
+    }
+
+    /// Non-fatal observability error. Logged, never surfaced to the UI
+    /// and never mapped to `phase = .error`.
+    func onError(message: String) {
+        Self.log.error("realtime error: \(message, privacy: .public)")
+    }
+}
 
 /// Phase 1 wallet view model. Holds the `AgicashWallet` UniFFI handle, an
 /// auth phase, and the cached accounts list. SwiftUI observes the @Observable
@@ -63,6 +130,14 @@ final class WalletViewModel {
 
     private let wallet: AgicashWallet
 
+    /// Strong reference to the live realtime listener while subscribed.
+    /// UniFFI clones the handle into the Rust side, but we also retain
+    /// the Swift object so its identity (and the `onChange` closure it
+    /// carries) stays valid for the subscription's lifetime. `nil`
+    /// whenever there is no active subscription (signed out / never
+    /// started / demo mode). Released in `unsubscribeWalletEvents()`.
+    private var eventBridge: WalletEventBridge?
+
     init() throws {
         self.wallet = try AgicashWallet(
             opensecretUrl: Endpoints.opensecretURL,
@@ -85,6 +160,11 @@ final class WalletViewModel {
             )
             phase = .signedIn(userId: stored.userId)
             await refreshAccounts()
+            // Session is live — open the realtime channel. `onConnected`
+            // will fire a catch-up refetch (covers anything that landed
+            // while the app was killed); this is the replacement for the
+            // deleted Home poll.
+            await subscribeWalletEvents()
         } catch let err as SessionStoreError {
             phase = .error("session load failed: \(err)")
         } catch let err as FfiError {
@@ -157,6 +237,10 @@ final class WalletViewModel {
             )
             phase = .signedIn(userId: session.userId)
             await refreshAccounts()
+            // Session just established (guest / login / signup all funnel
+            // here) — start realtime so the balance stays live without
+            // the deleted foreground poll.
+            await subscribeWalletEvents()
         } catch let err as FfiError {
             loginErrorMessage = ffiErrorMessage(err)
         } catch let err as SessionStoreError {
@@ -177,6 +261,10 @@ final class WalletViewModel {
             phase = .signedOut
             return
         }
+        // Tear down realtime before dropping the session so the channel
+        // closes cleanly while the token is still valid. Best-effort and
+        // a no-op if nothing was subscribed (e.g. realtime never opened).
+        await unsubscribeWalletEvents()
         do {
             try await wallet.authLogout()
         } catch {
@@ -727,6 +815,68 @@ final class WalletViewModel {
             // Unexpected throw shape; same conservative handling.
             _ = error
         }
+    }
+
+    // MARK: - Realtime wallet events (slice 10 Tier-2)
+
+    /// Start the Rust realtime subscription and route every signal to a
+    /// background (non-fatal) accounts refresh. Called from the
+    /// post-login / rehydrate paths once `self.wallet` carries a live
+    /// session. Idempotent: a second call while already subscribed is a
+    /// no-op (we keep the existing bridge rather than stacking a second
+    /// subscription).
+    ///
+    /// Demo mode has no real session/transport, so we skip it there for
+    /// the same reason `refreshAccounts` short-circuits — the FFI call
+    /// would just fail against an absent backend.
+    ///
+    /// The refresh closure uses `refreshAccounts(background: true)`: a
+    /// realtime-driven refetch is exactly the "unattended re-sync" the
+    /// `background` flag exists for. A send/receive sheet (and an
+    /// in-flight Lightning payment) may be presented when a broadcast
+    /// lands; a transient `listAccounts` blip on that route must keep
+    /// the last-known balance and must NOT escalate to `phase = .error`
+    /// (which `AuthGateView` turns into the full signed-in teardown).
+    /// Only a genuine auth-expiry still escalates — identical discipline
+    /// to the poll this replaces.
+    ///
+    /// `startWalletEvents` itself is wrapped in `try?`: failing to open
+    /// the channel is non-fatal (no realtime ≈ the pre-slice-10 world,
+    /// minus the poll; a manual pull-to-refresh still works and the next
+    /// login retries). It must never throw into the auth flow.
+    func subscribeWalletEvents() async {
+        if isDemoMode { return }
+        if eventBridge != nil { return }
+        let bridge = WalletEventBridge { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.refreshAccounts(background: true)
+            }
+        }
+        eventBridge = bridge
+        do {
+            try await wallet.startWalletEvents(listener: bridge)
+        } catch {
+            // Non-fatal: drop the retained bridge so a later login can
+            // cleanly retry, and stay signed-in with manual refresh.
+            eventBridge = nil
+            _ = error
+        }
+    }
+
+    /// Tear down the realtime subscription and release the retained
+    /// bridge. Called from the logout path. Best-effort: `stop` failing
+    /// must not block sign-out, and we release the Swift-side strong
+    /// reference regardless so the listener can deallocate.
+    func unsubscribeWalletEvents() async {
+        guard eventBridge != nil else { return }
+        do {
+            try await wallet.stopWalletEvents()
+        } catch {
+            // Best-effort; the Rust side closes the socket on its own
+            // timeout even if this call didn't land cleanly.
+            _ = error
+        }
+        eventBridge = nil
     }
 
     /// Outcome shape returned to the swipe handler in `AccountsView`.
