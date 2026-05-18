@@ -21,8 +21,19 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
-tokio = { workspace = true }
 uuid = { workspace = true }
+
+# Tokio is target-gated: native targets get the workspace feature set
+# (rt-multi-thread, signal, time, sync, macros). wasm32 keeps only the
+# wasm-safe surface — sync + macros + time — because rt-multi-thread and
+# signal pull `mio`, which fails on wasm with
+# "This wasm target is unsupported by mio". See spec
+# `2026-05-17-storage-supabase-wasm-port-design.md`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.42", default-features = false, features = ["sync", "macros", "time"] }
 
 [dev-dependencies]
 agicash-domain = { path = "../agicash-domain" }

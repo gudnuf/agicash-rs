@@ -57,7 +57,8 @@ impl std::fmt::Debug for CdkCashuProvider {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl CashuProvider for CdkCashuProvider {
     async fn wallet_for_account(
         &self,

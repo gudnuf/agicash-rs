@@ -52,7 +52,8 @@ pub trait ProofEncryption: ProofEncryptionBounds {
 #[derive(Debug, Clone, Default)]
 pub struct PassthroughProofEncryption;
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl ProofEncryption for PassthroughProofEncryption {
     async fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         Ok(plaintext.to_vec())
