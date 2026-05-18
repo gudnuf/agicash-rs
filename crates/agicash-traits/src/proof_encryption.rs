@@ -19,6 +19,18 @@ pub enum EncryptionError {
     NoKey,
 }
 
+/// Marker bound alias — `Send + Sync` on native, empty on wasm. Mirrors
+/// `KeyProviderBounds`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ProofEncryptionBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> ProofEncryptionBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait ProofEncryptionBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> ProofEncryptionBounds for T {}
+
 /// Encrypts and decrypts opaque byte blobs. Real impls MUST derive a fresh
 /// nonce per call and MUST NOT be deterministic; the passthrough impl in this
 /// crate is for local dev only.
@@ -26,8 +38,9 @@ pub enum EncryptionError {
 /// Storage callers are responsible for serializing domain values to bytes
 /// before calling [`encrypt`] (and deserializing after [`decrypt`]) — the
 /// trait stays plaintext-agnostic on purpose.
-#[async_trait]
-pub trait ProofEncryption: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait ProofEncryption: ProofEncryptionBounds {
     async fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError>;
     async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, EncryptionError>;
 }

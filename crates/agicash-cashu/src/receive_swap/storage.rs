@@ -24,8 +24,20 @@ use agicash_traits::EncryptionError;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-#[async_trait]
-pub trait CashuReceiveSwapStorage: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuReceiveSwapStorageBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuReceiveSwapStorageBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuReceiveSwapStorageBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuReceiveSwapStorageBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CashuReceiveSwapStorage: CashuReceiveSwapStorageBounds {
     /// Create a new receive-swap row + reserve a keyset counter range on the
     /// account. Returns the swap (PENDING) and the updated account.
     ///

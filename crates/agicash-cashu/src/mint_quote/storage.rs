@@ -22,8 +22,20 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[async_trait]
-pub trait CashuMintQuoteStorage: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuMintQuoteStorageBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuMintQuoteStorageBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuMintQuoteStorageBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuMintQuoteStorageBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CashuMintQuoteStorage: CashuMintQuoteStorageBounds {
     /// Persist a new UNPAID mint quote (and its draft transaction).
     async fn create(&self, input: CreateMintQuote)
         -> Result<CashuMintQuote, MintQuoteStorageError>;

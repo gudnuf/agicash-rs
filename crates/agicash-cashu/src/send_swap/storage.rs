@@ -34,8 +34,20 @@ pub struct ProofWithId {
     pub proof: TokenProof,
 }
 
-#[async_trait]
-pub trait CashuSendSwapStorage: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuSendSwapStorageBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuSendSwapStorageBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuSendSwapStorageBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuSendSwapStorageBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CashuSendSwapStorage: CashuSendSwapStorageBounds {
     /// Create a send-swap row, reserving the chosen input proofs from the
     /// account. If `input_amount != amount_to_send`, the swap starts DRAFT
     /// (input swap with mint required). Otherwise PENDING (proofs ARE the

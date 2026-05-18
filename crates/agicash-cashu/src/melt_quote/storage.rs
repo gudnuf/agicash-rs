@@ -18,8 +18,21 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[async_trait]
-pub trait CashuMeltQuoteStorage: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm. Mirrors
+/// `agicash_traits::KeyProviderBounds`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuMeltQuoteStorageBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuMeltQuoteStorageBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuMeltQuoteStorageBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuMeltQuoteStorageBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CashuMeltQuoteStorage: CashuMeltQuoteStorageBounds {
     /// Persist a new UNPAID melt quote, reserving the chosen input proofs
     /// and bumping the account's keyset counter by
     /// `input.number_of_change_outputs`.

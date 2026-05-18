@@ -79,8 +79,22 @@ pub struct UpsertUserResult {
     pub accounts: Vec<Account>,
 }
 
-#[async_trait]
-pub trait UserStorage: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm. Lets
+/// `UserStorage` carry the right bound for each target without duplicating
+/// every trait method behind `cfg`. Mirrors `KeyProviderBounds`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait UserStorageBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> UserStorageBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait UserStorageBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> UserStorageBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait UserStorage: UserStorageBounds {
     /// Real Supabase RPC: `wallet.upsert_user_with_accounts`. Idempotent on
     /// `user_id`; safe to call repeatedly. Returns the resulting user row plus
     /// all of that user's accounts.

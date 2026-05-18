@@ -49,8 +49,20 @@ pub enum CashuProviderError {
     Protocol(String),
 }
 
-#[async_trait]
-pub trait CashuProvider: Send + Sync {
+/// Marker bound alias — `Send + Sync` on native, empty on wasm.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuProviderBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuProviderBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuProviderBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuProviderBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CashuProvider: CashuProviderBounds {
     /// Returns the connector handle for the mint linked to this Cashu account.
     /// Providers cache connectors keyed by mint URL; repeated calls for the
     /// same mint return the same underlying HTTP client.
