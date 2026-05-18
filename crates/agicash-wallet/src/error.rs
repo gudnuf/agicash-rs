@@ -134,39 +134,79 @@ impl From<StorageError> for WalletError {
     }
 }
 
+// The classification rule lives in `docs/superpowers/plans/12a-suberror-inventory.md`.
+// `CashuProviderError` is the leaf transport enum; the four sub-errors that wrap
+// it (`Mint`/`MintDiscovery`) delegate to its classification rather than
+// string-matching foreign messages. `_ => Self::Cashu(e.to_string())` is the
+// retained §11 catch-all so nothing regresses.
+
 impl From<CashuProviderError> for WalletError {
     fn from(e: CashuProviderError) -> Self {
-        Self::Cashu(e.to_string())
+        match &e {
+            // transport/connectivity → retry-able
+            CashuProviderError::Network(_) => Self::Network(e.to_string()),
+            // InvalidUrl (config), Protocol (mint domain) → conservative Never
+            _ => Self::Cashu(e.to_string()),
+        }
     }
 }
 
 impl From<ReceiveSwapError> for WalletError {
     fn from(e: ReceiveSwapError) -> Self {
-        Self::Cashu(e.to_string())
+        match e {
+            // delegate to the wrapped provider's classification
+            ReceiveSwapError::Mint(p) => p.into(),
+            // no own state-moved variant → no Concurrency arm
+            other => Self::Cashu(other.to_string()),
+        }
     }
 }
 
 impl From<SendSwapError> for WalletError {
     fn from(e: SendSwapError) -> Self {
-        Self::Cashu(e.to_string())
+        match e {
+            SendSwapError::Mint(p) => p.into(),
+            // no own state-moved variant → no Concurrency arm
+            other => Self::Cashu(other.to_string()),
+        }
     }
 }
 
 impl From<MintQuoteError> for WalletError {
     fn from(e: MintQuoteError) -> Self {
-        Self::Cashu(e.to_string())
+        match e {
+            MintQuoteError::Mint(p) => p.into(),
+            // quote expired between read & write → retry after re-fetch
+            e @ MintQuoteError::QuoteExpired => Self::Concurrency(e.to_string()),
+            other => Self::Cashu(other.to_string()),
+        }
     }
 }
 
 impl From<MeltQuoteError> for WalletError {
     fn from(e: MeltQuoteError) -> Self {
-        Self::Cashu(e.to_string())
+        match e {
+            MeltQuoteError::Mint(p) => p.into(),
+            // in-flight conflict surfaced from a unique-index race, and
+            // invoice expired before melt initiated → both are state-moved
+            e @ (MeltQuoteError::DuplicatePayment | MeltQuoteError::QuoteExpired) => {
+                Self::Concurrency(e.to_string())
+            }
+            other => Self::Cashu(other.to_string()),
+        }
     }
 }
 
 impl From<ReceiveFlowError> for WalletError {
     fn from(e: ReceiveFlowError) -> Self {
-        Self::Cashu(e.to_string())
+        match e {
+            // NUT-06 discovery wraps the provider — delegate
+            ReceiveFlowError::MintDiscovery(p) => p.into(),
+            // underlying swap carries its own classification — delegate
+            ReceiveFlowError::Swap(s) => s.into(),
+            // no own state-moved variant → no own Concurrency arm
+            other => Self::Cashu(other.to_string()),
+        }
     }
 }
 
@@ -247,5 +287,122 @@ mod tests {
         ] {
             assert_eq!(e.retry_policy(), RetryPolicy::Never, "{e:?} must not retry");
         }
+    }
+
+    // --- Task 3: cashu sub-error reclassification (per 12a-suberror-inventory.md) ---
+    // `CashuProviderError`, sub-error enums are imported via `super::*`.
+
+    #[test]
+    fn cashuprovider_network_maps_to_network() {
+        let src = CashuProviderError::Network("mint unreachable".into());
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn cashuprovider_protocol_stays_cashu() {
+        let src = CashuProviderError::Protocol("bad NUT-06 response".into());
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn receiveswap_mint_network_maps_to_network() {
+        let src = ReceiveSwapError::Mint(CashuProviderError::Network("offline".into()));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn receiveswap_domain_stays_cashu() {
+        let src = ReceiveSwapError::AmountTooSmall;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn sendswap_mint_network_maps_to_network() {
+        let src = SendSwapError::Mint(CashuProviderError::Network("timeout".into()));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn sendswap_domain_stays_cashu() {
+        let src = SendSwapError::AmountTooSmall;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn mintquote_mint_network_maps_to_network() {
+        let src = MintQuoteError::Mint(CashuProviderError::Network("dns".into()));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn mintquote_expired_maps_to_concurrency() {
+        let src = MintQuoteError::QuoteExpired;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn mintquote_domain_stays_cashu() {
+        let src = MintQuoteError::QuoteNotPaid;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn meltquote_mint_network_maps_to_network() {
+        let src = MeltQuoteError::Mint(CashuProviderError::Network("conn reset".into()));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn meltquote_duplicate_payment_maps_to_concurrency() {
+        let src = MeltQuoteError::DuplicatePayment;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn meltquote_expired_maps_to_concurrency() {
+        let src = MeltQuoteError::QuoteExpired;
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn meltquote_domain_stays_cashu() {
+        let src = MeltQuoteError::MeltFailed("mint said no".into());
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn receiveflow_mintdiscovery_network_maps_to_network() {
+        let src = ReceiveFlowError::MintDiscovery(CashuProviderError::Network("nut06".into()));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn receiveflow_swap_network_propagates_to_network() {
+        let src = ReceiveFlowError::Swap(ReceiveSwapError::Mint(CashuProviderError::Network(
+            "offline".into(),
+        )));
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+    }
+
+    #[test]
+    fn receiveflow_domain_stays_cashu() {
+        let src = ReceiveFlowError::TokenParse("bad token".into());
+        let w: WalletError = src.into();
+        assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
     }
 }
