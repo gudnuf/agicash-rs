@@ -9,12 +9,12 @@
 //!
 //! See the `WIRE_CONFIRM_FINDING` constant below for the observed broadcast
 //! frame kind emitted by the running local Supabase Realtime server
-//! `v2.74.7` for `realtime.send` on a private channel. Until Task 9 has run
-//! against the live stack this constant reads "UNCONFIRMED".
+//! (`v2.74.7`) for `realtime.send` on a private channel. Until Task 9 has
+//! run against the live stack this constant reads `UNCONFIRMED`.
 use serde_json::Value;
 
-/// Encode an outbound control/heartbeat/join/leave/access_token frame.
-/// `join_ref`/`r#ref` are `Option<&str>` → JSON `null` when `None`.
+/// Encode an outbound control / heartbeat / join / leave / `access_token`
+/// frame. `join_ref` / `r#ref` are `Option<&str>` → JSON `null` when `None`.
 #[must_use]
 pub fn encode_outbound(
     join_ref: Option<&str>,
@@ -194,7 +194,13 @@ mod tests {
         let topic = b"t";
         let user_event = b"ACCOUNT_UPDATED";
         let payload = br#"{"a":1}"#;
-        let mut buf = vec![4u8, topic.len() as u8, user_event.len() as u8, 0u8, 1u8];
+        let mut buf = vec![
+            4u8,
+            u8::try_from(topic.len()).unwrap(),
+            u8::try_from(user_event.len()).unwrap(),
+            0u8,
+            1u8,
+        ];
         buf.extend_from_slice(topic);
         buf.extend_from_slice(user_event);
         buf.extend_from_slice(payload);
