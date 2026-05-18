@@ -67,6 +67,7 @@ fun HomeScreen(
 ) {
     val accounts by viewModel.accounts.collectAsStateWithLifecycle()
     val isRefreshing by viewModel.isRefreshing.collectAsStateWithLifecycle()
+    val refreshError by viewModel.refreshError.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
 
@@ -127,6 +128,23 @@ fun HomeScreen(
                 verticalArrangement = Arrangement.spacedBy(Spacing.xxxl),
             ) {
                 Spacer(Modifier.padding(top = Spacing.hero))
+                // Non-fatal transient-refresh banner. A background-poll /
+                // on-resume `list_accounts()` blip keeps the last-known
+                // balance on screen (BalanceHero below still renders the
+                // cached `accounts`) and surfaces here instead of routing
+                // to the session-destroying ErrorView. Clears itself on
+                // the next successful 5s poll tick.
+                if (refreshError != null) {
+                    Text(
+                        text = "Showing last known balance — couldn't reach the server.",
+                        style = BrandTypography.label,
+                        color = BrandColors.mutedForeground,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = Spacing.l),
+                    )
+                }
                 BalanceHero(accounts)
                 HomeActionGrid(
                     onReceive = onReceive,

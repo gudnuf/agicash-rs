@@ -110,6 +110,21 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     private val _loginErrorMessage = MutableStateFlow<String?>(null)
     val loginErrorMessage: StateFlow<String?> = _loginErrorMessage.asStateFlow()
 
+    /**
+     * Transient, non-fatal refresh failure surfaced to a soft banner on
+     * Home while the user stays signed in (last-known balance preserved).
+     * Set when a background poll / on-resume / post-mutation
+     * `list_accounts()` blip fails *without* being a genuine auth
+     * expiry; cleared on the next successful refresh. Distinct from
+     * [loginErrorMessage] (login screen) and from the session-destroying
+     * [Phase.Error]/`ErrorView` path, which is now reserved for the
+     * initial bootstrap load only. Mirrors the web app degrading to a
+     * stale-but-usable balance on a fetch hiccup rather than evicting
+     * the session.
+     */
+    private val _refreshError = MutableStateFlow<String?>(null)
+    val refreshError: StateFlow<String?> = _refreshError.asStateFlow()
+
     private var wallet: AgicashWallet? = null
 
     init {
@@ -164,7 +179,10 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
             if (restored != null) {
                 _state.value = BootState.Ready(Phase.SignedIn(restored.userId))
-                refreshAccounts()
+                // Bootstrap path: there is no last-known balance to fall
+                // back to yet, so a hard failure here legitimately routes
+                // to the initial-load error surface.
+                refreshAccountsSuspending(isBootstrap = true)
             } else {
                 _state.value = BootState.Ready(Phase.SignedOut)
             }
@@ -215,6 +233,7 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             _accounts.value = emptyList()
             _user.value = null
             _loginErrorMessage.value = null
+            _refreshError.value = null
             _state.value = BootState.Ready(Phase.SignedOut)
             _isWorking.value = false
         }
@@ -239,6 +258,19 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
+     * True if a non-auth refresh failure should NOT escalate to the
+     * session-destroying [Phase.Error]/`ErrorView`. Holds whenever the
+     * user is already established (`SignedIn`) so background-poll /
+     * on-resume / post-mutation blips degrade to a stale-but-usable
+     * balance instead of evicting the session. The bootstrap restore
+     * passes `isBootstrap = true` explicitly because it flips `_state`
+     * to `SignedIn` *before* the first refresh — reading `_state` there
+     * would misclassify the initial load as recoverable.
+     */
+    private fun isSignedIn(): Boolean =
+        (_state.value as? BootState.Ready)?.phase is Phase.SignedIn
+
+    /**
      * Pull-to-refresh entry point for `HomeScreen`'s `PullToRefreshBox`.
      * Suspends until the FFI round-trip completes and toggles
      * [isRefreshing] around it so the Compose pull indicator shows/hides
@@ -257,21 +289,65 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     /**
      * The actual refresh, suspending so callers (poll loop, pull-to-
-     * refresh, on-resume) can sequence around it. Identical semantics to
-     * the previous fire-and-forget body and to iOS `refreshAccounts()`:
-     * a hard `list_accounts()` failure escalates to the error phase; a
-     * `get_user()` failure is non-fatal (brand-new guests have no user
-     * row yet — expected).
+     * refresh, on-resume) can sequence around it.
+     *
+     * Failure handling is now tiered so a transient blip on the
+     * foreground poll / on-resume / post-mutation refresh can no longer
+     * destroy a live session (the old behavior: ANY `list_accounts()`
+     * throw → [Phase.Error] → `ErrorView` whose only action is the
+     * session-destroying `signOut()`):
+     *
+     *  - **Genuine auth failure** ([FfiException.Auth] — refresh token
+     *    rejected / session expired): the session really is no longer
+     *    valid. Drop to [Phase.SignedOut] so the user re-authenticates.
+     *    This is non-destructive auth-expiry handling and mirrors the
+     *    bootstrap precedent (iOS `bootstrap()` maps a rejected
+     *    rehydration to `signedOut`, not `error`).
+     *  - **Non-auth failure during bootstrap** (`isBootstrap = true`):
+     *    there is no last-known balance to fall back to, so escalate to
+     *    [Phase.Error] — the initial-load error surface is appropriate
+     *    here (and is the only path that still reaches `ErrorView`).
+     *  - **Non-auth failure while already signed in** (poll / on-resume
+     *    / addMint / setDefault): NON-FATAL. Keep the last-good
+     *    `_accounts`, surface a transient [refreshError] banner, and
+     *    leave `_state` untouched. The 5s Home poll keeps running and
+     *    self-heals on the next tick when the network recovers.
+     *
+     * A `get_user()` failure remains non-fatal (brand-new guests have no
+     * user row yet — expected).
      */
-    private suspend fun refreshAccountsSuspending() {
+    private suspend fun refreshAccountsSuspending(isBootstrap: Boolean = false) {
         val w = wallet ?: return
         try {
             _accounts.value = withContext(Dispatchers.IO) { w.listAccounts() }
+            // Successful refresh clears any stale transient banner.
+            _refreshError.value = null
+        } catch (e: FfiException.Auth) {
+            // Session genuinely invalid — re-auth required. Non-destructive
+            // (no on-disk wipe here; the cold-start restore path handles a
+            // stale blob), routes to the login screen rather than the
+            // dead-end ErrorView.
+            _accounts.value = emptyList()
+            _user.value = null
+            _refreshError.value = null
+            _state.value = BootState.Ready(Phase.SignedOut)
+            return
         } catch (e: FfiException) {
-            _state.value = BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
+            if (isBootstrap || !isSignedIn()) {
+                _state.value =
+                    BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
+            } else {
+                // Transient blip while signed in: keep last-known balance,
+                // soft banner, self-heal on the next poll tick.
+                _refreshError.value = "Couldn't refresh balance: ${ffiErrorMessage(e)}"
+            }
             return
         } catch (e: Throwable) {
-            _state.value = BootState.Ready(Phase.Error("unexpected: ${e.message}"))
+            if (isBootstrap || !isSignedIn()) {
+                _state.value = BootState.Ready(Phase.Error("unexpected: ${e.message}"))
+            } else {
+                _refreshError.value = "Couldn't refresh balance: ${e.message}"
+            }
             return
         }
 
