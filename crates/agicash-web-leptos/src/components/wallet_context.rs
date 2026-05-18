@@ -111,7 +111,22 @@ pub struct WalletData {
     /// Account list keyed by load state. `Ready(vec![])` is the
     /// canonical empty-wallet state.
     pub accounts: RwSignal<LoadState<Vec<AccountSummary>>>,
+    /// Idempotency latch for [`WalletData::start_visibility_refresh`].
+    /// The listeners + poll are wired into the page lifetime exactly
+    /// once; a Home remount (client-side nav back to `/`) must not stack
+    /// duplicate `visibilitychange` / `focus` handlers or a second poll
+    /// loop. `false` until the first wiring call flips it.
+    reactivity_wired: RwSignal<bool>,
 }
+
+/// Foreground balance-poll interval. Mirrors the iOS / Android Tier-1
+/// plan (a ~3-5s poll while the screen is visible) and stands in for the
+/// web canonical model's Supabase Realtime channel until the Tier-2
+/// realtime FFI seam lands. Only fires while the document is visible —
+/// a backgrounded tab does no work and the `visibilitychange` handler
+/// catches it up the instant it returns to the foreground.
+#[cfg(target_arch = "wasm32")]
+const FOREGROUND_POLL_MS: u32 = 4_000;
 
 impl WalletData {
     /// Fresh `WalletData` in `Idle` state. The App root constructs one
@@ -121,6 +136,7 @@ impl WalletData {
         Self {
             user_id: RwSignal::new(None),
             accounts: RwSignal::new(LoadState::Idle),
+            reactivity_wired: RwSignal::new(false),
         }
     }
 
@@ -187,6 +203,122 @@ impl WalletData {
             // shape they'd see in the browser steady-state.
             self.accounts.set(LoadState::Ready(Vec::new()));
         });
+    }
+
+    /// Wire the Tier-1 reactive-refresh layer: refresh the balance when
+    /// the tab regains focus / becomes visible, plus a slow foreground
+    /// poll. This is the Leptos analogue of the web canonical model's
+    /// `refetchOnWindowFocus:'always'` + Supabase Realtime channel
+    /// (see `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`,
+    /// the Leptos Tier-1 section). It uses **only** the existing
+    /// `fetch_account_summaries()` read path — no FFI / protocol change.
+    ///
+    /// Mechanism (wasm only — a no-op on the native test build):
+    ///
+    /// - a `visibilitychange` listener on `document`: when the document
+    ///   transitions back to visible (tab refocused, OS unlock, app
+    ///   foregrounded) it calls [`WalletData::refresh`], catching up any
+    ///   out-of-band receive that happened while backgrounded;
+    /// - a `focus` listener on `window`: covers window-manager focus
+    ///   changes that don't toggle `document.hidden` (e.g. alt-tab
+    ///   between two visible windows), mirroring the web app exactly;
+    /// - a ~4s foreground poll (gated on `!document.hidden()`) as the
+    ///   stand-in for the not-yet-built realtime seam, so a receive
+    ///   performed elsewhere shows up within a few seconds without the
+    ///   user touching anything.
+    ///
+    /// Idempotent: the App root provides a single `WalletData`, but the
+    /// Home page mount Effect can re-run if the user navigates away and
+    /// back client-side. The `reactivity_wired` latch ensures the
+    /// listeners + poll are installed exactly once for the page's
+    /// lifetime (they intentionally outlive any single Home mount —
+    /// balance reactivity is an app-global concern, not a per-view one,
+    /// just as the web app's channel lives above the route tree).
+    pub fn start_visibility_refresh(&self) {
+        // Flip the latch once. If it was already set, another mount
+        // already wired everything — bail without stacking handlers.
+        if self.reactivity_wired.get_untracked() {
+            return;
+        }
+        self.reactivity_wired.set(true);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::closure::Closure;
+            use wasm_bindgen::JsCast;
+
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let Some(document) = window.document() else {
+                return;
+            };
+
+            // `visibilitychange` fires on the document for both
+            // hide and show transitions; only refresh on the
+            // become-visible edge so a backgrounding tab does no work.
+            {
+                let wallet = self.clone();
+                let doc_for_check = document.clone();
+                let on_visibility = Closure::<dyn FnMut()>::new(move || {
+                    if !doc_for_check.hidden() {
+                        wallet.clone().refresh();
+                    }
+                });
+                if let Err(e) = document.add_event_listener_with_callback(
+                    "visibilitychange",
+                    on_visibility.as_ref().unchecked_ref(),
+                ) {
+                    leptos::logging::log!("visibilitychange listener attach failed: {e:?}");
+                }
+                // The listener lives for the page's lifetime (the SPA
+                // never tears the document down). Leaking the closure
+                // is the correct ownership here — `on_cleanup` would
+                // detach it on the first Home unmount, which is exactly
+                // the regression we must avoid.
+                on_visibility.forget();
+            }
+
+            // `focus` on the window covers focus changes that don't
+            // toggle `document.hidden` (alt-tab between two visible
+            // windows), matching the web app's
+            // `refetchOnWindowFocus:'always'`.
+            {
+                let wallet = self.clone();
+                let on_focus = Closure::<dyn FnMut()>::new(move || {
+                    wallet.clone().refresh();
+                });
+                let target: &web_sys::EventTarget = window.as_ref();
+                if let Err(e) = target
+                    .add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref())
+                {
+                    leptos::logging::log!("window focus listener attach failed: {e:?}");
+                }
+                on_focus.forget();
+            }
+
+            // Foreground poll — the Tier-1 stand-in for the realtime
+            // channel. Uses the same `gloo-timers` primitive the mocked
+            // redeem path already uses; a self-rescheduling timeout
+            // keeps it a plain wasm future with no extra dependency.
+            {
+                let wallet = self.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    loop {
+                        gloo_timers::future::TimeoutFuture::new(FOREGROUND_POLL_MS).await;
+                        let still_visible = web_sys::window()
+                            .and_then(|w| w.document())
+                            .is_some_and(|d| !d.hidden());
+                        if still_visible {
+                            wallet.clone().refresh();
+                        }
+                        // When hidden we skip the work but keep looping;
+                        // the `visibilitychange` handler does the
+                        // catch-up refresh the moment the tab returns.
+                    }
+                });
+            }
+        }
     }
 }
 

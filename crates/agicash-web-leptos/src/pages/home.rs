@@ -65,9 +65,21 @@ pub fn HomePage() -> impl IntoView {
     // runs exactly once post-hydration and the spawned future drives the
     // signal transitions. `clone` because closures need to own a copy
     // and the retry handler below needs another.
+    //
+    // The same Effect installs the Tier-1 reactive layer
+    // (`visibilitychange` / window `focus` listeners + a slow
+    // foreground poll) so the balance tracks out-of-band receives the
+    // way the web canonical model does — see
+    // `WalletData::start_visibility_refresh` for the mechanism and
+    // `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`
+    // for the cross-platform diagnosis. The call is idempotent: a
+    // client-side nav back to `/` re-runs this Effect but the listeners
+    // wire exactly once for the page's lifetime.
     let wallet_for_mount = wallet.clone();
     Effect::new(move |_| {
-        wallet_for_mount.clone().refresh();
+        let wallet = wallet_for_mount.clone();
+        wallet.start_visibility_refresh();
+        wallet.refresh();
     });
 
     let wallet_for_retry = wallet.clone();

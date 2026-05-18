@@ -71,13 +71,16 @@ console_error_panic_hook = "0.1"
 # (see `// TODO[slice-12]` in `components/cashu_token_paste_view.rs`).
 gloo-timers = { version = "0.3", default-features = false, features = ["futures"] }
 # `js-sys` + `web-sys` — used by the `ShareSheet` component to call the
-# Web Share API (`navigator.share`) with a clipboard fallback, and by
-# the LoginView's guest-auth path for getrandom-on-wasm wiring.
+# Web Share API (`navigator.share`) with a clipboard fallback, by the
+# LoginView's guest-auth path for getrandom-on-wasm wiring, and by
+# `WalletData::start_visibility_refresh` for the `visibilitychange` /
+# window `focus` balance-refresh listeners (`EventTarget`).
 js-sys = { workspace = true }
 web-sys = { version = "0.3", features = [
     "Clipboard",
     "Document",
     "Element",
+    "EventTarget",
     "HtmlMetaElement",
     "Navigator",
     "Window",
