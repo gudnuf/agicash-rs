@@ -15,9 +15,22 @@ import UIKit
 ///   - `paying(handle)`      → spinner while `executeMeltQuote` fires
 ///     `post_melt`; on PENDING a long-running `Task` polls
 ///     `pollMeltQuote` every 2s until a terminal state.
+///   - `verifying(handle)`   → the melt was *already initiated* for
+///     this quote (executeMeltQuote called) but the call threw, or
+///     returned an ambiguous non-terminal state. The mint may have
+///     paid the invoice. We MUST NOT re-quote — instead poll
+///     `pollMeltQuote` on the held handle (a NUT-05 status check, not
+///     a re-pay) until the mint authoritatively reports PAID
+///     (→ success) or genuinely-not-paid (→ a non-re-quoting failure).
 ///   - `paid(snapshot)`      → green check + final amount/fee. Auto-
 ///     dismisses the carousel after 3s; user can tap Done sooner.
-///   - `failure(message)`    → inline error + retry → invoiceEntry.
+///   - `failure(message, retryable)` → inline error. `retryable` is
+///     true ONLY for pre-initiation failures (bad invoice / quote
+///     failed before `executeMeltQuote`) where re-quoting the same
+///     bolt11 is safe; retry → invoiceEntry. Once a melt has been
+///     initiated for a quote, a failure is NEVER `retryable` (a fresh
+///     quote for the same invoice would double-pay) — the user can
+///     only dismiss; reconciliation already happened via the poll.
 ///
 /// The file name keeps the historical `LightningSendPlaceholderView`
 /// identifier so `SendCarouselView`'s `.tag(.lightning)` wiring and
@@ -54,8 +67,15 @@ struct LightningSendPlaceholderView: View {
         case confirming(MeltQuotePreview)
         case creating
         case paying(MeltQuoteHandle)
+        /// The melt was initiated for this quote (executeMeltQuote
+        /// called) but threw or returned a non-terminal/ambiguous
+        /// state. Poll the held handle to reconcile — NEVER re-quote.
+        case verifying(MeltQuoteHandle)
         case paid(MeltQuoteSnapshot)
-        case failure(String)
+        /// `retryable` is true only for pre-initiation failures where
+        /// re-quoting the same invoice is safe. Post-initiation
+        /// failures are never retryable (re-quote would double-pay).
+        case failure(message: String, retryable: Bool)
     }
 
     @State private var invoice: String = ""
@@ -125,6 +145,16 @@ struct LightningSendPlaceholderView: View {
                 .font(.brandLabel)
                 .foregroundStyle(Color.brandMutedForeground)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .verifying:
+            // The payment may already have settled — we are
+            // reconciling against the mint, NOT retrying. No cancel
+            // affordance here: bailing now would lose the only UI
+            // tracking of an in-flight/possibly-settled payment, and
+            // there is nothing safe to "retry".
+            ProgressView("Confirming payment status…")
+                .font(.brandLabel)
+                .foregroundStyle(Color.brandMutedForeground)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .paid(let snapshot):
             PaidCard(
                 snapshot: snapshot,
@@ -132,10 +162,14 @@ struct LightningSendPlaceholderView: View {
                 onDone: dismissNow
             )
             .padding(.horizontal, Spacing.l)
-        case .failure(let message):
+        case .failure(let message, let retryable):
             FailureCard(
                 message: message,
-                onRetry: resetToEntry,
+                // Only offer "Try again" (→ re-quote) when the failure
+                // happened BEFORE the melt was initiated. After
+                // initiation a fresh quote for the same invoice would
+                // double-pay, so the only affordance is Dismiss.
+                onRetry: retryable ? resetToEntry : nil,
                 onDismiss: dismissNow
             )
             .padding(.horizontal, Spacing.l)
@@ -247,7 +281,9 @@ struct LightningSendPlaceholderView: View {
         case .success(let preview):
             phase = .confirming(preview)
         case .failure(let message):
-            phase = .failure(message)
+            // Pre-initiation: no quote persisted, no proofs reserved,
+            // no melt fired. Re-quoting the same invoice is safe.
+            phase = .failure(message: message, retryable: true)
         }
     }
 
@@ -263,10 +299,18 @@ struct LightningSendPlaceholderView: View {
         case .success(let h):
             handle = h
         case .failure(let message):
-            phase = .failure(message)
+            // Pre-initiation: the quote row failed to persist / proofs
+            // weren't reserved and `post_melt` never fired. Safe to
+            // re-quote the same invoice.
+            phase = .failure(message: message, retryable: true)
             return
         }
 
+        // From here on the melt is being INITIATED for `handle`.
+        // `post_melt` may reach the mint and the invoice may be paid
+        // even if the call below throws or returns ambiguously. After
+        // this point we must NEVER route to a re-quote: every
+        // non-success outcome reconciles via the poll on `handle`.
         phase = .paying(handle)
         let execOutcome = await model.executeMeltQuote(quoteId: handle.quoteId)
         switch execOutcome {
@@ -278,20 +322,55 @@ struct LightningSendPlaceholderView: View {
             case .pending:
                 // Lightning payment in flight — poll until terminal.
                 startPolling(handle)
-            case .failed:
-                phase = .failure(snapshot.failureReason ?? "Payment failed.")
-            case .expired:
-                phase = .failure("The invoice expired before payment.")
-            case .unpaid:
-                // Shouldn't happen post-execute; treat as a soft
-                // failure the user can retry.
-                phase = .failure("Payment didn't start. Try again.")
+            case .failed, .expired, .unpaid:
+                // The mint *replied* with a non-paid state on the
+                // execute round-trip. We still do NOT trust this to
+                // mean "no funds moved": the core `post_melt`
+                // network-error branch can mark a quote Failed even
+                // when the mint received the request. Reconcile via a
+                // mint status check before showing any terminal UI —
+                // and never via a fresh quote.
+                startReconcilePoll(handle)
             }
-        case .failure(let message):
-            phase = .failure(message)
+        case .failure:
+            // `executeMeltQuote` THREW after initiation. The classic
+            // double-pay trigger: the mint may have paid the invoice
+            // and only `complete_with_change` (storage write / NUT-12
+            // DLEQ) failed, leaving the quote PENDING. Resolve by
+            // polling the held handle — a NUT-05 status check, not a
+            // re-pay — never by re-quoting this invoice.
+            startReconcilePoll(handle)
         }
     }
 
+    /// Reconcile a melt that was already INITIATED for `handle` but
+    /// whose `executeMeltQuote` threw or returned an
+    /// ambiguous/non-terminal state. The invoice may have been paid;
+    /// the quote row is left PENDING when only the post-payment
+    /// bookkeeping (storage `complete` / NUT-12 DLEQ) failed. We do
+    /// NOT trust the thrown error or an execute-time Failed to mean
+    /// "no funds moved" — we poll `pollMeltQuote` (a NUT-05 status
+    /// check via the core `poll_until_complete`, never a re-pay) until
+    /// the mint authoritatively resolves the quote. Crucially this
+    /// path can never reach `createMeltQuote` for this invoice.
+    private func startReconcilePoll(_ handle: MeltQuoteHandle) {
+        phase = .verifying(handle)
+        startPolling(handle)
+    }
+
+    /// Drive `pollMeltQuote` on the held handle until a TRUSTWORTHY
+    /// terminal state. Used both for the normal PENDING path (after a
+    /// clean `executeMeltQuote` → Pending) and for reconciliation
+    /// after a post-initiation throw — the loop is identical because
+    /// in both cases the only safe move is to ask the mint for the
+    /// quote's status, never to issue a new melt.
+    ///
+    /// Every terminal failure here is reported as **non-retryable**:
+    /// the melt was already initiated for this quote, so a "Try again"
+    /// that re-quotes the same invoice could double-pay. The
+    /// PAID/FAILED/UNPAID/EXPIRED verdicts come from a mint status
+    /// check (`poll_until_complete`), so they are authoritative —
+    /// unlike a thrown error or the `post_melt` network-error branch.
     private func startPolling(_ handle: MeltQuoteHandle) {
         pollTask?.cancel()
         pollTask = Task {
@@ -307,34 +386,55 @@ struct LightningSendPlaceholderView: View {
                 case .state(let state, let snapshot):
                     switch state {
                     case .pending:
+                        // Still in flight per the mint. Keep polling —
+                        // do NOT surface a retry affordance.
                         continue
                     case .paid:
+                        // Authoritative PAID. The original throw (if
+                        // any) was post-payment bookkeeping; the money
+                        // moved exactly once. Show success.
                         await MainActor.run { phase = .paid(snapshot) }
                         scheduleAutoDismiss()
                         return
                     case .failed:
+                        // Mint status check resolved the quote FAILED
+                        // — trustworthy (it round-tripped the mint via
+                        // `poll_until_complete`, not the unreliable
+                        // post_melt network-error branch). Still NOT
+                        // retryable: never re-quote this invoice.
                         await MainActor.run {
-                            phase = .failure(snapshot.failureReason ?? "Payment failed.")
+                            phase = .failure(
+                                message: snapshot.failureReason ?? "Payment failed.",
+                                retryable: false
+                            )
                         }
                         return
                     case .expired:
                         await MainActor.run {
-                            phase = .failure("The invoice expired before payment.")
+                            phase = .failure(
+                                message: "The invoice expired before payment.",
+                                retryable: false
+                            )
                         }
                         return
                     case .unpaid:
-                        // A poll that sees UNPAID after execute means
-                        // the mint reported the melt back as unpaid —
-                        // the FFI already flipped the row FAILED.
+                        // A poll that sees UNPAID means the mint
+                        // reported the melt back as unpaid and the
+                        // core flipped the row FAILED — authoritative.
+                        // Still not retryable from here.
                         await MainActor.run {
-                            phase = .failure("The mint could not pay this invoice.")
+                            phase = .failure(
+                                message: "The mint could not pay this invoice.",
+                                retryable: false
+                            )
                         }
                         return
                     }
                 case .failure(let message):
                     // Transient network blip — keep polling so a
-                    // single failure doesn't kick the user out. The
-                    // payment is in flight on the mint regardless.
+                    // single failure doesn't kick the user out, and so
+                    // we never fall through to a re-quote. The payment
+                    // is in flight on the mint regardless.
                     _ = message
                     continue
                 }
@@ -517,7 +617,10 @@ private struct PaidCard: View {
 
 private struct FailureCard: View {
     let message: String
-    let onRetry: () -> Void
+    /// `nil` when re-quoting would be unsafe (the melt was already
+    /// initiated for this invoice — a fresh quote could double-pay).
+    /// Only then is the "Try again" button hidden entirely.
+    let onRetry: (() -> Void)?
     let onDismiss: () -> Void
 
     var body: some View {
@@ -541,8 +644,14 @@ private struct FailureCard: View {
             .frame(maxWidth: 384)
 
             VStack(spacing: Spacing.m) {
-                BrandButton("Try again", variant: .primary, action: onRetry)
-                BrandButton("Dismiss", variant: .ghost, action: onDismiss)
+                if let onRetry {
+                    BrandButton("Try again", variant: .primary, action: onRetry)
+                    BrandButton("Dismiss", variant: .ghost, action: onDismiss)
+                } else {
+                    // Post-initiation failure: re-quoting the same
+                    // invoice could double-pay, so no retry is offered.
+                    BrandButton("Dismiss", variant: .primary, action: onDismiss)
+                }
             }
             .frame(maxWidth: 384)
 
