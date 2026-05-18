@@ -42,8 +42,7 @@ impl WasmTransport {
 #[async_trait(?Send)]
 impl RealtimeTransport for WasmTransport {
     async fn connect(&mut self, url: &str) -> Result<(), TransportError> {
-        let ws =
-            WebSocket::new(url).map_err(|e| TransportError::Connect(format!("{e:?}")))?;
+        let ws = WebSocket::new(url).map_err(|e| TransportError::Connect(format!("{e:?}")))?;
         ws.set_binary_type(BinaryType::Arraybuffer);
         let (tx, rx) = async_broadcast::broadcast(256);
 
@@ -60,11 +59,10 @@ impl RealtimeTransport for WasmTransport {
         on_msg.forget();
 
         let txc = tx.clone();
-        let on_close = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(
-            move |_e: web_sys::CloseEvent| {
+        let on_close =
+            Closure::<dyn FnMut(web_sys::CloseEvent)>::new(move |_e: web_sys::CloseEvent| {
                 let _ = txc.try_broadcast(Err(TransportError::Closed("ws close".into())));
-            },
-        );
+            });
         ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         on_close.forget();
 

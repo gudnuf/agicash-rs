@@ -197,21 +197,19 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
                 RouterAction::JoinReplyError(r) => {
                     let _ = self
                         .sink
-                        .try_broadcast(WalletRealtimeEvent::Error(format!(
-                            "join rejected: {r}"
-                        )));
+                        .try_broadcast(WalletRealtimeEvent::Error(format!("join rejected: {r}")));
                     return Err(RealtimeError::JoinRejected(r));
                 }
                 RouterAction::Broadcast {
                     event,
                     payload_json,
                 } => {
-                    let _ = self.sink.try_broadcast(WalletRealtimeEvent::Event(
-                        WalletEvent {
+                    let _ = self
+                        .sink
+                        .try_broadcast(WalletRealtimeEvent::Event(WalletEvent {
                             event,
                             payload_json,
-                        },
-                    ));
+                        }));
                 }
                 RouterAction::ChannelDown => {
                     let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
@@ -334,9 +332,8 @@ mod tests {
 
     #[test]
     fn classify_heartbeat_reply() {
-        let m =
-            decode_text(r#"[null,"2","phoenix","phx_reply",{"status":"ok","response":{}}]"#)
-                .unwrap();
+        let m = decode_text(r#"[null,"2","phoenix","phx_reply",{"status":"ok","response":{}}]"#)
+            .unwrap();
         assert_eq!(classify(&m, Some("1")), RouterAction::HeartbeatAck);
     }
 

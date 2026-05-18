@@ -12,17 +12,18 @@
 //! frame, PRINTS whether it was `WsFrame::Text` or `WsFrame::Binary`,
 //! decodes it through the codec, and asserts the decoded event name.
 //!
-//! Required env (via dotenvy): SUPABASE_URL (or VITE_), SUPABASE_ANON_KEY
-//! (or VITE_), SUPABASE_SERVICE_ROLE_KEY, SUPABASE_JWT_SECRET. The user
-//! JWT is minted HS256 with the local project JWT secret (no JWT crate
-//! dependency — `python3` from the dev shell does the HMAC), `sub` set to
-//! a seeded `wallet.users` id so the realtime RLS join policy
-//! (`realtime.topic() = 'wallet:'||auth.uid()`) admits it. The DB
-//! mutation goes through the service-role REST endpoint (RLS-bypass) via
-//! `curl`, mirroring `user_storage_integration.rs`'s service-role setup.
+//! Required env (via dotenvy): `SUPABASE_URL` (or `VITE_*`),
+//! `SUPABASE_ANON_KEY` (or `VITE_*`), `SUPABASE_SERVICE_ROLE_KEY`,
+//! `SUPABASE_JWT_SECRET`. The user JWT is minted HS256 with the local
+//! project JWT secret (no JWT crate dependency — `python3` from the dev
+//! shell does the HMAC), `sub` set to a seeded `wallet.users` id so the
+//! realtime RLS join policy (`realtime.topic() = 'wallet:'||auth.uid()`)
+//! admits it. The DB mutation goes through the service-role REST endpoint
+//! (RLS-bypass) via `curl`, mirroring `user_storage_integration.rs`'s
+//! service-role setup.
 //!
-//! Run: cargo test -p agicash-realtime --features real-supabase-tests \
-//!        --test wire_confirm -- --nocapture
+//! Run: `cargo test -p agicash-realtime --features real-supabase-tests
+//! --test wire_confirm -- --nocapture`
 #![cfg(feature = "real-supabase-tests")]
 
 use agicash_realtime::client::{build_connect_url, decode_frame, join_payload, topic_for_user};
@@ -88,10 +89,16 @@ fn curl(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+// One linear live-integration scenario (connect → join → mutate →
+// capture → record); splitting it would scatter the captured-frame
+// evidence narrative across helpers for no real benefit.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn capture_join_reply_and_broadcast_encoding() {
     if !env_ready() {
-        eprintln!("SKIP: local stack env not present (SUPABASE_URL/ANON_KEY/SERVICE_ROLE_KEY/JWT_SECRET)");
+        eprintln!(
+            "SKIP: local stack env not present (SUPABASE_URL/ANON_KEY/SERVICE_ROLE_KEY/JWT_SECRET)"
+        );
         return;
     }
     let base = env_var("SUPABASE_URL", "VITE_SUPABASE_URL").unwrap();
@@ -102,8 +109,7 @@ async fn capture_join_reply_and_broadcast_encoding() {
     // 1. Find (or refuse without) a seeded wallet.accounts row. We mutate
     //    an existing account so the ACCOUNT_UPDATED trigger fires for a
     //    user whose id we control as the JWT `sub`.
-    let accounts_url =
-        format!("{base}/rest/v1/accounts?select=id,user_id,name&limit=1");
+    let accounts_url = format!("{base}/rest/v1/accounts?select=id,user_id,name&limit=1");
     let body = curl(&[
         &accounts_url,
         "-H",
@@ -113,8 +119,7 @@ async fn capture_join_reply_and_broadcast_encoding() {
         "-H",
         "Accept-Profile: wallet",
     ]);
-    let rows: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
     let row = rows
         .as_array()
         .and_then(|a| a.first())
@@ -231,8 +236,7 @@ async fn capture_join_reply_and_broadcast_encoding() {
             broadcast_event = msg.payload["event"].as_str().map(str::to_string);
             eprintln!(
                 "[wire-confirm] *** BROADCAST CAPTURED *** wire-kind={kind} \
-                 app-event={:?}",
-                broadcast_event
+                 app-event={broadcast_event:?}"
             );
             break;
         }
