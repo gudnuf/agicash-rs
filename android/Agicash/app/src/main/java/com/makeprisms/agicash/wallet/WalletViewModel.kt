@@ -1,33 +1,54 @@
 package com.makeprisms.agicash.wallet
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
-import uniffi.agicash_ffi.AccountFfi
-import uniffi.agicash_ffi.AgicashWallet
-import uniffi.agicash_ffi.FfiException
-import uniffi.agicash_ffi.Session
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import uniffi.agicash_ffi.AccountFfi
+import uniffi.agicash_ffi.AgicashWallet
+import uniffi.agicash_ffi.FfiException
+import uniffi.agicash_ffi.MintAddResult
+import uniffi.agicash_ffi.Session
+import uniffi.agicash_ffi.UserFfi
 
 /**
- * Mirrors `ios/Agicash/Agicash/WalletViewModel.swift` but in Android idiom:
- * Compose `@State` -> `StateFlow`, swift's `WalletState` boot wrapper is
- * collapsed into [BootState] inside this same class.
+ * Mirrors `ios/Agicash/Agicash/WalletViewModel.swift` in Android idiom.
  *
- * Phase 1 talks to local OpenSecret + local Supabase (see [Endpoints]).
- * Endpoint overrides arrive in Phase 2+ when the app grows a settings UI.
+ * Subclassing [AndroidViewModel] so the constructor has an
+ * [Application] handle — needed for the `getFilesDir()` path the Rust
+ * FFI installs as the [AgicashWallet]'s session storage root. Without
+ * that path, the wallet has only an in-memory session slot and the user
+ * re-authenticates on every cold start (the issue this deliverable
+ * fixes).
  *
- * Session persistence is intentionally NOT implemented here for Android v0.
- * The Rust FFI's `keyring` crate has no Android backend (see SPIKE_REPORT.md
- * section Q5), and a JNI-backed `SessionStorage` is its own slice. In v0 the
- * user re-authenticates on every cold start.
+ * Lifecycle:
+ *
+ *   1. `init` constructs the [AgicashWallet] and immediately installs
+ *      `setSessionStorageDir(application.filesDir.absolutePath)`. This
+ *      is the JNI hop into `AndroidFileSessionStorage` (an AES-256-GCM
+ *      blob in the app's private data dir).
+ *   2. `tryRestoreSession()` runs the OpenSecret handshake + refresh
+ *      chain against any blob already on disk. On success the app
+ *      lands on the home screen; on failure we drop the blob and route
+ *      to the sign-in screen.
+ *   3. Every `auth_*` call writes the new session through to disk; the
+ *      next cold start picks it up via step 2.
+ *   4. `signOut` clears both the in-memory slot AND the on-disk blob
+ *      (the Rust `auth_logout` runs `storage.clear()` after the
+ *      best-effort server logout).
+ *
+ * Endpoint configuration mirrors iOS but uses the Android emulator's
+ * host-loopback alias `10.0.2.2` for OpenSecret and Supabase.
  */
-class WalletViewModel : ViewModel() {
+class WalletViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
-     * Hardcoded Phase 1 dev endpoints. On the Android emulator, host
+     * Hard-coded Phase 1 dev endpoints. On the Android emulator, host
      * loopback is reached via `10.0.2.2`, not `127.0.0.1`. The OpenSecret
      * enclave listens on :3999 and the local Supabase stack on :54321.
      */
@@ -59,6 +80,17 @@ class WalletViewModel : ViewModel() {
     private val _accounts = MutableStateFlow<List<AccountFfi>>(emptyList())
     val accounts: StateFlow<List<AccountFfi>> = _accounts.asStateFlow()
 
+    /**
+     * Mirrors `WalletViewModel.user` on iOS. Populated alongside
+     * `accounts` from [refreshAccounts]. Stays `null` for brand-new
+     * guests (the `wallet.users` row only exists after the first
+     * `mint_add` call). UI consumers should treat `null` as "no
+     * defaults known" — no `Default` badge anywhere, every account is
+     * eligible for the swipe-to-default action.
+     */
+    private val _user = MutableStateFlow<UserFfi?>(null)
+    val user: StateFlow<UserFfi?> = _user.asStateFlow()
+
     private val _isWorking = MutableStateFlow(false)
     val isWorking: StateFlow<Boolean> = _isWorking.asStateFlow()
 
@@ -79,9 +111,50 @@ class WalletViewModel : ViewModel() {
                 supabaseUrl = Endpoints.SUPABASE_URL,
                 supabaseAnonKey = Endpoints.SUPABASE_ANON_KEY,
             )
-            _state.value = BootState.Ready(Phase.SignedOut)
         } catch (e: Throwable) {
             _state.value = BootState.Failed("init failed: ${e.message}")
+            return
+        }
+
+        // Install the file-backed session storage + try to rehydrate any
+        // existing blob from the previous run. Both calls are best-effort
+        // — failures fall through to the sign-in screen rather than
+        // wedging the app.
+        //
+        // FFI calls run on Dispatchers.IO so UniFFI's `RustFuture::poll`
+        // never executes on the Android main thread. Without that
+        // dispatcher switch, Rust-side `RwLock::lock_contended` waits
+        // freeze the main looper for 5s and trigger an ANR (see also
+        // the same pattern in refreshAccounts, signOut, addMint, etc.).
+        viewModelScope.launch {
+            val w = wallet ?: return@launch
+            val filesDir = getApplication<Application>().filesDir.absolutePath
+            val restored: Session? = withContext(Dispatchers.IO) {
+                try {
+                    w.setSessionStorageDir(filesDir)
+                } catch (e: Throwable) {
+                    android.util.Log.w(
+                        "WalletViewModel",
+                        "setSessionStorageDir failed (continuing in-memory): ${e.message}",
+                    )
+                }
+                try {
+                    w.tryRestoreSession()
+                } catch (e: Throwable) {
+                    android.util.Log.w(
+                        "WalletViewModel",
+                        "tryRestoreSession failed: ${e.message}",
+                    )
+                    null
+                }
+            }
+
+            if (restored != null) {
+                _state.value = BootState.Ready(Phase.SignedIn(restored.userId))
+                refreshAccounts()
+            } else {
+                _state.value = BootState.Ready(Phase.SignedOut)
+            }
         }
     }
 
@@ -104,7 +177,7 @@ class WalletViewModel : ViewModel() {
         _loginErrorMessage.value = null
         viewModelScope.launch {
             try {
-                val session = call(w)
+                val session = withContext(Dispatchers.IO) { call(w) }
                 _state.value = BootState.Ready(Phase.SignedIn(session.userId))
                 refreshAccounts()
             } catch (e: FfiException) {
@@ -122,11 +195,12 @@ class WalletViewModel : ViewModel() {
         _isWorking.value = true
         viewModelScope.launch {
             try {
-                w.authLogout()
+                withContext(Dispatchers.IO) { w.authLogout() }
             } catch (_: Throwable) {
                 // Best-effort; clear local state regardless.
             }
             _accounts.value = emptyList()
+            _user.value = null
             _loginErrorMessage.value = null
             _state.value = BootState.Ready(Phase.SignedOut)
             _isWorking.value = false
@@ -137,18 +211,136 @@ class WalletViewModel : ViewModel() {
         val w = wallet ?: return
         viewModelScope.launch {
             try {
-                _accounts.value = w.listAccounts()
+                _accounts.value = withContext(Dispatchers.IO) { w.listAccounts() }
             } catch (e: FfiException) {
                 _state.value = BootState.Ready(Phase.Error("list accounts failed: ${ffiErrorMessage(e)}"))
+                return@launch
             } catch (e: Throwable) {
                 _state.value = BootState.Ready(Phase.Error("unexpected: ${e.message}"))
+                return@launch
+            }
+
+            // Refresh the user row so per-currency default-account ids are
+            // current. Failure is non-fatal — see iOS WalletViewModel for
+            // rationale (brand-new guests don't have a user row yet, that's
+            // expected).
+            try {
+                _user.value = withContext(Dispatchers.IO) { w.getUser() }
+            } catch (e: FfiException) {
+                if (e is FfiException.Internal &&
+                    (e.message ?: "").contains("user row not found")
+                ) {
+                    _user.value = null
+                } else {
+                    // Other failures: leave user as-is, accounts list is
+                    // still usable.
+                }
+            } catch (_: Throwable) {
+                // Same conservative handling.
             }
         }
+    }
+
+    /**
+     * Outcome shape for the Add Mint sheet. Success carries the FFI
+     * `MintAddResult` so the sheet can render mint name/URL inline;
+     * failure carries a presentation-ready string.
+     */
+    sealed interface AddMintOutcome {
+        data class Success(val result: MintAddResult) : AddMintOutcome
+        data class Failure(val message: String) : AddMintOutcome
+    }
+
+    /**
+     * Provision a new Cashu mint. Mirrors `addMint` on iOS:
+     * trims+validates the URL, calls the FFI, refreshes the accounts
+     * list on success so the Accounts screen reflects the new row
+     * without a pull-to-refresh.
+     */
+    suspend fun addMint(url: String): AddMintOutcome {
+        val trimmed = url.trim()
+        if (trimmed.isEmpty()) return AddMintOutcome.Failure("Enter a mint URL first.")
+        val w = wallet ?: return AddMintOutcome.Failure("Wallet not ready.")
+        _isWorking.value = true
+        try {
+            val result = withContext(Dispatchers.IO) { w.mintAdd(trimmed) }
+            refreshAccounts()
+            return AddMintOutcome.Success(result)
+        } catch (e: FfiException) {
+            return AddMintOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            return AddMintOutcome.Failure("unexpected: ${e.message}")
+        } finally {
+            _isWorking.value = false
+        }
+    }
+
+    /**
+     * Outcome shape for the swipe-to-default action on AccountsScreen.
+     */
+    sealed interface SetDefaultOutcome {
+        data object Success : SetDefaultOutcome
+        data class Failure(val message: String) : SetDefaultOutcome
+    }
+
+    /**
+     * Mirror of `UserService.setDefaultAccount` on web. Calls the FFI
+     * then refreshes accounts + user so the row reorders and the badge
+     * moves without a separate pull-to-refresh. Does NOT flip
+     * `default_currency` — see the FFI doc on `set_default_account`.
+     */
+    suspend fun setDefaultAccount(account: AccountFfi): SetDefaultOutcome {
+        val w = wallet ?: return SetDefaultOutcome.Failure("Wallet not ready.")
+        _isWorking.value = true
+        try {
+            val updated = withContext(Dispatchers.IO) { w.setDefaultAccount(account.id) }
+            _user.value = updated
+            refreshAccounts()
+            return SetDefaultOutcome.Success
+        } catch (e: FfiException) {
+            return SetDefaultOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            return SetDefaultOutcome.Failure("unexpected: ${e.message}")
+        } finally {
+            _isWorking.value = false
+        }
+    }
+
+    /**
+     * True when the given account is the user's default for its
+     * currency. Mirrors iOS `isDefault(_:)`. Returns false (no badge)
+     * when the user row hasn't loaded yet, or when the account's
+     * currency has no default slot (e.g., USDB).
+     */
+    fun isDefault(account: AccountFfi): Boolean {
+        val u = _user.value ?: return false
+        return when (account.currency) {
+            "BTC" -> account.id == u.defaultBtcAccountId
+            "USD" -> account.id == u.defaultUsdAccountId
+            else -> false
+        }
+    }
+
+    /**
+     * `accounts` sorted so the default-for-its-currency row sits on
+     * top. Mirrors `sortedAccounts` on iOS.
+     */
+    fun sortedAccounts(): List<AccountFfi> {
+        val list = _accounts.value
+        return list.sortedWith(Comparator { lhs, rhs ->
+            val l = isDefault(lhs)
+            val r = isDefault(rhs)
+            when {
+                l && !r -> -1
+                !l && r -> 1
+                else -> 0
+            }
+        })
     }
 
     private fun ffiErrorMessage(e: FfiException): String = when (e) {
         is FfiException.Auth -> "auth/${e.code}: ${e.message}"
         is FfiException.Storage -> "storage/${e.code}: ${e.message}"
-        is FfiException.Internal -> e.message
+        is FfiException.Internal -> e.message ?: "internal error"
     }
 }

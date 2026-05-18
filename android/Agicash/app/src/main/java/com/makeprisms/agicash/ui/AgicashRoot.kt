@@ -10,6 +10,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Warning
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -26,14 +27,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.makeprisms.agicash.ui.screens.AccountsScreen
+import com.makeprisms.agicash.ui.screens.AddMintScreen
 import com.makeprisms.agicash.ui.screens.HomeScreen
 import com.makeprisms.agicash.ui.screens.LoginScreen
 import com.makeprisms.agicash.ui.screens.SettingsScreen
 import com.makeprisms.agicash.wallet.WalletViewModel
 
 /**
- * Top-level shell. Mirrors `ContentView.swift` (ios) — reads [WalletViewModel]
- * state and routes to login or the bottom-tab signed-in surface.
+ * Top-level shell. Mirrors `ContentView.swift` on iOS — reads
+ * [WalletViewModel] state and routes to login or the bottom-tab
+ * signed-in surface.
  */
 @Composable
 fun AgicashRoot(viewModel: WalletViewModel) {
@@ -54,6 +61,16 @@ private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
     }
 }
 
+/**
+ * Signed-in shell. Bottom nav between Home and Settings; Settings is
+ * itself a NavHost so the user can drill into Accounts → AddMint and
+ * back without leaving the Settings tab.
+ *
+ * Mirrors the iOS shell where Settings + AccountsView + AddMintView
+ * live on a single NavigationStack; on iOS that stack is per-tab,
+ * here it's a nested NavHost. Switching back to Home pops to the
+ * top-level Home screen — same iOS feel.
+ */
 @Composable
 private fun SignedInShell(viewModel: WalletViewModel) {
     var selected by remember { mutableStateOf(Tab.HOME) }
@@ -78,8 +95,40 @@ private fun SignedInShell(viewModel: WalletViewModel) {
         Box(Modifier.padding(inner)) {
             when (selected) {
                 Tab.HOME -> HomeScreen(viewModel)
-                Tab.SETTINGS -> SettingsScreen(viewModel)
+                Tab.SETTINGS -> SettingsTabHost(viewModel)
             }
+        }
+    }
+}
+
+/**
+ * Per-tab NavHost for the Settings flow. Routes:
+ *   - settings  — top-level Settings screen
+ *   - accounts  — Settings → Accounts (list + swipe-to-default)
+ *   - addMint   — Accounts → Add Mint (full-screen here vs iOS sheet)
+ */
+@Composable
+private fun SettingsTabHost(viewModel: WalletViewModel) {
+    val nav = rememberNavController()
+    NavHost(navController = nav, startDestination = "settings") {
+        composable("settings") {
+            SettingsScreen(
+                viewModel = viewModel,
+                onOpenAccounts = { nav.navigate("accounts") },
+            )
+        }
+        composable("accounts") {
+            AccountsScreen(
+                viewModel = viewModel,
+                onBack = { nav.popBackStack() },
+                onAddMint = { nav.navigate("addMint") },
+            )
+        }
+        composable("addMint") {
+            AddMintScreen(
+                viewModel = viewModel,
+                onClose = { nav.popBackStack() },
+            )
         }
     }
 }
@@ -156,7 +205,7 @@ private fun ErrorView(viewModel: WalletViewModel, message: String) {
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            androidx.compose.material3.Button(onClick = { viewModel.signOut() }) {
+            Button(onClick = { viewModel.signOut() }) {
                 Text("Sign out and retry")
             }
         }

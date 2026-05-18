@@ -1,234 +1,227 @@
 package com.makeprisms.agicash.ui.screens
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Bolt
-import androidx.compose.material.icons.outlined.CreditCard
-import androidx.compose.material.icons.outlined.Inbox
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.makeprisms.agicash.ui.theme.BrandButton
+import com.makeprisms.agicash.ui.theme.BrandButtonSize
+import com.makeprisms.agicash.ui.theme.BrandButtonVariant
+import com.makeprisms.agicash.ui.theme.BrandColors
+import com.makeprisms.agicash.ui.theme.BrandTypography
+import com.makeprisms.agicash.ui.theme.Spacing
 import com.makeprisms.agicash.wallet.WalletViewModel
+import java.math.BigDecimal
+import java.math.RoundingMode
 import uniffi.agicash_ffi.AccountFfi
 
 /**
- * Mirrors `HomeView.swift`. Centered total balance + Accounts list.
- * Phase 1 balance hard-coded to 0 (FFI doesn't have proofs yet).
+ * Compose analogue of `ios/Agicash/Agicash/HomeView.swift`.
+ *
+ * Layout mirrors iOS 1:1:
+ *   - `BalanceHero` (Teko numeric, currency-symbol prefix, secondary
+ *     converted-amount placeholder line in muted text)
+ *   - `HomeActionGrid` — Receive (secondary) + Send (primary) stacked,
+ *     288dp max width, centered.
+ *
+ * The Send/Receive primary CTAs surface `onReceive`/`onSend` callbacks
+ * the parent shell wires to the sibling Send/Receive workers' carousel
+ * sheets. Their lanes (`feat/android-send-cashu`,
+ * `feat/android-receive-cashu`) were still on the TLS-init commit at
+ * the time of writing; placeholders here mean both buttons render but
+ * route to no-op handlers in this branch.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(viewModel: WalletViewModel) {
+fun HomeScreen(
+    viewModel: WalletViewModel,
+    onReceive: () -> Unit = {},
+    onSend: () -> Unit = {},
+) {
     val accounts by viewModel.accounts.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) { viewModel.refreshAccounts() }
 
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Home") },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                ),
-            )
-        },
-        containerColor = MaterialTheme.colorScheme.background,
+        containerColor = BrandColors.background,
     ) { inner ->
         Column(
             modifier = Modifier
                 .padding(inner)
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState()),
+                .verticalScroll(rememberScrollState())
+                .padding(bottom = Spacing.xxl),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(24.dp),
+            verticalArrangement = Arrangement.spacedBy(Spacing.xxxl),
         ) {
-            BalanceHeader(accounts)
-            AccountListSection(
-                accounts = accounts,
-                title = "Accounts",
-                modifier = Modifier.padding(horizontal = 16.dp),
+            Spacer(Modifier.padding(top = Spacing.hero))
+            BalanceHero(accounts)
+            HomeActionGrid(
+                onReceive = onReceive,
+                onSend = onSend,
+                modifier = Modifier.padding(horizontal = Spacing.l),
             )
         }
     }
 }
 
+/**
+ * Centered balance display modeled on iOS `BalanceHero`. Teko numeric
+ * with a small leading currency symbol (₿ / $), and a smaller muted
+ * converted-amount line below.
+ *
+ * Currency selection mirrors iOS: USD wins when both currencies exist,
+ * otherwise BTC, otherwise defaults to USD.
+ */
 @Composable
-private fun BalanceHeader(accounts: List<AccountFfi>) {
-    val currencyHint = remember(accounts) {
-        val currencies = accounts.map { it.currency }.toSet()
+private fun BalanceHero(accounts: List<AccountFfi>) {
+    val currencies = remember(accounts) { accounts.map { it.currency }.toSet() }
+    val primaryCurrency = remember(currencies) {
         when {
-            currencies.isEmpty() -> "\u2014"
-            currencies.size == 1 -> currencies.first()
-            else -> currencies.sorted().joinToString(" \u00B7 ")
+            currencies.contains("USD") -> "USD"
+            currencies.contains("BTC") -> "BTC"
+            else -> "USD"
         }
     }
+    val primarySymbol = remember(primaryCurrency) {
+        when (primaryCurrency) {
+            "USD" -> "$"
+            "BTC" -> "\u20BF"
+            else -> "$"
+        }
+    }
+    val primaryAmount = remember(accounts, primaryCurrency) {
+        totalForCurrency(accounts, primaryCurrency).toPlainString()
+    }
+    val secondaryLine = remember(accounts, primaryCurrency, currencies) {
+        secondaryLineFor(accounts, primaryCurrency, currencies)
+    }
+
     Column(
-        modifier = Modifier.padding(top = 24.dp).fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(Spacing.s),
     ) {
+        Row(
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            // Currency symbol — small, semibold rounded — baseline-aligned
+            // to the bottom of the Teko hero.
+            Text(
+                text = primarySymbol,
+                style = BrandTypography.titleSmall,
+                color = BrandColors.foreground,
+                modifier = Modifier.padding(bottom = 14.dp),
+            )
+            Text(
+                text = primaryAmount,
+                style = BrandTypography.numericHero,
+                color = BrandColors.foreground,
+            )
+        }
         Text(
-            "Total balance",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text("0", style = MaterialTheme.typography.displayMedium)
-        Text(
-            currencyHint,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            text = secondaryLine,
+            style = BrandTypography.label,
+            color = BrandColors.mutedForeground,
+            textAlign = TextAlign.Center,
         )
     }
 }
 
 /**
- * Shared between Home + Settings so the visual treatment stays consistent.
- * Mirrors the AccountListSection in `HomeView.swift`.
+ * Receive / Send button stack. Mirrors iOS `HomeActionGrid`: 288dp max
+ * width, centered in the parent, secondary Receive on top of primary
+ * Send so the visual hierarchy matches the web design.
  */
 @Composable
-fun AccountListSection(
-    accounts: List<AccountFfi>,
-    title: String,
+private fun HomeActionGrid(
+    onReceive: () -> Unit,
+    onSend: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
         modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Text(title, style = MaterialTheme.typography.titleMedium)
-        if (accounts.isEmpty()) {
-            EmptyAccountsCard()
-        } else {
-            LazyColumn(
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                contentPadding = PaddingValues(0.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                items(accounts, key = { it.id }) { account ->
-                    AccountRow(account)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun EmptyAccountsCard() {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
-        ),
-        shape = RoundedCornerShape(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(Spacing.l),
     ) {
         Column(
-            modifier = Modifier.padding(20.dp).fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.widthIn(max = 288.dp).fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(Spacing.l),
         ) {
-            Icon(
-                Icons.Outlined.Inbox,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            BrandButton(
+                label = "Receive",
+                onClick = onReceive,
+                variant = BrandButtonVariant.Secondary,
+                size = BrandButtonSize.Large,
             )
-            Text("No accounts yet", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Phase 1 fetched zero accounts from Supabase. Account creation lands in Phase 2.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            BrandButton(
+                label = "Send",
+                onClick = onSend,
+                variant = BrandButtonVariant.Primary,
+                size = BrandButtonSize.Large,
             )
         }
     }
 }
 
-@Composable
-private fun AccountRow(account: AccountFfi) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
-        ),
-        shape = RoundedCornerShape(8.dp),
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp).fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Box(modifier = Modifier.fillMaxWidth()) {
-                Row(account)
-            }
-            val url = account.mintUrl
-            if (!url.isNullOrEmpty()) {
-                Text(
-                    url,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                )
-            }
+/**
+ * Sum balances (decimal-string minor units) for the accounts matching
+ * `currency`. Skips non-numeric balances so a future malformed row
+ * can't crash the hero. Mirrors iOS `totalForCurrency`.
+ */
+private fun totalForCurrency(accounts: List<AccountFfi>, currency: String): BigDecimal {
+    return accounts
+        .filter { it.currency == currency }
+        .fold(BigDecimal.ZERO) { acc, account ->
+            val parsed = runCatching { BigDecimal(account.balance) }.getOrDefault(BigDecimal.ZERO)
+            acc + parsed
         }
-    }
+        .setScale(0, RoundingMode.DOWN)
 }
 
-@Composable
-private fun Row(account: AccountFfi) {
-    androidx.compose.foundation.layout.Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        val icon = when (account.accountType) {
-            "cashu" -> Icons.Outlined.CreditCard
-            "spark" -> Icons.Outlined.Bolt
-            else -> Icons.Outlined.CreditCard
-        }
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        androidx.compose.foundation.layout.Spacer(Modifier.padding(end = 12.dp))
-        Text(
-            account.name,
-            style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-        )
-        Text(
-            displayBalance(account),
-            style = MaterialTheme.typography.bodyLarge,
-        )
+/**
+ * Secondary converted-amount line. When the user holds BOTH BTC and
+ * USD accounts, render the *other* currency's per-unit total. With
+ * only one currency present, render a sats placeholder so the hero
+ * doesn't collapse to a single line. Matches iOS `secondaryLine`.
+ */
+private fun secondaryLineFor(
+    accounts: List<AccountFfi>,
+    primaryCurrency: String,
+    currencies: Set<String>,
+): String {
+    val secondaryCurrency: String? = when {
+        primaryCurrency == "USD" && currencies.contains("BTC") -> "BTC"
+        primaryCurrency == "BTC" && currencies.contains("USD") -> "USD"
+        else -> null
     }
-}
-
-private fun displayBalance(account: AccountFfi): String {
-    return if (account.unit.isEmpty()) {
-        "${account.balance} ${account.currency}"
-    } else {
-        account.balance
+    if (secondaryCurrency == null) {
+        return "\u2248 0 sats"
     }
+    val total = totalForCurrency(accounts, secondaryCurrency)
+    val unit = when (secondaryCurrency) {
+        "BTC" -> if (total.compareTo(BigDecimal.ONE) == 0) "sat" else "sats"
+        "USD", "USDB" -> if (total.compareTo(BigDecimal.ONE) == 0) "cent" else "cents"
+        else -> ""
+    }
+    return "\u2248 ${total.toPlainString()} $unit"
 }
