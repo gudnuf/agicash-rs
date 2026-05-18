@@ -199,11 +199,13 @@ fn classify_melt_quote(e: &MeltQuoteError) -> &'static str {
         MeltQuoteError::InvalidTransition { .. } => "invalid-state",
         MeltQuoteError::Storage(inner) => match inner {
             MeltQuoteStorageError::Concurrency(_) => "concurrency-error",
+            MeltQuoteStorageError::DuplicatePayment => "duplicate-payment",
             MeltQuoteStorageError::NotFound => "not-found",
             MeltQuoteStorageError::InvalidState(_) => "invalid-state",
             MeltQuoteStorageError::Backend(_) => "storage-backend-error",
             MeltQuoteStorageError::Encryption(_) => "encryption-error",
         },
+        MeltQuoteError::DuplicatePayment => "duplicate-payment",
         MeltQuoteError::Mint(inner) => match inner {
             CashuProviderError::InvalidUrl(_) => "invalid-mint-url",
             CashuProviderError::Network(_) => "mint-unreachable",

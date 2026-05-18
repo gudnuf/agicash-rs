@@ -17,7 +17,17 @@ pub enum MeltQuoteError {
 
     /// Underlying storage backend failed.
     #[error("storage error: {0}")]
-    Storage(#[from] MeltQuoteStorageError),
+    Storage(MeltQuoteStorageError),
+
+    /// An active (UNPAID/PENDING/PAID) melt quote already exists for
+    /// this invoice's payment hash. Re-quoting would fire a second
+    /// `post_melt` for an in-flight / already-paid invoice — a
+    /// double-pay. Surfaced from the DB partial unique index
+    /// `cashu_send_quotes_payment_hash_active_unique` (or the
+    /// `find_active_by_payment_hash` pre-check) so FFI consumers get a
+    /// clean typed error instead of a raw `Backend(...)` 23505 string.
+    #[error("duplicate payment: an active melt quote already exists for this invoice")]
+    DuplicatePayment,
 
     /// CDK / mint network or protocol failure.
     #[error("mint error: {0}")]
@@ -66,6 +76,20 @@ pub enum MeltQuoteError {
     DleqVerificationFailed(#[from] DleqVerificationError),
 }
 
+impl From<MeltQuoteStorageError> for MeltQuoteError {
+    /// Promote the storage-level `DuplicatePayment` to the typed
+    /// top-level [`MeltQuoteError::DuplicatePayment`] so FFI consumers
+    /// can pattern-match it cleanly; every other storage error keeps
+    /// flowing through [`MeltQuoteError::Storage`] (preserving the
+    /// behaviour the previous `#[from]` derive gave).
+    fn from(e: MeltQuoteStorageError) -> Self {
+        match e {
+            MeltQuoteStorageError::DuplicatePayment => MeltQuoteError::DuplicatePayment,
+            other => MeltQuoteError::Storage(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +125,25 @@ mod tests {
         let s = e.to_string();
         assert!(s.contains("100"));
         assert!(s.contains("50"));
+    }
+
+    #[test]
+    fn duplicate_payment_storage_error_promotes_to_typed_top_level_variant() {
+        // The DB partial unique index surfaces a storage-level
+        // DuplicatePayment; it must be promoted to the typed
+        // MeltQuoteError::DuplicatePayment (NOT buried in Storage(...))
+        // so FFI consumers can pattern-match it.
+        let e: MeltQuoteError = MeltQuoteStorageError::DuplicatePayment.into();
+        assert!(matches!(e, MeltQuoteError::DuplicatePayment));
+        assert!(e.to_string().contains("duplicate payment"));
+    }
+
+    #[test]
+    fn other_storage_errors_still_flow_through_storage_variant() {
+        let e: MeltQuoteError = MeltQuoteStorageError::NotFound.into();
+        assert!(matches!(e, MeltQuoteError::Storage(_)));
+        let e: MeltQuoteError = MeltQuoteStorageError::Concurrency("x".into()).into();
+        assert!(matches!(e, MeltQuoteError::Storage(_)));
     }
 
     #[test]

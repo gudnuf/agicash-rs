@@ -2159,6 +2159,14 @@ fn melt_quote_error_to_ffi(e: MeltQuoteError) -> FfiError {
             FfiError::internal(format!("invalid state transition from {from} on {event}"))
         }
         MeltQuoteError::Storage(s) => FfiError::internal(format!("storage error: {s}")),
+        // An active melt quote already exists for this invoice —
+        // re-quoting would double-pay. Distinct discriminator-bearing
+        // message so the iOS UI can pattern-match the prefix and resume
+        // the existing quote / show the paid receipt instead of
+        // retrying. Same funneling shape as the DLEQ branch below.
+        MeltQuoteError::DuplicatePayment => FfiError::internal(
+            "DUPLICATE_PAYMENT: an active melt quote already exists for this invoice",
+        ),
         MeltQuoteError::Mint(inner) => cashu_provider_error_to_ffi(inner),
         MeltQuoteError::InvalidInvoice(msg) => {
             FfiError::internal(format!("invalid bolt11 invoice: {msg}"))

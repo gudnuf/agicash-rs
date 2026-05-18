@@ -192,6 +192,17 @@ impl CashuMeltQuoteService {
     }
 
     /// Persist the UNPAID melt-quote row, reserving the chosen proofs.
+    ///
+    /// Defense-in-depth pre-check: if an active (UNPAID/PENDING/PAID)
+    /// quote already exists for this `(user_id, payment_hash)`, return
+    /// it instead of issuing a second `post_melt` — a re-pasted
+    /// in-flight invoice re-attaches to the live quote and a re-pasted
+    /// already-paid invoice surfaces the paid receipt (matches the iOS
+    /// reconcile-poll behaviour). This is the *friendly* path; the DB
+    /// partial unique index `cashu_send_quotes_payment_hash_active_unique`
+    /// is the hard race-safe backstop that still fires
+    /// [`MeltQuoteError::DuplicatePayment`] if two `create_quote` calls
+    /// race past this check concurrently (TOCTOU).
     pub async fn create_quote(
         &self,
         user_id: UserId,
@@ -200,6 +211,16 @@ impl CashuMeltQuoteService {
     ) -> Result<CreateMeltQuoteResult, MeltQuoteError> {
         if Utc::now() >= preview.expires_at {
             return Err(MeltQuoteError::QuoteExpired);
+        }
+        if let Some(existing) = self
+            .storage
+            .find_active_by_payment_hash(user_id, &preview.payment_hash)
+            .await?
+        {
+            return Ok(CreateMeltQuoteResult {
+                quote: existing,
+                account: account.clone(),
+            });
         }
         let proof_ids: Vec<uuid::Uuid> = preview.prepared_proofs.iter().map(|p| p.id).collect();
         let proofs: Vec<TokenProof> = preview
@@ -304,10 +325,42 @@ impl CashuMeltQuoteService {
         {
             Ok(r) => r,
             Err(e) => {
-                let reason = format!("post_melt: {e}");
-                let failed = self.storage.fail(quote.id, &reason).await?;
-                machine.apply(Event::QuoteFailed(failed.clone()))?;
-                return Ok(MeltOutcome::Failed(failed));
+                // `post_melt` is the request that asks the mint to pay
+                // the Lightning invoice. We must NOT collapse every
+                // failure into FAILED: `fail()`/`fail_cashu_send_quote`
+                // releases the RESERVED proofs back to UNSPENT, and if
+                // the mint is mid-payment (or already paid) that turns
+                // the "failed" UI into a double-pay on retry.
+                //
+                // Split on whether the mint provably did not move
+                // funds. `cdk::Error::is_definitive_failure()` is the
+                // canonical mint-is-truth classifier: `true` means the
+                // mint definitively rejected the request and did not
+                // update its state (validation error, 4xx, NUT error —
+                // safe to revert); `false` means ambiguous (timeout,
+                // network/connection error, 5xx — the request may have
+                // reached the mint and the melt may be in flight). This
+                // is the same discipline `Self::fail` already applies
+                // (it refuses to fail unless the mint confirms `Unpaid`
+                // via `get_melt_quote_status`); here we keep PENDING and
+                // let the caller reconcile via the poll path instead of
+                // failing blind.
+                if e.is_definitive_failure() {
+                    // Mint provably did not pay — safe to FAIL and
+                    // release the reserved proofs (unchanged behaviour).
+                    let reason = format!("post_melt: {e}");
+                    let failed = self.storage.fail(quote.id, &reason).await?;
+                    machine.apply(Event::QuoteFailed(failed.clone()))?;
+                    return Ok(MeltOutcome::Failed(failed));
+                }
+                // Ambiguous error: mint state unknown, payment may be
+                // in flight. Keep the quote PENDING (proofs stay
+                // RESERVED — the row was already transitioned to
+                // PENDING in step 1) and let the caller poll
+                // `get_melt_quote_status`. Mirrors the
+                // `MeltState::Pending | MeltState::Unknown` branch
+                // below.
+                return Ok(MeltOutcome::Pending(updated));
             }
         };
 
@@ -957,6 +1010,13 @@ mod tests {
         ) -> Result<CashuMeltQuote, super::super::storage::MeltQuoteStorageError> {
             unreachable!()
         }
+        async fn find_active_by_payment_hash(
+            &self,
+            _user_id: UserId,
+            _payment_hash: &str,
+        ) -> Result<Option<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
     }
 
     struct UnusedProvider;
@@ -1096,5 +1156,240 @@ mod tests {
         }];
         let err = select_send_proofs(&proofs, 100, &[]).unwrap_err();
         assert!(matches!(err, MeltQuoteError::InsufficientBalance { .. }));
+    }
+
+    // ===== Fix 1: ambiguous-vs-definitive post_melt classification =====
+    //
+    // The `initiate_melt` post_melt error branch keys entirely on
+    // `cdk::Error::is_definitive_failure()`: `true` => FAIL + release
+    // reserved proofs (mint provably did not pay); `false` => keep
+    // PENDING + return `MeltOutcome::Pending` so the caller reconciles
+    // via `get_melt_quote_status` (mint may be mid-payment). These
+    // tests pin the load-bearing predicate so a cdk bump that flips a
+    // variant's classification fails loudly here instead of silently
+    // re-introducing the premature-Failed double-pay.
+
+    #[test]
+    fn ambiguous_post_melt_errors_are_not_definitive_so_quote_stays_pending() {
+        use cdk::Error;
+        // Network error (no status code) — request may have reached the
+        // mint; the melt may be in flight. MUST be ambiguous so the
+        // branch keeps the quote PENDING (proofs RESERVED) instead of
+        // failing + releasing them.
+        assert!(!Error::HttpError(None, "connection reset".into()).is_definitive_failure());
+        // 5xx — server error, mint state unknown.
+        assert!(!Error::HttpError(Some(502), "bad gateway".into()).is_definitive_failure());
+        assert!(!Error::HttpError(Some(503), "unavailable".into()).is_definitive_failure());
+        // Timeout — classic ambiguous case.
+        assert!(!Error::Timeout.is_definitive_failure());
+        // Unknown payment state — explicitly ambiguous in cdk.
+        assert!(!Error::UnknownPaymentState.is_definitive_failure());
+    }
+
+    #[test]
+    fn definitive_post_melt_rejections_stay_definitive_so_quote_fails_and_releases() {
+        use cdk::Error;
+        // 4xx — mint rejected the request outright; funds did not move.
+        assert!(Error::HttpError(Some(400), "bad request".into()).is_definitive_failure());
+        assert!(Error::HttpError(Some(404), "unknown quote".into()).is_definitive_failure());
+        // Mint-level NUT rejections that prove no payment happened.
+        assert!(Error::TokenAlreadySpent.is_definitive_failure());
+        assert!(Error::UnpaidQuote.is_definitive_failure());
+        assert!(Error::TransactionUnbalanced(0, 0, 0).is_definitive_failure());
+    }
+
+    // ===== Fix 2: create_quote payment_hash pre-check =====
+
+    /// Configurable mock: records whether `create` was invoked and
+    /// serves a canned `find_active_by_payment_hash` result, so we can
+    /// prove the pre-check short-circuits *before* any second
+    /// `storage.create` (which is what would drive a second `post_melt`).
+    struct PrecheckStorage {
+        existing: std::sync::Mutex<Option<CashuMeltQuote>>,
+        create_called: std::sync::atomic::AtomicBool,
+    }
+
+    impl PrecheckStorage {
+        fn new(existing: Option<CashuMeltQuote>) -> Self {
+            Self {
+                existing: std::sync::Mutex::new(existing),
+                create_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CashuMeltQuoteStorage for PrecheckStorage {
+        async fn create(
+            &self,
+            input: CreateMeltQuote,
+        ) -> Result<CreateMeltQuoteResult, super::super::storage::MeltQuoteStorageError> {
+            self.create_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Behave like a fresh insert so the no-duplicate path can
+            // also be asserted.
+            let mut q = stub_quote(CashuMeltQuoteState::Unpaid);
+            q.user_id = input.user_id;
+            q.account_id = input.account_id;
+            q.payment_hash = input.payment_hash;
+            Ok(CreateMeltQuoteResult {
+                quote: q,
+                account: stub_account(Currency::Btc),
+            })
+        }
+        async fn mark_as_pending(
+            &self,
+            _quote_id: Uuid,
+        ) -> Result<CashuMeltQuote, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
+        async fn complete(
+            &self,
+            _input: CompleteMeltQuote,
+        ) -> Result<CompleteMeltQuoteResult, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
+        async fn expire(
+            &self,
+            _quote_id: Uuid,
+        ) -> Result<CashuMeltQuote, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
+        async fn fail(
+            &self,
+            _quote_id: Uuid,
+            _reason: &str,
+        ) -> Result<CashuMeltQuote, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _quote_id: Uuid,
+        ) -> Result<CashuMeltQuote, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
+        async fn find_active_by_payment_hash(
+            &self,
+            _user_id: UserId,
+            _payment_hash: &str,
+        ) -> Result<Option<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
+            Ok(self.existing.lock().unwrap().clone())
+        }
+    }
+
+    fn preview_for(payment_hash: &str) -> MeltQuotePreview {
+        MeltQuotePreview {
+            bolt11: "lnbc...".into(),
+            melt_quote_id: "fresh-mint-quote-id".into(),
+            amount_received: money(64, Currency::Btc),
+            lightning_fee_reserve: money(1, Currency::Btc),
+            cashu_fee: money(0, Currency::Btc),
+            total_fee: money(1, Currency::Btc),
+            total_amount: money(65, Currency::Btc),
+            amount_requested: money(64, Currency::Btc),
+            amount_requested_in_msat: 64_000,
+            payment_hash: payment_hash.to_string(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            keyset_id: "00abcdef".into(),
+            keyset_counter: 0,
+            number_of_change_outputs: 1,
+            prepared_proofs: vec![],
+            amount_reserved: money(64, Currency::Btc),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_quote_returns_existing_active_quote_without_creating_a_duplicate() {
+        // An active (PENDING) quote already exists for this invoice's
+        // payment_hash — re-quoting must re-attach to it and NOT call
+        // storage.create (which is what would fire a second post_melt).
+        let mut existing = stub_quote(CashuMeltQuoteState::Pending);
+        existing.payment_hash = "deadbeef".into();
+        let storage = Arc::new(PrecheckStorage::new(Some(existing.clone())));
+        let svc = CashuMeltQuoteService::new(storage.clone(), Arc::new(UnusedProvider));
+        let account = stub_account(Currency::Btc);
+
+        let out = svc
+            .create_quote(UserId::new(), &account, preview_for("deadbeef"))
+            .await
+            .expect("pre-check returns existing quote");
+
+        assert_eq!(out.quote.id, existing.id);
+        assert!(matches!(out.quote.state, CashuMeltQuoteState::Pending));
+        assert!(
+            !storage
+                .create_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "storage.create must NOT be called when an active quote already exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_quote_returns_existing_paid_quote_so_repaste_shows_receipt() {
+        // Re-pasting an already-PAID invoice surfaces the paid receipt
+        // rather than issuing a second payment.
+        let mut existing = stub_quote(CashuMeltQuoteState::Paid {
+            payment_preimage: "pre".into(),
+            lightning_fee: money(1, Currency::Btc),
+            amount_spent: money(65, Currency::Btc),
+            total_fee: money(1, Currency::Btc),
+        });
+        existing.payment_hash = "cafe".into();
+        let storage = Arc::new(PrecheckStorage::new(Some(existing.clone())));
+        let svc = CashuMeltQuoteService::new(storage.clone(), Arc::new(UnusedProvider));
+
+        let out = svc
+            .create_quote(
+                UserId::new(),
+                &stub_account(Currency::Btc),
+                preview_for("cafe"),
+            )
+            .await
+            .expect("pre-check returns existing paid quote");
+
+        assert_eq!(out.quote.id, existing.id);
+        assert!(matches!(out.quote.state, CashuMeltQuoteState::Paid { .. }));
+        assert!(!storage
+            .create_called
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn create_quote_creates_when_no_active_duplicate_exists() {
+        // No active quote for this payment_hash (only FAILED/EXPIRED
+        // would also yield None) — the happy path must still create.
+        let storage = Arc::new(PrecheckStorage::new(None));
+        let svc = CashuMeltQuoteService::new(storage.clone(), Arc::new(UnusedProvider));
+
+        let out = svc
+            .create_quote(
+                UserId::new(),
+                &stub_account(Currency::Btc),
+                preview_for("fresh"),
+            )
+            .await
+            .expect("create on no-duplicate");
+
+        assert_eq!(out.quote.payment_hash, "fresh");
+        assert!(
+            storage
+                .create_called
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "storage.create MUST be called on the no-duplicate happy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_quote_rejects_expired_preview_before_precheck() {
+        // Expiry guard still runs first (unchanged behaviour).
+        let storage = Arc::new(PrecheckStorage::new(None));
+        let svc = CashuMeltQuoteService::new(storage, Arc::new(UnusedProvider));
+        let mut preview = preview_for("x");
+        preview.expires_at = Utc::now() - chrono::Duration::hours(1);
+        let err = svc
+            .create_quote(UserId::new(), &stub_account(Currency::Btc), preview)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MeltQuoteError::QuoteExpired));
     }
 }

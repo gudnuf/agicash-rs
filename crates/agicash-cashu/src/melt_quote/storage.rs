@@ -72,6 +72,20 @@ pub trait CashuMeltQuoteStorage: CashuMeltQuoteStorageBounds {
     /// Fetch a single quote by primary key. Returns
     /// [`MeltQuoteStorageError::NotFound`] if absent.
     async fn get(&self, quote_id: Uuid) -> Result<CashuMeltQuote, MeltQuoteStorageError>;
+
+    /// Look up an existing *active* (UNPAID/PENDING/PAID) melt quote
+    /// for this `(user_id, payment_hash)`. Returns `None` when none
+    /// exists (or only FAILED/EXPIRED rows do — those are legitimately
+    /// retryable). This is the defense-in-depth pre-check that lets a
+    /// caller re-attach to an in-flight quote / show the paid receipt
+    /// instead of issuing a second `post_melt`; the partial unique
+    /// index `cashu_send_quotes_payment_hash_active_unique` is the
+    /// race-safe backstop behind it.
+    async fn find_active_by_payment_hash(
+        &self,
+        user_id: UserId,
+        payment_hash: &str,
+    ) -> Result<Option<CashuMeltQuote>, MeltQuoteStorageError>;
 }
 
 /// Input to [`CashuMeltQuoteStorage::create`].
@@ -140,6 +154,14 @@ pub enum MeltQuoteStorageError {
     /// (`hint = 'CONCURRENCY_ERROR'`).
     #[error("concurrent modification: {0}")]
     Concurrency(String),
+    /// An active (UNPAID/PENDING/PAID) melt quote already exists for
+    /// this `(user_id, payment_hash)` — the partial unique index
+    /// `cashu_send_quotes_payment_hash_active_unique` rejected the
+    /// insert (Postgres error code `23505`). The same invoice is
+    /// already in flight or already paid; a second `post_melt` would
+    /// double-pay. Mirrors [`ReceiveSwapStorageError::AlreadyClaimed`].
+    #[error("duplicate payment: an active melt quote already exists for this invoice")]
+    DuplicatePayment,
     /// No quote row matches the supplied id.
     #[error("not found")]
     NotFound,

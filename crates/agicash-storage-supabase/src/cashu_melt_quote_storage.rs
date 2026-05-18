@@ -185,6 +185,18 @@ impl CashuMeltQuoteStorage for SupabaseCashuMeltQuoteStorage {
             if text.contains("CONCURRENCY_ERROR") {
                 return Err(MeltQuoteStorageError::Concurrency(text));
             }
+            // The partial unique index
+            // `cashu_send_quotes_payment_hash_active_unique` rejects a
+            // second active (UNPAID/PENDING/PAID) quote for the same
+            // `(user_id, payment_hash)`. Postgrest surfaces this as a
+            // 23505 with the constraint name in the body. Detect the
+            // constraint by name so we don't mis-classify the *other*
+            // unique index on this table (`..._quote_id_hash_key`).
+            // Mirrors the 23505 handling in
+            // `cashu_receive_swap_storage.rs` (`AlreadyClaimed`).
+            if is_duplicate_payment_violation(&text) {
+                return Err(MeltQuoteStorageError::DuplicatePayment);
+            }
             return Err(MeltQuoteStorageError::Backend(format!(
                 "create_cashu_send_quote: HTTP {status}: {text}"
             )));
@@ -456,6 +468,39 @@ impl CashuMeltQuoteStorage for SupabaseCashuMeltQuoteStorage {
             .ok_or(MeltQuoteStorageError::NotFound)?;
         self.row_to_quote(row).await
     }
+
+    async fn find_active_by_payment_hash(
+        &self,
+        user_id: UserId,
+        payment_hash: &str,
+    ) -> Result<Option<CashuMeltQuote>, MeltQuoteStorageError> {
+        let client = self.base.authenticated_client().await.map_err(map_auth)?;
+        let response = client
+            .from("cashu_send_quotes")
+            .select("*")
+            .eq("user_id", user_id.to_string())
+            .eq("payment_hash", payment_hash)
+            .in_("state", ["UNPAID", "PENDING", "PAID"])
+            .execute()
+            .await
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("postgrest: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(MeltQuoteStorageError::Backend(format!(
+                "select cashu_send_quotes (by payment_hash): HTTP {status}: {text}"
+            )));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("parse response: {e}")))?;
+        match rows.into_iter().next() {
+            Some(row) => Ok(Some(self.row_to_quote(row).await?)),
+            None => Ok(None),
+        }
+    }
 }
 
 impl SupabaseCashuMeltQuoteStorage {
@@ -549,6 +594,17 @@ fn map_auth(err: agicash_traits::StorageError) -> MeltQuoteStorageError {
     MeltQuoteStorageError::Backend(format!("auth: {err}"))
 }
 
+/// True when a failed `create_cashu_send_quote` response body is the
+/// Postgres `unique_violation` (23505) raised by the partial unique
+/// index `cashu_send_quotes_payment_hash_active_unique` — i.e. an
+/// active (UNPAID/PENDING/PAID) melt quote already exists for this
+/// `(user_id, payment_hash)`. Keyed on the constraint name so the
+/// *other* unique index on this table (`..._quote_id_hash_key`) is not
+/// mis-classified as a duplicate payment.
+fn is_duplicate_payment_violation(body: &str) -> bool {
+    body.contains("cashu_send_quotes_payment_hash_active_unique")
+}
+
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
@@ -634,6 +690,25 @@ mod tests {
             h,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn duplicate_payment_violation_detected_by_constraint_name() {
+        // Postgrest 23505 body shape for our partial unique index.
+        let body = r#"{"code":"23505","details":"Key (user_id, payment_hash)=(...) already exists.","message":"duplicate key value violates unique constraint \"cashu_send_quotes_payment_hash_active_unique\""}"#;
+        assert!(is_duplicate_payment_violation(body));
+    }
+
+    #[test]
+    fn other_unique_violation_is_not_duplicate_payment() {
+        // The *other* unique index on this table (mint quote_id_hash)
+        // must NOT be mis-classified as a duplicate payment.
+        let body = r#"{"code":"23505","message":"duplicate key value violates unique constraint \"cashu_send_quotes_quote_id_hash_key\""}"#;
+        assert!(!is_duplicate_payment_violation(body));
+        // A generic backend error is also not a duplicate payment.
+        assert!(!is_duplicate_payment_violation(
+            r#"{"code":"P0001","message":"CONCURRENCY_ERROR"}"#
+        ));
     }
 
     #[test]
