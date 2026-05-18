@@ -626,15 +626,54 @@ final class WalletViewModel {
         }
     }
 
-    func refreshAccounts() async {
+    /// Stable code for `FfiError.Auth` meaning "session genuinely dead, the
+    /// user must re-authenticate" — the Rust `auth_code::UNAUTHENTICATED`
+    /// source of truth in `crates/agicash-ffi/src/error.rs`. UniFFI only
+    /// exports the `Auth(code:message:)` shape, not the `auth_code` module,
+    /// so we mirror the integer here (same magic-value style as the
+    /// `"user row not found"` match below). Every other `Auth` code
+    /// (`NETWORK` = 1, `BACKEND` = 3, `INTERNAL` = 4) is a transient blip,
+    /// not an expired session.
+    private static let authCodeUnauthenticated: UInt32 = 2
+
+    /// - Parameter background: `true` when called from the unattended Home
+    ///   foreground poll loop (and the scene-foreground re-sync), where a
+    ///   send/receive sheet and an in-flight payment may be presented. On
+    ///   that route a transient `listAccounts` failure must NOT escalate to
+    ///   `phase = .error`, because `AuthGateView` reacts to `.error` by
+    ///   tearing down the entire signed-in UI — sheet and in-flight payment
+    ///   included — over what is usually one dropped packet. Only a genuine
+    ///   auth-expiry (`FfiError.Auth` / `UNAUTHENTICATED`) still escalates
+    ///   on this route; everything else is swallowed (stale `accounts` stay
+    ///   on screen, the next poll re-syncs). Defaults to `false` so the
+    ///   bootstrap / interactive sign-in / explicit pull-to-refresh /
+    ///   post-payment callers keep their existing first-class error UX.
+    func refreshAccounts(background: Bool = false) async {
         if isDemoMode { return }
         do {
             let list = try await wallet.listAccounts()
             accounts = list
         } catch let err as FfiError {
+            if background && !isGenuineAuthExpiry(err) {
+                // Transient network / backend blip on the unattended poll
+                // route. Mirror the non-fatal `getUser` handling below:
+                // keep the last-known `accounts`, do NOT touch `phase`, let
+                // the next poll (or an explicit pull-to-refresh) recover.
+                // This is what keeps a network hiccup during a Lightning
+                // send from ejecting the user mid-payment.
+                _ = err
+                return
+            }
             phase = .error("list accounts failed: \(ffiErrorMessage(err))")
             return
         } catch {
+            if background {
+                // Unexpected throw shape on the poll route: still non-fatal
+                // — an unrecognised error is even less likely to be a real
+                // session expiry, so never tear the UI down for it here.
+                _ = error
+                return
+            }
             phase = .error("unexpected: \(error)")
             return
         }
@@ -731,6 +770,18 @@ final class WalletViewModel {
             // elements, which it does here.
             return false
         }
+    }
+
+    /// True only for a genuine "session is dead, re-authenticate" failure:
+    /// `FfiError.Auth` with the `UNAUTHENTICATED` code. A `.Auth` with
+    /// `NETWORK` / `BACKEND` / `INTERNAL`, or any `.Storage` / `.Internal`,
+    /// is a transient or non-auth fault and is explicitly NOT treated as an
+    /// expiry — those must not eject the user on the background poll route.
+    private func isGenuineAuthExpiry(_ err: FfiError) -> Bool {
+        if case .Auth(let code, _) = err {
+            return code == Self.authCodeUnauthenticated
+        }
+        return false
     }
 
     private func ffiErrorMessage(_ err: FfiError) -> String {

@@ -76,7 +76,15 @@ struct HomeView: View {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: Self.pollInterval)
                     if Task.isCancelled { return }
-                    await model.refreshAccounts()
+                    // `background: true` — this is the unattended poll. A
+                    // send/receive sheet (and an in-flight Lightning
+                    // payment) may be presented; a transient listAccounts
+                    // blip here must NOT escalate to `phase = .error`,
+                    // which would tear the whole signed-in UI (sheet +
+                    // payment) down. Only a genuine auth-expiry still does.
+                    // The initial load above stays on the default path so
+                    // first-load failures keep their explicit error UX.
+                    await model.refreshAccounts(background: true)
                 }
             }
             .onChange(of: scenePhase) { _, newPhase in
@@ -85,7 +93,11 @@ struct HomeView: View {
                 // is suspended while backgrounded, so this catches anything
                 // that arrived in the meantime as soon as the user is back.
                 if newPhase == .active {
-                    Task { await model.refreshAccounts() }
+                    // Same unattended route as the poll loop: returning to
+                    // the foreground (possibly with a payment sheet still
+                    // up) must not let a transient refresh failure kill the
+                    // session. `background: true` for the same reason.
+                    Task { await model.refreshAccounts(background: true) }
                 }
             }
             .sheet(isPresented: $showReceive) {
