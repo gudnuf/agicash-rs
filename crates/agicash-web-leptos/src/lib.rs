@@ -20,6 +20,7 @@ pub mod app;
 pub mod components;
 pub mod pages;
 pub mod tokens;
+pub mod transitions;
 
 pub use app::App;
 

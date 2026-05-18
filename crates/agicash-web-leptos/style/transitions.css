@@ -1,0 +1,97 @@
+/* View Transitions API styles.
+ *
+ * Mirrors the React app's app/lib/transitions/transitions.css. The
+ * Rust side (transitions::AnimatedA) sets CSS variables on <html>
+ * synchronously before calling document.startViewTransition(); the
+ * ::view-transition-old/new(root) rules below read those variables
+ * and play the named keyframe.
+ *
+ * Names are all prefixed with `agicash-vt-` to avoid colliding with
+ * other animations on the page. Keep in sync with the
+ * Transition::out_animation / in_animation methods in
+ * src/transitions/mod.rs.
+ *
+ * Duration: 180ms ease-in. Matches the React app exactly.
+ */
+
+@keyframes agicash-vt-slide-in-from-right {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes agicash-vt-slide-in-from-left {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes agicash-vt-slide-in-from-top {
+  from { transform: translateY(-100%); }
+  to   { transform: translateY(0); }
+}
+
+@keyframes agicash-vt-slide-in-from-bottom {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0); }
+}
+
+@keyframes agicash-vt-slide-out-to-right {
+  from { transform: translateX(0); }
+  to   { transform: translateX(100%); }
+}
+
+@keyframes agicash-vt-slide-out-to-left {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+
+@keyframes agicash-vt-slide-out-to-top {
+  from { transform: translateY(0); }
+  to   { transform: translateY(-100%); }
+}
+
+@keyframes agicash-vt-slide-out-to-bottom {
+  from { transform: translateY(0); }
+  to   { transform: translateY(100%); }
+}
+
+@keyframes agicash-vt-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes agicash-vt-fade-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+::view-transition-old(root) {
+  animation-name: var(--vt-direction-out, none);
+  animation-duration: 0.18s;
+  animation-timing-function: ease-in;
+  animation-fill-mode: both;
+  z-index: var(--vt-z-index-out, auto);
+}
+
+::view-transition-new(root) {
+  animation-name: var(--vt-direction-in, none);
+  animation-duration: 0.18s;
+  animation-timing-function: ease-in;
+  animation-fill-mode: both;
+  z-index: var(--vt-z-index-in, auto);
+}
+
+/* Shared-element transition for the spike's "hero circle" demo.
+ *
+ * When the user navigates between /spike/transitions/a and
+ * /spike/transitions/b, both pages render a circle with
+ * `view-transition-name: spike-hero`. The browser pairs them and
+ * morphs position + size automatically — no JS animation required.
+ *
+ * We override the default 0.25s built-in here to match the page-level
+ * 0.18s duration so the hero and the page change finish together.
+ */
+::view-transition-old(spike-hero),
+::view-transition-new(spike-hero) {
+  animation-duration: 0.35s;
+  animation-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}

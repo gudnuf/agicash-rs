@@ -17,6 +17,7 @@ use crate::components::{ProtectedLayout, WalletData};
 use crate::pages::{
     AccountsAddPage, AccountsIndexPage, HomePage, LoginPage, ReceiveCashuPage, ReceivePage,
     SendPage, SettingsAppearancePage, SettingsContactsPage, SettingsIndexPage, SettingsProfilePage,
+    SpikeAPage, SpikeBPage, SpikeSheetPage,
 };
 
 /// Auth signal stored in the Leptos context. `Some(access_token)` means
@@ -66,12 +67,25 @@ pub fn App() -> impl IntoView {
 
     view! {
         <Stylesheet id="leptos" href="/style/main.css"/>
+        // Browser-native View Transitions API rules — see
+        // `crates/agicash-web-leptos/src/transitions/mod.rs`.
+        <Stylesheet id="leptos-transitions" href="/style/transitions.css"/>
         <Title text="Agicash"/>
 
         <Router>
             <main>
                 <Routes fallback=|| "Not found.">
                     <Route path=StaticSegment("/login") view=LoginPage/>
+
+                    // Spike: View Transitions API demo. Public (no auth) so
+                    // it's easy to reach for a screenshot. Registered BEFORE
+                    // the ParentRoute below because the protected layout's
+                    // empty-path parent would otherwise swallow these URLs
+                    // and bounce to /login. See
+                    // `crates/agicash-web-leptos/src/pages/spike_transitions.rs`.
+                    <Route path=path!("/spike/transitions/a") view=SpikeAPage/>
+                    <Route path=path!("/spike/transitions/b") view=SpikeBPage/>
+                    <Route path=path!("/spike/transitions/sheet") view=SpikeSheetPage/>
 
                     // Protected group. The empty-path ParentRoute matches
                     // every URL that didn't match `/login` above; the inner

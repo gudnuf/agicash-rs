@@ -4,6 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#ffffff" />
+    <!--
+      Anchor all relative URLs (style/, public/, pkg/, manifest, etc.)
+      to the document root. Without this, deep SPA URLs like
+      /spike/transitions/a break asset resolution when the dev server
+      falls back to index.html.
+    -->
+    <base href="/" />
     <title>Agicash</title>
 
     <link rel="manifest" href="public/manifest.json" />
@@ -23,6 +30,8 @@
       href="https://fonts.googleapis.com/css2?family=Kode+Mono:wght@400..700&family=Teko:wght@300..700&display=swap"
     />
     <link rel="stylesheet" href="style/main.css" />
+    <!-- View Transitions API rules. See src/transitions/mod.rs. -->
+    <link rel="stylesheet" href="style/transitions.css" />
   </head>
   <body>
     <!--

@@ -14,6 +14,7 @@ mod receive;
 mod receive_cashu;
 mod send;
 mod settings;
+mod spike_transitions;
 
 pub use accounts::{AccountsAddPage, AccountsIndexPage};
 pub use home::HomePage;
@@ -24,3 +25,4 @@ pub use send::SendPage;
 pub use settings::{
     SettingsAppearancePage, SettingsContactsPage, SettingsIndexPage, SettingsProfilePage,
 };
+pub use spike_transitions::{SpikeAPage, SpikeBPage, SpikeSheetPage};
