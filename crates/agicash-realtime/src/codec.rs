@@ -33,6 +33,39 @@ pub fn encode_outbound(
     arr.to_string()
 }
 
+/// Decoded Phoenix message (both text and binary collapse to this).
+#[derive(Debug, Clone)]
+pub struct PhoenixMessage {
+    pub join_ref: Option<String>,
+    pub r#ref: Option<String>,
+    pub topic: String,
+    pub event: String,
+    pub payload: Value,
+}
+
+/// Decode an inbound STRING frame: JSON `[join_ref, ref, topic, event, payload]`.
+pub fn decode_text(s: &str) -> Result<PhoenixMessage, crate::RealtimeError> {
+    let v: Value =
+        serde_json::from_str(s).map_err(|e| crate::RealtimeError::Codec(format!("json: {e}")))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| crate::RealtimeError::Codec("frame is not a JSON array".into()))?;
+    if arr.len() != 5 {
+        return Err(crate::RealtimeError::Codec(format!(
+            "expected 5 elements, got {}",
+            arr.len()
+        )));
+    }
+    let opt_str = |x: &Value| x.as_str().map(str::to_string);
+    Ok(PhoenixMessage {
+        join_ref: opt_str(&arr[0]),
+        r#ref: opt_str(&arr[1]),
+        topic: arr[2].as_str().unwrap_or_default().to_string(),
+        event: arr[3].as_str().unwrap_or_default().to_string(),
+        payload: arr[4].clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +96,34 @@ mod tests {
     fn encodes_null_join_ref_as_json_null() {
         let frame = encode_outbound(None, "3", "phoenix", "heartbeat", json!({}));
         assert_eq!(frame, r#"[null,"3","phoenix","heartbeat",{}]"#);
+    }
+
+    #[test]
+    fn decodes_join_ok_reply() {
+        let m = decode_text(
+            r#"[null,"1","realtime:wallet:u1","phx_reply",{"status":"ok","response":{"postgres_changes":[]}}]"#,
+        )
+        .unwrap();
+        assert_eq!(m.join_ref, None);
+        assert_eq!(m.r#ref.as_deref(), Some("1"));
+        assert_eq!(m.topic, "realtime:wallet:u1");
+        assert_eq!(m.event, "phx_reply");
+        assert_eq!(m.payload["status"], "ok");
+    }
+
+    #[test]
+    fn decodes_text_broadcast_frame() {
+        let m = decode_text(
+            r#"[null,null,"realtime:wallet:u1","broadcast",{"type":"broadcast","event":"TRANSACTION_UPDATED","payload":{"id":"abc"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(m.event, "broadcast");
+        assert_eq!(m.payload["event"], "TRANSACTION_UPDATED");
+        assert_eq!(m.payload["payload"]["id"], "abc");
+    }
+
+    #[test]
+    fn decode_text_rejects_non_array() {
+        assert!(decode_text(r#"{"not":"an array"}"#).is_err());
     }
 }
