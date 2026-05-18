@@ -107,9 +107,13 @@ pub fn HomePage() -> impl IntoView {
     let wallet_for_retry = wallet.clone();
     let config_for_retry = app_config.clone();
     let on_retry = move |_| {
+        // Explicit user-initiated refresh → foreground. The spinner only
+        // shows if there is no `Ready` value to keep (i.e. we're retrying
+        // out of an Error/Idle state, which is the desired feedback);
+        // a Retry after a successful load keeps the numbers on screen.
         wallet_for_retry
             .clone()
-            .refresh_with_config(config_for_retry.clone());
+            .refresh_with_config(config_for_retry.clone(), false);
     };
 
     let accounts = wallet.accounts;

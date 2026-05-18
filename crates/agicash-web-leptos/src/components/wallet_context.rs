@@ -168,11 +168,13 @@ impl WalletData {
         // value is then threaded through to the detached future.
         #[cfg(target_arch = "wasm32")]
         let config = use_context::<AppConfig>();
+        // First load / explicit user-initiated refresh: foreground, so a
+        // spinner is allowed while we have no data yet.
         #[cfg(target_arch = "wasm32")]
-        self.refresh_with_config(config);
+        self.refresh_with_config(config, false);
 
         #[cfg(not(target_arch = "wasm32"))]
-        self.refresh_with_config(None);
+        self.refresh_with_config(None, false);
     }
 
     /// Refresh using an already-captured `AppConfig` instead of reading
@@ -188,6 +190,29 @@ impl WalletData {
     /// browser and no real config) can pass `None` and settle into the
     /// same `Ready(empty)` shape view tests expect; on wasm a `None`
     /// surfaces the `AppConfig context missing` error exactly as before.
+    ///
+    /// `background` selects the load-state discipline, mirroring the iOS
+    /// poll fix (`HomeView`'s foreground poll / `scenePhase` refresh call
+    /// `refreshAccounts()` without ever blanking the hero):
+    ///
+    /// - `false` — first load or an explicit user-initiated refresh
+    ///   (mount Effect, the Retry button). Allowed to flip to
+    ///   `LoadState::Loading` so the view can show the full-screen
+    ///   spinner *while there is no data yet*.
+    /// - `true` — a silent background catch-up (the ~4s foreground poll,
+    ///   the `visibilitychange` / `focus` listeners). Stale-while-
+    ///   revalidate: the last `Ready` value stays on screen and is only
+    ///   swapped when the new fetch resolves; a failure surfaces as a
+    ///   quiet `Error` *only if there was nothing to keep showing*, never
+    ///   as the full-screen spinner. This is the web canonical model's
+    ///   `refetchOnWindowFocus` behaviour (background refetch keeps the
+    ///   prior data) — the regression fixed here was the poll throwing
+    ///   the balance away on every tick.
+    ///
+    /// Even with `background == false` the spinner only appears when
+    /// there is no `Ready` data to preserve: an explicit Retry after a
+    /// successful load keeps the numbers on screen rather than flashing
+    /// the spinner.
     //
     // `config` is moved into the spawned future on wasm (the build that
     // ships); the native test build cfg's that block out, so to clippy
@@ -196,10 +221,19 @@ impl WalletData {
         not(target_arch = "wasm32"),
         allow(clippy::needless_pass_by_value, unused_variables)
     )]
-    pub fn refresh_with_config(self, config: Option<AppConfig>) {
-        // Loading state visible immediately so the view can show a
-        // spinner even before the async work yields.
-        self.accounts.set(LoadState::Loading);
+    pub fn refresh_with_config(self, config: Option<AppConfig>, background: bool) {
+        // Stale-while-revalidate. Only blank the hero with the spinner
+        // when this is a foreground refresh AND there is no `Ready`
+        // value to keep showing. Background refreshes (poll / focus /
+        // visibility) NEVER flip to `Loading` — they keep the last
+        // balance on screen until the async fetch below resolves, then
+        // swap in the new data (or surface a quiet inline error). This
+        // mirrors the iOS poll discipline (`refreshAccounts()` never
+        // sets a loading phase) and the web's `refetchOnWindowFocus`.
+        let has_ready = matches!(self.accounts.get_untracked(), LoadState::Ready(_));
+        if !background && !has_ready {
+            self.accounts.set(LoadState::Loading);
+        }
 
         // Wasm uses wasm_bindgen_futures directly because `leptos::task::
         // spawn_local` requires the leptos Executor to be installed, and
@@ -208,9 +242,24 @@ impl WalletData {
         // tests run under tokio + the reactive harness.
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
+            // A failed *background* refresh must not blow away a balance
+            // that is already on screen — a transient poll/focus error
+            // should leave the last good numbers visible (stale-while-
+            // revalidate), exactly as the foreground spinner is
+            // suppressed above. Foreground refreshes, or background
+            // refreshes with nothing to preserve, still surface the
+            // error so the user isn't left staring at a stale value
+            // forever with no feedback.
+            let set_error = |this: &Self, msg: String| {
+                let keep_stale =
+                    background && matches!(this.accounts.get_untracked(), LoadState::Ready(_));
+                if !keep_stale {
+                    this.accounts.set(LoadState::Error(msg));
+                }
+            };
+
             let Some(config) = config else {
-                self.accounts
-                    .set(LoadState::Error("AppConfig context missing".to_string()));
+                set_error(&self, "AppConfig context missing".to_string());
                 return;
             };
 
@@ -222,7 +271,7 @@ impl WalletData {
                             self.accounts.set(LoadState::Ready(accounts));
                         }
                         Err(msg) => {
-                            self.accounts.set(LoadState::Error(msg));
+                            set_error(&self, msg);
                         }
                     }
                 }
@@ -232,7 +281,7 @@ impl WalletData {
                     self.accounts.set(LoadState::Ready(Vec::new()));
                 }
                 Err(msg) => {
-                    self.accounts.set(LoadState::Error(msg));
+                    set_error(&self, msg);
                 }
             }
         });
@@ -323,7 +372,9 @@ impl WalletData {
                 let config = config.clone();
                 let on_visibility = Closure::<dyn FnMut()>::new(move || {
                     if !doc_for_check.hidden() {
-                        wallet.clone().refresh_with_config(config.clone());
+                        // Background catch-up: keep the last balance on
+                        // screen, never flash the spinner.
+                        wallet.clone().refresh_with_config(config.clone(), true);
                     }
                 });
                 if let Err(e) = document.add_event_listener_with_callback(
@@ -348,7 +399,9 @@ impl WalletData {
                 let wallet = self.clone();
                 let config = config.clone();
                 let on_focus = Closure::<dyn FnMut()>::new(move || {
-                    wallet.clone().refresh_with_config(config.clone());
+                    // Background catch-up: stale-while-revalidate, no
+                    // spinner flash.
+                    wallet.clone().refresh_with_config(config.clone(), true);
                 });
                 let target: &web_sys::EventTarget = window.as_ref();
                 if let Err(e) = target
@@ -373,7 +426,11 @@ impl WalletData {
                             .and_then(|w| w.document())
                             .is_some_and(|d| !d.hidden());
                         if still_visible {
-                            wallet.clone().refresh_with_config(config.clone());
+                            // The Tier-1 poll is a silent background
+                            // catch-up — it must keep the last balance
+                            // visible, not blank it every 4s (the
+                            // regression this fixes).
+                            wallet.clone().refresh_with_config(config.clone(), true);
                         }
                         // When hidden we skip the work but keep looping;
                         // the `visibilitychange` handler does the
