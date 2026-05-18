@@ -34,7 +34,8 @@ use agicash_traits::{
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl UserStorage for SupabaseStorage {
     async fn upsert_user_with_accounts(
         &self,

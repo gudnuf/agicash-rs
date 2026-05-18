@@ -21,13 +21,7 @@ base64 = { workspace = true }
 cdk = { workspace = true }
 hex = { workspace = true }
 postgrest = { workspace = true }
-# Needed by the generated `TypedBuilder::execute` wrapper — its return type
-# names `reqwest::Response`/`reqwest::Error` (the same types `postgrest::Builder::execute`
-# returns). Already transitively pulled in by postgrest.
-reqwest = { workspace = true }
 sha2 = "0.10"
-rustls = { workspace = true }
-rustls-platform-verifier = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,12 +30,32 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 
+# Native: keep the rustls + platform-verifier path so iOS / Android / CLI
+# continue to honour the system trust store (including any mkcert root in
+# the iOS simulator keychain). The workspace `reqwest` dep already pulls
+# `rustls-tls`, so it slots into `use_preconfigured_tls`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+
+# wasm32: drop rustls + ring + platform-verifier entirely — the browser's
+# `fetch` handles TLS. `reqwest` with no TLS features uses its wasm
+# backend, which wraps `fetch`, so the typed Supabase calls go through
+# the same surface as native binaries.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
 [dev-dependencies]
 async-trait = { workspace = true }
-tokio = { workspace = true }
 serde_json = { workspace = true }
 dotenvy = { workspace = true }
 uuid = { workspace = true }
+
+# Tokio test attr is native-only; wasm uses `wasm-bindgen-test` for the
+# browser smoke tests instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

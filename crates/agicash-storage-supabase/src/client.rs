@@ -1,8 +1,14 @@
 use crate::SupabaseStorageConfig;
 use agicash_traits::{StorageError, TokenProvider};
 use base64::Engine;
+use std::sync::Arc;
+
+// Native-only TLS plumbing. On wasm the browser handles TLS inside
+// `fetch`, so the rustls/ring/platform-verifier stack is dead weight.
+#[cfg(not(target_arch = "wasm32"))]
 use rustls_platform_verifier::ConfigVerifierExt;
-use std::sync::{Arc, OnceLock};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 
 /// Extract just the `sub` claim from a JWT for logging.
 ///
@@ -36,13 +42,20 @@ fn jwt_sub_for_log(jwt: &str) -> String {
 /// Schema name in the Supabase project where all wallet tables live.
 pub(crate) const WALLET_SCHEMA: &str = "wallet";
 
-/// Build the shared `reqwest::Client` once and reuse it. TLS chain validation
-/// is delegated to the platform's native verifier (Security.framework on
-/// macOS/iOS, `SChannel` on Windows, system roots on Linux) so the system trust
-/// store — including any user-installed mkcert root in the iOS simulator
-/// keychain — is honored. Replaces the previous `rustls-tls-native-roots`
-/// approach, which only consulted the host trust store and silently failed
-/// on iOS targets.
+/// Build the shared `reqwest::Client` once and reuse it.
+///
+/// Native: TLS chain validation is delegated to the platform's native
+/// verifier (Security.framework on macOS/iOS, `SChannel` on Windows,
+/// system roots on Linux) so the system trust store — including any
+/// user-installed mkcert root in the iOS simulator keychain — is
+/// honoured. Replaces the previous `rustls-tls-native-roots` approach
+/// which silently failed on iOS targets.
+///
+/// wasm32: the browser handles TLS inside `fetch`; reqwest's wasm
+/// backend wraps `fetch` directly. Connect/read timeouts are not
+/// configurable from the reqwest wasm builder (the browser's own
+/// timeout policy applies), so this path is just `Client::new()`.
+#[cfg(not(target_arch = "wasm32"))]
 fn http_client() -> Result<reqwest::Client, StorageError> {
     // `rustls-platform-verifier` builds a `ClientConfig` against the process
     // default `CryptoProvider`. Install ring exactly once before the first
@@ -72,14 +85,30 @@ fn http_client() -> Result<reqwest::Client, StorageError> {
         .map_err(|e| StorageError::Backend(format!("reqwest client build: {e}")))
 }
 
+/// wasm32: browser handles TLS inside `fetch`. No timeout knobs exist
+/// in the reqwest wasm builder — the browser's own policy applies.
+#[cfg(target_arch = "wasm32")]
+fn http_client() -> Result<reqwest::Client, StorageError> {
+    Ok(reqwest::Client::new())
+}
+
 #[derive(Clone)]
 pub struct SupabaseStorage {
     /// REST endpoint base (e.g. `https://xxx.supabase.co/rest/v1`).
     pub(crate) rest_url: String,
     pub(crate) anon_key: String,
+    /// Native: `Arc<dyn TokenProvider + Send + Sync>` so the wallet can
+    /// share the provider across tokio worker threads. wasm: drop the
+    /// `Send + Sync` bound because the browser is single-threaded and
+    /// `TokenProvider` itself is `?Send` on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) tokens: Arc<dyn TokenProvider + Send + Sync>,
-    /// Reqwest client wired to the platform-native TLS verifier. Shared
-    /// across all RPC/select calls so the connection pool is reused.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) tokens: Arc<dyn TokenProvider>,
+    /// Native: reqwest wired to the platform-native TLS verifier.
+    /// wasm: reqwest's `fetch`-backed client.
+    /// Either way, shared across RPC/select calls so the connection
+    /// pool (native) / browser keep-alive (wasm) is reused.
     pub(crate) http: reqwest::Client,
 }
 
@@ -93,11 +122,31 @@ impl std::fmt::Debug for SupabaseStorage {
 }
 
 impl SupabaseStorage {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
         config: SupabaseStorageConfig,
         tokens: Arc<dyn TokenProvider + Send + Sync>,
     ) -> Result<Self, StorageError> {
         // Normalize `<base>` -> `<base>/rest/v1`. Strip a trailing slash if any.
+        let base = config.url.trim_end_matches('/');
+        let rest_url = format!("{base}/rest/v1");
+        let http = http_client()?;
+        Ok(Self {
+            rest_url,
+            anon_key: config.anon_key,
+            tokens,
+            http,
+        })
+    }
+
+    /// wasm: identical surface to the native `new`, but the token
+    /// provider does NOT carry `Send + Sync` — `TokenProvider` is
+    /// `?Send`-gated on wasm and the browser is single-threaded.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(
+        config: SupabaseStorageConfig,
+        tokens: Arc<dyn TokenProvider>,
+    ) -> Result<Self, StorageError> {
         let base = config.url.trim_end_matches('/');
         let rest_url = format!("{base}/rest/v1");
         let http = http_client()?;
@@ -141,7 +190,8 @@ mod tests {
 
     struct StubTokens;
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl TokenProvider for StubTokens {
         async fn get_jwt(&self) -> Result<String, AuthError> {
             Ok("stub.jwt.token".into())
