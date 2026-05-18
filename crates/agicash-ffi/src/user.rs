@@ -75,8 +75,14 @@ mod tests {
         let usd_id = AccountId::from(Uuid::new_v4());
         let u = user_with_defaults(Some(btc_id), Some(usd_id), Currency::Btc);
         let ffi: UserFfi = u.into();
-        assert_eq!(ffi.default_btc_account_id.as_deref(), Some(btc_id.to_string().as_str()));
-        assert_eq!(ffi.default_usd_account_id.as_deref(), Some(usd_id.to_string().as_str()));
+        assert_eq!(
+            ffi.default_btc_account_id.as_deref(),
+            Some(btc_id.to_string().as_str())
+        );
+        assert_eq!(
+            ffi.default_usd_account_id.as_deref(),
+            Some(usd_id.to_string().as_str())
+        );
         assert_eq!(ffi.default_currency, "BTC");
     }
 

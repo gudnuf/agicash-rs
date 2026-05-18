@@ -270,8 +270,7 @@ async fn fetch_account_summaries(
     // encryption layer ships (mirrors CLI + FFI composition root).
     let storage_arc = Arc::new(storage);
     let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
-    let send_swap_storage =
-        SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), encryption);
+    let send_swap_storage = SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), encryption);
 
     let mut summaries = Vec::with_capacity(accounts.len());
     for account in accounts {
