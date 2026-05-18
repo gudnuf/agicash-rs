@@ -598,6 +598,26 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
     func completeMintQuote(quoteId: String) async throws  -> ReceiveResult
     
     /**
+     * Request a NUT-05 melt quote, persist the UNPAID row, and reserve
+     * the proofs. Mirrors the CLI's `agicash send lightning <bolt11>`
+     * up to the "quote issued" step (without `--dry-run` /
+     * `--no-wait`): the Swift side then calls `execute_melt_quote`
+     * (which fires `post_melt`) and drives the poll cycle itself so
+     * the polling cadence + UI feedback stay on the consumer — same
+     * split as the mint-quote (Lightning receive) surface.
+     *
+     * Re-runs `get_quote` internally so the caller passes only the
+     * bolt11 (the [`MeltQuotePreview`] FFI record carries no
+     * re-constructable proof handles across the boundary). The second
+     * quote is cheap (one mint round-trip) and matches the CLI's own
+     * "preview then create" sequence.
+     *
+     * Errors mirror `prepare_melt_quote` plus quote-expired between
+     * preview and create.
+     */
+    func createMeltQuote(bolt11: String, accountId: String?, currency: String?) async throws  -> MeltQuoteHandle
+    
+    /**
      * Persist a new Cashu send swap and produce a wire-form token.
      * Mirrors the CLI's `agicash send <amount>` (without `--dry-run`).
      *
@@ -607,6 +627,30 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * Errors mirror `prepare_send_quote` plus token-encode failures.
      */
     func createSendSwap(amount: UInt64, accountId: String?, currency: String?) async throws  -> SendSwapHandle
+    
+    /**
+     * Initiate the melt for a previously-created UNPAID quote: marks
+     * it PENDING, calls NUT-05 `post_melt`, then dispatches on the
+     * mint's response. Mirrors the `initiate_melt` step of the CLI's
+     * `cmd_send_lightning` (`crates/agicash-cli/src/send_lightning.rs`).
+     *
+     * Single round-trip: returns as soon as the mint replies. A PAID
+     * reply yields a terminal `Paid` snapshot (preimage + final
+     * fees); a still-in-flight reply yields `Pending` and the iOS app
+     * should then drive `poll_melt_quote` on a timer; a mint refusal
+     * yields a terminal `Failed` snapshot.
+     *
+     * `quote_id` is the wallet-side UUID from
+     * [`MeltQuoteHandle::quote_id`] — NOT the mint-side string id.
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid UUID, missing quote row,
+     * ownership mismatch, missing account, or mint-protocol failure
+     * during the melt round-trip.
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+    func executeMeltQuote(quoteId: String) async throws  -> MeltQuoteSnapshot
     
     /**
      * Return the currently-loaded session, or `None` if the wallet is
@@ -679,6 +723,30 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
     func mintAdd(url: String) async throws  -> MintAddResult
     
     /**
+     * Poll the mint for the current state of a PENDING melt quote.
+     * Single-shot: reconciles change proofs + storage on PAID,
+     * flips the row FAILED on a mint UNPAID/FAILED, returns the
+     * still-pending snapshot otherwise. Never loops — the iOS app
+     * owns the polling timer (every 2-3s from a long-running `Task`),
+     * same contract as `poll_mint_quote`.
+     *
+     * Mirrors the `poll_until_complete` step of the CLI's
+     * `cmd_send_lightning` but with a zero timeout so it returns
+     * after exactly one mint status check.
+     *
+     * `quote_id` is the wallet-side UUID from
+     * [`MeltQuoteHandle::quote_id`].
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid UUID, missing quote row,
+     * ownership mismatch, missing account, or mint-protocol failure
+     * during the single poll round-trip.
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+    func pollMeltQuote(quoteId: String) async throws  -> MeltQuoteSnapshot
+    
+    /**
      * Poll the mint for the current state of a previously-started
      * quote. Single-shot: returns the snapshot of the persisted row
      * (with one mint round-trip if still UNPAID), never loops.
@@ -701,6 +769,29 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func pollMintQuote(quoteId: String) async throws  -> MintQuoteSnapshot
+    
+    /**
+     * Compute the fee + amount breakdown for a hypothetical Lightning
+     * send. Pure preview — no quote row is created, no proofs are
+     * reserved. Mirrors the CLI's `agicash send lightning <bolt11>
+     * --dry-run` (`crates/agicash-cli/src/send_lightning.rs`).
+     *
+     * `bolt11` is the invoice the user pasted (or that
+     * `request_lightning_invoice` produced for the LN-address path).
+     * `account_id` + `currency` together pick the source Cashu
+     * account; same selector semantics as `prepare_send_quote`. The
+     * invoice's own msat amount determines what the receiver gets —
+     * the mint quotes the Lightning fee reserve on top.
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid bolt11, amountless invoice,
+     * expired invoice, currency mismatch, insufficient balance,
+     * no/ambiguous matching account, or any mint-protocol failure
+     * (mirrors `prepare_send_quote`'s funneling pattern).
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+    func prepareMeltQuote(bolt11: String, accountId: String?, currency: String?) async throws  -> MeltQuotePreview
     
     /**
      * Compute the fee breakdown for a hypothetical send. Pure preview —
@@ -1076,6 +1167,41 @@ open func completeMintQuote(quoteId: String)async throws  -> ReceiveResult  {
 }
     
     /**
+     * Request a NUT-05 melt quote, persist the UNPAID row, and reserve
+     * the proofs. Mirrors the CLI's `agicash send lightning <bolt11>`
+     * up to the "quote issued" step (without `--dry-run` /
+     * `--no-wait`): the Swift side then calls `execute_melt_quote`
+     * (which fires `post_melt`) and drives the poll cycle itself so
+     * the polling cadence + UI feedback stay on the consumer — same
+     * split as the mint-quote (Lightning receive) surface.
+     *
+     * Re-runs `get_quote` internally so the caller passes only the
+     * bolt11 (the [`MeltQuotePreview`] FFI record carries no
+     * re-constructable proof handles across the boundary). The second
+     * quote is cheap (one mint round-trip) and matches the CLI's own
+     * "preview then create" sequence.
+     *
+     * Errors mirror `prepare_melt_quote` plus quote-expired between
+     * preview and create.
+     */
+open func createMeltQuote(bolt11: String, accountId: String?, currency: String?)async throws  -> MeltQuoteHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_create_melt_quote(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(bolt11),FfiConverterOptionString.lower(accountId),FfiConverterOptionString.lower(currency)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMeltQuoteHandle_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Persist a new Cashu send swap and produce a wire-form token.
      * Mirrors the CLI's `agicash send <amount>` (without `--dry-run`).
      *
@@ -1097,6 +1223,45 @@ open func createSendSwap(amount: UInt64, accountId: String?, currency: String?)a
             completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeSendSwapHandle_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Initiate the melt for a previously-created UNPAID quote: marks
+     * it PENDING, calls NUT-05 `post_melt`, then dispatches on the
+     * mint's response. Mirrors the `initiate_melt` step of the CLI's
+     * `cmd_send_lightning` (`crates/agicash-cli/src/send_lightning.rs`).
+     *
+     * Single round-trip: returns as soon as the mint replies. A PAID
+     * reply yields a terminal `Paid` snapshot (preimage + final
+     * fees); a still-in-flight reply yields `Pending` and the iOS app
+     * should then drive `poll_melt_quote` on a timer; a mint refusal
+     * yields a terminal `Failed` snapshot.
+     *
+     * `quote_id` is the wallet-side UUID from
+     * [`MeltQuoteHandle::quote_id`] — NOT the mint-side string id.
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid UUID, missing quote row,
+     * ownership mismatch, missing account, or mint-protocol failure
+     * during the melt round-trip.
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+open func executeMeltQuote(quoteId: String)async throws  -> MeltQuoteSnapshot  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_execute_melt_quote(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(quoteId)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMeltQuoteSnapshot_lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
@@ -1233,6 +1398,45 @@ open func mintAdd(url: String)async throws  -> MintAddResult  {
 }
     
     /**
+     * Poll the mint for the current state of a PENDING melt quote.
+     * Single-shot: reconciles change proofs + storage on PAID,
+     * flips the row FAILED on a mint UNPAID/FAILED, returns the
+     * still-pending snapshot otherwise. Never loops — the iOS app
+     * owns the polling timer (every 2-3s from a long-running `Task`),
+     * same contract as `poll_mint_quote`.
+     *
+     * Mirrors the `poll_until_complete` step of the CLI's
+     * `cmd_send_lightning` but with a zero timeout so it returns
+     * after exactly one mint status check.
+     *
+     * `quote_id` is the wallet-side UUID from
+     * [`MeltQuoteHandle::quote_id`].
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid UUID, missing quote row,
+     * ownership mismatch, missing account, or mint-protocol failure
+     * during the single poll round-trip.
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+open func pollMeltQuote(quoteId: String)async throws  -> MeltQuoteSnapshot  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_poll_melt_quote(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(quoteId)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMeltQuoteSnapshot_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
      * Poll the mint for the current state of a previously-started
      * quote. Single-shot: returns the snapshot of the persisted row
      * (with one mint round-trip if still UNPAID), never loops.
@@ -1267,6 +1471,44 @@ open func pollMintQuote(quoteId: String)async throws  -> MintQuoteSnapshot  {
             completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMintQuoteSnapshot_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Compute the fee + amount breakdown for a hypothetical Lightning
+     * send. Pure preview — no quote row is created, no proofs are
+     * reserved. Mirrors the CLI's `agicash send lightning <bolt11>
+     * --dry-run` (`crates/agicash-cli/src/send_lightning.rs`).
+     *
+     * `bolt11` is the invoice the user pasted (or that
+     * `request_lightning_invoice` produced for the LN-address path).
+     * `account_id` + `currency` together pick the source Cashu
+     * account; same selector semantics as `prepare_send_quote`. The
+     * invoice's own msat amount determines what the receiver gets —
+     * the mint quotes the Lightning fee reserve on top.
+     *
+     * Errors:
+     * - `FfiError::Auth { UNAUTHENTICATED }` if no session is loaded.
+     * - `FfiError::Internal` for invalid bolt11, amountless invoice,
+     * expired invoice, currency mismatch, insufficient balance,
+     * no/ambiguous matching account, or any mint-protocol failure
+     * (mirrors `prepare_send_quote`'s funneling pattern).
+     * - `FfiError::Storage` for raw Supabase failures.
+     */
+open func prepareMeltQuote(bolt11: String, accountId: String?, currency: String?)async throws  -> MeltQuotePreview  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_prepare_melt_quote(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(bolt11),FfiConverterOptionString.lower(accountId),FfiConverterOptionString.lower(currency)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMeltQuotePreview_lift,
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
@@ -2146,6 +2388,470 @@ public func FfiConverterTypeLightningAddressParts_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeLightningAddressParts_lower(_ value: LightningAddressParts) -> RustBuffer {
     return FfiConverterTypeLightningAddressParts.lower(value)
+}
+
+
+/**
+ * Lightning send handle. Mirrors the CLI's `QuoteIssuedOutput` JSON
+ * (`crates/agicash-cli/src/send_lightning.rs`) but with the Swift-side
+ * fields the carousel's Lightning-send view needs:
+ * - `quote_id` for follow-up FFI calls,
+ * - `invoice` for display / receipt,
+ * - `amount` + fee breakdown for the in-flight card,
+ * - `expires_at` for the countdown timer.
+ *
+ * `quote_id` is the **wallet-side** UUID (Supabase `wallet.melt_quotes`
+ * PK) — that's what `execute_melt_quote` and `poll_melt_quote` expect.
+ * `melt_quote_id` is the mint-side string identifier returned by NUT-05
+ * `POST /v1/melt/quote/bolt11`; exposed for receipt / debugging only.
+ */
+public struct MeltQuoteHandle: Equatable, Hashable {
+    /**
+     * Wallet-side UUID of the persisted quote row. Pass this to
+     * `execute_melt_quote` and `poll_melt_quote`.
+     */
+    public var quoteId: String
+    /**
+     * Mint-side NUT-05 quote id string. Informational; not used for
+     * follow-up FFI calls.
+     */
+    public var meltQuoteId: String
+    /**
+     * BOLT-11 invoice the mint pays on the user's behalf.
+     */
+    public var invoice: String
+    /**
+     * Hex-encoded BOLT-11 payment hash.
+     */
+    public var paymentHash: String
+    /**
+     * Amount the receiver gets. Decimal-stringified (matches the
+     * `ReceiveResult.amount` convention).
+     */
+    public var amount: String
+    /**
+     * Mint-quoted Lightning fee reserve. Decimal-stringified.
+     */
+    public var lightningFeeReserve: String
+    /**
+     * Cashu input fee. Decimal-stringified.
+     */
+    public var cashuFee: String
+    /**
+     * `lightning_fee_reserve + cashu_fee`. Decimal-stringified.
+     */
+    public var totalFee: String
+    /**
+     * Cashu sub-unit (`sat`, `usd`).
+     */
+    public var unit: String
+    /**
+     * Wallet account currency (`BTC`, `USD`).
+     */
+    public var currency: String
+    /**
+     * UUID of the account the send debits.
+     */
+    public var accountId: String
+    /**
+     * ISO 8601 timestamp at which the quote expires.
+     */
+    public var expiresAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Wallet-side UUID of the persisted quote row. Pass this to
+         * `execute_melt_quote` and `poll_melt_quote`.
+         */quoteId: String, 
+        /**
+         * Mint-side NUT-05 quote id string. Informational; not used for
+         * follow-up FFI calls.
+         */meltQuoteId: String, 
+        /**
+         * BOLT-11 invoice the mint pays on the user's behalf.
+         */invoice: String, 
+        /**
+         * Hex-encoded BOLT-11 payment hash.
+         */paymentHash: String, 
+        /**
+         * Amount the receiver gets. Decimal-stringified (matches the
+         * `ReceiveResult.amount` convention).
+         */amount: String, 
+        /**
+         * Mint-quoted Lightning fee reserve. Decimal-stringified.
+         */lightningFeeReserve: String, 
+        /**
+         * Cashu input fee. Decimal-stringified.
+         */cashuFee: String, 
+        /**
+         * `lightning_fee_reserve + cashu_fee`. Decimal-stringified.
+         */totalFee: String, 
+        /**
+         * Cashu sub-unit (`sat`, `usd`).
+         */unit: String, 
+        /**
+         * Wallet account currency (`BTC`, `USD`).
+         */currency: String, 
+        /**
+         * UUID of the account the send debits.
+         */accountId: String, 
+        /**
+         * ISO 8601 timestamp at which the quote expires.
+         */expiresAt: String) {
+        self.quoteId = quoteId
+        self.meltQuoteId = meltQuoteId
+        self.invoice = invoice
+        self.paymentHash = paymentHash
+        self.amount = amount
+        self.lightningFeeReserve = lightningFeeReserve
+        self.cashuFee = cashuFee
+        self.totalFee = totalFee
+        self.unit = unit
+        self.currency = currency
+        self.accountId = accountId
+        self.expiresAt = expiresAt
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension MeltQuoteHandle: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeltQuoteHandle: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteHandle {
+        return
+            try MeltQuoteHandle(
+                quoteId: FfiConverterString.read(from: &buf), 
+                meltQuoteId: FfiConverterString.read(from: &buf), 
+                invoice: FfiConverterString.read(from: &buf), 
+                paymentHash: FfiConverterString.read(from: &buf), 
+                amount: FfiConverterString.read(from: &buf), 
+                lightningFeeReserve: FfiConverterString.read(from: &buf), 
+                cashuFee: FfiConverterString.read(from: &buf), 
+                totalFee: FfiConverterString.read(from: &buf), 
+                unit: FfiConverterString.read(from: &buf), 
+                currency: FfiConverterString.read(from: &buf), 
+                accountId: FfiConverterString.read(from: &buf), 
+                expiresAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeltQuoteHandle, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.quoteId, into: &buf)
+        FfiConverterString.write(value.meltQuoteId, into: &buf)
+        FfiConverterString.write(value.invoice, into: &buf)
+        FfiConverterString.write(value.paymentHash, into: &buf)
+        FfiConverterString.write(value.amount, into: &buf)
+        FfiConverterString.write(value.lightningFeeReserve, into: &buf)
+        FfiConverterString.write(value.cashuFee, into: &buf)
+        FfiConverterString.write(value.totalFee, into: &buf)
+        FfiConverterString.write(value.unit, into: &buf)
+        FfiConverterString.write(value.currency, into: &buf)
+        FfiConverterString.write(value.accountId, into: &buf)
+        FfiConverterString.write(value.expiresAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteHandle_lift(_ buf: RustBuffer) throws -> MeltQuoteHandle {
+    return try FfiConverterTypeMeltQuoteHandle.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteHandle_lower(_ value: MeltQuoteHandle) -> RustBuffer {
+    return FfiConverterTypeMeltQuoteHandle.lower(value)
+}
+
+
+/**
+ * Pre-commit melt quote shown on the confirmation screen.
+ *
+ * Mirrors the CLI's `QuoteOutput` JSON (the `--dry-run` branch of
+ * `crates/agicash-cli/src/send_lightning.rs`). No swap row is created;
+ * the iOS confirm card renders the fee breakdown then calls
+ * `create_melt_quote` to persist + reserve proofs.
+ *
+ * All `Money`-valued fields are decimal-stringified to match the
+ * [`crate::receive::ReceiveResult`] / [`crate::send::SendQuotePreview`]
+ * convention so Swift consumers don't thread Rust's `Decimal` through
+ * the FFI boundary.
+ */
+public struct MeltQuotePreview: Equatable, Hashable {
+    /**
+     * The amount the receiver gets (the BOLT-11 invoice amount), in
+     * the account's minor unit. Decimal-stringified.
+     */
+    public var amount: String
+    /**
+     * Mint-quoted Lightning fee reserve. The actual Lightning fee is
+     * `<= this`; any unspent reserve is refunded as change on PAID.
+     * Decimal-stringified.
+     */
+    public var lightningFeeReserve: String
+    /**
+     * Cashu input fee for the proofs the wallet will spend.
+     * Decimal-stringified.
+     */
+    public var cashuFee: String
+    /**
+     * `lightning_fee_reserve + cashu_fee` — the worst-case fee.
+     * Decimal-stringified.
+     */
+    public var totalFee: String
+    /**
+     * `amount + total_fee` — the worst-case total deducted from the
+     * account (the actual debit may be lower after the reserve
+     * refund). Decimal-stringified.
+     */
+    public var totalAmount: String
+    /**
+     * Cashu sub-unit (`sat`, `usd`).
+     */
+    public var unit: String
+    /**
+     * Wallet account currency (`BTC`, `USD`).
+     */
+    public var currency: String
+    /**
+     * UUID of the account the send will debit.
+     */
+    public var accountId: String
+    /**
+     * Hex-encoded BOLT-11 payment hash. Stable identifier for the
+     * receipt / debugging.
+     */
+    public var paymentHash: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The amount the receiver gets (the BOLT-11 invoice amount), in
+         * the account's minor unit. Decimal-stringified.
+         */amount: String, 
+        /**
+         * Mint-quoted Lightning fee reserve. The actual Lightning fee is
+         * `<= this`; any unspent reserve is refunded as change on PAID.
+         * Decimal-stringified.
+         */lightningFeeReserve: String, 
+        /**
+         * Cashu input fee for the proofs the wallet will spend.
+         * Decimal-stringified.
+         */cashuFee: String, 
+        /**
+         * `lightning_fee_reserve + cashu_fee` — the worst-case fee.
+         * Decimal-stringified.
+         */totalFee: String, 
+        /**
+         * `amount + total_fee` — the worst-case total deducted from the
+         * account (the actual debit may be lower after the reserve
+         * refund). Decimal-stringified.
+         */totalAmount: String, 
+        /**
+         * Cashu sub-unit (`sat`, `usd`).
+         */unit: String, 
+        /**
+         * Wallet account currency (`BTC`, `USD`).
+         */currency: String, 
+        /**
+         * UUID of the account the send will debit.
+         */accountId: String, 
+        /**
+         * Hex-encoded BOLT-11 payment hash. Stable identifier for the
+         * receipt / debugging.
+         */paymentHash: String) {
+        self.amount = amount
+        self.lightningFeeReserve = lightningFeeReserve
+        self.cashuFee = cashuFee
+        self.totalFee = totalFee
+        self.totalAmount = totalAmount
+        self.unit = unit
+        self.currency = currency
+        self.accountId = accountId
+        self.paymentHash = paymentHash
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension MeltQuotePreview: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeltQuotePreview: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuotePreview {
+        return
+            try MeltQuotePreview(
+                amount: FfiConverterString.read(from: &buf), 
+                lightningFeeReserve: FfiConverterString.read(from: &buf), 
+                cashuFee: FfiConverterString.read(from: &buf), 
+                totalFee: FfiConverterString.read(from: &buf), 
+                totalAmount: FfiConverterString.read(from: &buf), 
+                unit: FfiConverterString.read(from: &buf), 
+                currency: FfiConverterString.read(from: &buf), 
+                accountId: FfiConverterString.read(from: &buf), 
+                paymentHash: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeltQuotePreview, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.amount, into: &buf)
+        FfiConverterString.write(value.lightningFeeReserve, into: &buf)
+        FfiConverterString.write(value.cashuFee, into: &buf)
+        FfiConverterString.write(value.totalFee, into: &buf)
+        FfiConverterString.write(value.totalAmount, into: &buf)
+        FfiConverterString.write(value.unit, into: &buf)
+        FfiConverterString.write(value.currency, into: &buf)
+        FfiConverterString.write(value.accountId, into: &buf)
+        FfiConverterString.write(value.paymentHash, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuotePreview_lift(_ buf: RustBuffer) throws -> MeltQuotePreview {
+    return try FfiConverterTypeMeltQuotePreview.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuotePreview_lower(_ value: MeltQuotePreview) -> RustBuffer {
+    return FfiConverterTypeMeltQuotePreview.lower(value)
+}
+
+
+/**
+ * Snapshot returned by [`crate::wallet::AgicashWallet::execute_melt_quote`]
+ * and [`crate::wallet::AgicashWallet::poll_melt_quote`].
+ *
+ * `failure_reason` is only populated when `state == Failed`. The
+ * `payment_preimage` / `lightning_fee` / `amount_spent` / `total_fee`
+ * fields are only populated when `state == Paid` (the NUT-05 settled
+ * receipt) — `None` for every other state.
+ */
+public struct MeltQuoteSnapshot: Equatable, Hashable {
+    public var state: MeltQuoteFfiState
+    /**
+     * Operator-facing failure message. `Some` iff `state == Failed`.
+     */
+    public var failureReason: String?
+    /**
+     * BOLT-11 payment preimage proving settlement. `Some` iff
+     * `state == Paid`.
+     */
+    public var paymentPreimage: String?
+    /**
+     * Actual Lightning fee charged (`lightning_fee_reserve` minus the
+     * refunded change). Decimal-stringified. `Some` iff
+     * `state == Paid`.
+     */
+    public var lightningFee: String?
+    /**
+     * `amount + lightning_fee` — what really left the account in
+     * network terms. Decimal-stringified. `Some` iff `state == Paid`.
+     */
+    public var amountSpent: String?
+    /**
+     * `lightning_fee + cashu_fee`. Decimal-stringified. `Some` iff
+     * `state == Paid`.
+     */
+    public var totalFee: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: MeltQuoteFfiState, 
+        /**
+         * Operator-facing failure message. `Some` iff `state == Failed`.
+         */failureReason: String?, 
+        /**
+         * BOLT-11 payment preimage proving settlement. `Some` iff
+         * `state == Paid`.
+         */paymentPreimage: String?, 
+        /**
+         * Actual Lightning fee charged (`lightning_fee_reserve` minus the
+         * refunded change). Decimal-stringified. `Some` iff
+         * `state == Paid`.
+         */lightningFee: String?, 
+        /**
+         * `amount + lightning_fee` — what really left the account in
+         * network terms. Decimal-stringified. `Some` iff `state == Paid`.
+         */amountSpent: String?, 
+        /**
+         * `lightning_fee + cashu_fee`. Decimal-stringified. `Some` iff
+         * `state == Paid`.
+         */totalFee: String?) {
+        self.state = state
+        self.failureReason = failureReason
+        self.paymentPreimage = paymentPreimage
+        self.lightningFee = lightningFee
+        self.amountSpent = amountSpent
+        self.totalFee = totalFee
+    }
+
+    
+}
+
+#if compiler(>=6)
+extension MeltQuoteSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeltQuoteSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteSnapshot {
+        return
+            try MeltQuoteSnapshot(
+                state: FfiConverterTypeMeltQuoteFfiState.read(from: &buf), 
+                failureReason: FfiConverterOptionString.read(from: &buf), 
+                paymentPreimage: FfiConverterOptionString.read(from: &buf), 
+                lightningFee: FfiConverterOptionString.read(from: &buf), 
+                amountSpent: FfiConverterOptionString.read(from: &buf), 
+                totalFee: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeltQuoteSnapshot, into buf: inout [UInt8]) {
+        FfiConverterTypeMeltQuoteFfiState.write(value.state, into: &buf)
+        FfiConverterOptionString.write(value.failureReason, into: &buf)
+        FfiConverterOptionString.write(value.paymentPreimage, into: &buf)
+        FfiConverterOptionString.write(value.lightningFee, into: &buf)
+        FfiConverterOptionString.write(value.amountSpent, into: &buf)
+        FfiConverterOptionString.write(value.totalFee, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteSnapshot_lift(_ buf: RustBuffer) throws -> MeltQuoteSnapshot {
+    return try FfiConverterTypeMeltQuoteSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteSnapshot_lower(_ value: MeltQuoteSnapshot) -> RustBuffer {
+    return FfiConverterTypeMeltQuoteSnapshot.lower(value)
 }
 
 
@@ -3501,6 +4207,117 @@ public func FfiConverterTypeLightningAddressError_lower(_ value: LightningAddres
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Lifecycle state for a [`MeltQuoteHandle`]. Mirrors
+ * `agicash_cashu::melt_quote::CashuMeltQuoteState` but flattens the
+ * per-state payload out into [`MeltQuoteSnapshot`]'s optional fields
+ * (the iOS UI never needs the change-proof machinery — the service
+ * reconciles it internally).
+ */
+
+public enum MeltQuoteFfiState: Equatable, Hashable {
+    
+    /**
+     * Quote created, no melt issued — proofs reserved, awaiting the
+     * user's confirm.
+     */
+    case unpaid
+    /**
+     * `post_melt` issued; the Lightning payment is in flight. iOS
+     * should poll `poll_melt_quote` until this transitions.
+     */
+    case pending
+    /**
+     * Mint settled the melt; proofs spent + change credited
+     * (terminal). The snapshot carries the preimage + final fees.
+     */
+    case paid
+    /**
+     * Quote expired before the melt was initiated (terminal).
+     */
+    case expired
+    /**
+     * Operational failure (mint rejected, network) (terminal).
+     */
+    case failed
+
+
+
+}
+
+#if compiler(>=6)
+extension MeltQuoteFfiState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeltQuoteFfiState: FfiConverterRustBuffer {
+    typealias SwiftType = MeltQuoteFfiState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteFfiState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unpaid
+        
+        case 2: return .pending
+        
+        case 3: return .paid
+        
+        case 4: return .expired
+        
+        case 5: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MeltQuoteFfiState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unpaid:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .paid:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteFfiState_lift(_ buf: RustBuffer) throws -> MeltQuoteFfiState {
+    return try FfiConverterTypeMeltQuoteFfiState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeltQuoteFfiState_lower(_ value: MeltQuoteFfiState) -> RustBuffer {
+    return FfiConverterTypeMeltQuoteFfiState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Lifecycle state for a [`MintQuoteHandle`]. Mirrors
  * `agicash_cashu::mint_quote::CashuMintQuoteState` but flattens the
  * per-state payload out (the iOS UI never needs the keyset metadata —
@@ -4386,7 +5203,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_complete_mint_quote() != 50767) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_create_melt_quote() != 26349) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_create_send_swap() != 63476) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_execute_melt_quote() != 47960) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_get_persisted_session() != 4899) {
@@ -4401,7 +5224,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_mint_add() != 35097) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_poll_melt_quote() != 37596) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_poll_mint_quote() != 39309) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_prepare_melt_quote() != 32531) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_prepare_send_quote() != 37161) {
