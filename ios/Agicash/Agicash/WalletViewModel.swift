@@ -444,6 +444,188 @@ final class WalletViewModel {
         }
     }
 
+    // MARK: - Lightning send (NUT-05 melt quote)
+
+    /// Outcome shape for `prepareMeltQuote`. Success carries the FFI
+    /// preview (amount + fee-reserve breakdown) so the confirm card can
+    /// render it directly; failure carries a presentation-ready string
+    /// already mapped through `ffiErrorMessage`. Mirrors
+    /// `SendQuoteOutcome` on the Cashu side.
+    enum MeltQuoteOutcome {
+        case success(MeltQuotePreview)
+        case failure(String)
+    }
+
+    /// Outcome shape for `createMeltQuote`. Success carries the FFI
+    /// handle (quote_id + invoice + fee breakdown) the in-flight card
+    /// drives the poll/execute cycle from; failure carries a
+    /// presentation-ready error string.
+    enum MeltCreateOutcome {
+        case success(MeltQuoteHandle)
+        case failure(String)
+    }
+
+    /// Outcome shape for `executeMeltQuote` / `pollMeltQuote`. Mirrors
+    /// `MeltQuoteSnapshot` plus a failure branch. The view dispatches
+    /// on the state (unpaid/pending/paid/expired/failed) to drive its
+    /// own phase machine. Mirrors `LightningPollOutcome` on the
+    /// receive side.
+    enum MeltStatusOutcome {
+        case state(MeltQuoteFfiState, snapshot: MeltQuoteSnapshot)
+        case failure(String)
+    }
+
+    /// Preview the fee + total for a Lightning send. Mirrors
+    /// `prepareSend` in shape; does NOT flip `isWorking` for the same
+    /// reason — the Lightning-send view owns its own phase machine and
+    /// renders a localised spinner during the brief quote round-trip.
+    func prepareMeltQuote(
+        bolt11: String,
+        accountId: String? = nil,
+        currency: String? = nil
+    ) async -> MeltQuoteOutcome {
+        do {
+            let preview = try await wallet.prepareMeltQuote(
+                bolt11: bolt11,
+                accountId: accountId,
+                currency: currency
+            )
+            return .success(preview)
+        } catch let err as FfiError {
+            return .failure(ffiErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
+    /// Persist the UNPAID melt quote + reserve proofs. Returns the
+    /// handle the view uses to drive `executeMeltQuote` then the poll
+    /// loop. Does NOT refresh accounts here — the debit isn't final
+    /// until the melt settles (PAID); `pollMeltQuote` refreshes on the
+    /// terminal transition.
+    func createMeltQuote(
+        bolt11: String,
+        accountId: String? = nil,
+        currency: String? = nil
+    ) async -> MeltCreateOutcome {
+        do {
+            let handle = try await wallet.createMeltQuote(
+                bolt11: bolt11,
+                accountId: accountId,
+                currency: currency
+            )
+            return .success(handle)
+        } catch let err as FfiError {
+            return .failure(ffiErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
+    /// Fire NUT-05 `post_melt` for a created quote (UNPAID → PENDING).
+    /// One mint round-trip — returns a terminal snapshot (PAID/FAILED)
+    /// or PENDING (the view then drives `pollMeltQuote`). Refreshes
+    /// accounts on the PAID transition so Home reflects the debit
+    /// without a pull-to-refresh.
+    func executeMeltQuote(quoteId: String) async -> MeltStatusOutcome {
+        do {
+            let snapshot = try await wallet.executeMeltQuote(quoteId: quoteId)
+            if snapshot.state == .paid {
+                await refreshAccounts()
+            }
+            return .state(snapshot.state, snapshot: snapshot)
+        } catch let err as FfiError {
+            return .failure(ffiErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
+    /// Single-shot poll for a PENDING melt quote. Called from a
+    /// long-running `Task` in the Lightning-send view every ~2s while
+    /// the payment is in flight. The view owns cadence + the
+    /// cancel-on-disappear lifecycle so this stays a pure shot.
+    /// Refreshes accounts on the PAID transition.
+    func pollMeltQuote(quoteId: String) async -> MeltStatusOutcome {
+        do {
+            let snapshot = try await wallet.pollMeltQuote(quoteId: quoteId)
+            if snapshot.state == .paid {
+                await refreshAccounts()
+            }
+            return .state(snapshot.state, snapshot: snapshot)
+        } catch let err as FfiError {
+            return .failure(ffiErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
+    // MARK: - Lightning Address (LUD-16) resolution
+
+    /// Outcome for the LN-address → bolt11 resolve step. Success
+    /// carries the resolved invoice string the view feeds straight
+    /// into the melt flow (`prepareMeltQuote`). Failure carries a
+    /// presentation-ready string. The LUD-16 FFI is wallet-agnostic
+    /// (module-level free functions) so this just adapts its error
+    /// shape to the same string convention the rest of the VM uses.
+    enum LnAddressInvoiceOutcome {
+        case success(invoice: String, amountSats: UInt64)
+        case failure(String)
+    }
+
+    /// Resolve a Lightning Address and request a BOLT-11 invoice for
+    /// `amountSats`. Two network round-trips (well-known lookup, then
+    /// the LUD-06 callback) wrapped behind one call so the view's
+    /// state machine stays simple. `amountSats` is bounds-checked
+    /// against the server's advertised min/max on the Rust side; the
+    /// `AmountOutOfRange` case is surfaced with its sat bounds so the
+    /// view can render "minimum N sats".
+    func resolveLnAddressInvoice(
+        address: String,
+        amountSats: UInt64,
+        comment: String? = nil
+    ) async -> LnAddressInvoiceOutcome {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !trimmed.isEmpty else {
+            return .failure("Enter a Lightning Address first.")
+        }
+        do {
+            let info = try await resolveLightningAddress(address: trimmed)
+            let invoice = try await requestLightningInvoice(
+                info: info,
+                amountMsat: amountSats * 1000,
+                comment: comment
+            )
+            return .success(invoice: invoice, amountSats: amountSats)
+        } catch let err as LightningAddressError {
+            return .failure(lnAddressErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
+    /// Map the LUD-16 FFI error enum to a user-readable string. Mirrors
+    /// the per-variant UI guidance documented on the Rust
+    /// `LightningAddressError` (so the copy stays consistent with the
+    /// FFI's own doc contract). `amountOutOfRange` renders the sat
+    /// bounds (msat / 1000) inline.
+    private func lnAddressErrorMessage(_ err: LightningAddressError) -> String {
+        switch err {
+        case .InvalidAddress:
+            return "That doesn't look like a Lightning Address."
+        case .Network:
+            return "Couldn't reach the recipient's server. Try again."
+        case .InvalidResponse:
+            return "The recipient's server returned an unexpected response."
+        case .AmountOutOfRange(let amountMsat, let min, let max):
+            _ = amountMsat
+            return "Amount must be between \(min / 1000) and \(max / 1000) sats."
+        case .ServerError(let message):
+            return message
+        }
+    }
+
     func refreshAccounts() async {
         if isDemoMode { return }
         do {

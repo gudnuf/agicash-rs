@@ -2,12 +2,12 @@ import SwiftUI
 
 /// Top-level Send surface. Presented as a `.sheet` from `HomeView`,
 /// hosts a three-tab swipeable carousel: Cashu (token), Lightning
-/// (placeholder), Lightning Address (placeholder).
+/// (BOLT-11 melt), Lightning Address (LUD-16 → melt).
 ///
 /// Sibling of `ReceiveCarouselView` — same `TabView` +
 /// `.tabViewStyle(.page(indexDisplayMode: .never))` pattern, same
-/// custom bottom indicator bar. The default tab is `.cashu` since
-/// it's the only real surface in this pass.
+/// custom bottom indicator bar. The default tab is `.cashu`; all
+/// three tabs are live surfaces.
 struct SendCarouselView: View {
     @Bindable var model: WalletViewModel
     /// Tab the carousel opens on. Defaults to `.cashu` — the only
@@ -38,11 +38,17 @@ struct SendCarouselView: View {
                     )
                     .tag(SendTab.cashu)
 
-                    LightningSendPlaceholderView()
-                        .tag(SendTab.lightning)
+                    LightningSendPlaceholderView(
+                        model: model,
+                        onDismissCarousel: onDismiss
+                    )
+                    .tag(SendTab.lightning)
 
-                    LightningAddressSendPlaceholderView()
-                        .tag(SendTab.lightningAddress)
+                    LightningAddressSendPlaceholderView(
+                        model: model,
+                        onDismissCarousel: onDismiss
+                    )
+                    .tag(SendTab.lightningAddress)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
                 .background(Color.brandBackground)
