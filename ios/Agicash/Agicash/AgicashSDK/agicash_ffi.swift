@@ -414,7 +414,13 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -966,6 +972,34 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func startMintQuote(amount: UInt64, accountId: String?, currency: String?) async throws  -> MintQuoteHandle
+    
+    /**
+     * Start the realtime wallet-event subscription for the
+     * currently-logged-in user. Joins `realtime:wallet:<userId>` and
+     * forwards every DB broadcast + (re)connect signal to `listener`.
+     * This replaces the platform Tier-1 balance pollers (the
+     * `on_connected` callback is the no-replay catch-up trigger, spec
+     * §5.5; `on_event` carries the opaque `(event, payload_json)` the
+     * caller demuxes).
+     *
+     * The supervisor runs on a tokio task; the user JWT comes from the
+     * **same** `OpenSecretTokenProvider` the wallet builds for storage
+     * (`new`, wrapped through `TokenProviderJwtSource`), so the
+     * realtime `access_token` rotates with the rest of the session. A
+     * prior subscription (if any) is replaced + aborted.
+     *
+     * Errors with `FfiError::Auth { UNAUTHENTICATED }` if no session is
+     * loaded (there is no user id to scope the channel to).
+     */
+    func startWalletEvents(listener: WalletEventListener) async throws 
+    
+    /**
+     * Stop the realtime subscription: `phx_leave` + close the socket
+     * (clean), then abort the supervisor task. Idempotent — calling it
+     * with nothing running is a no-op (the platform calls it
+     * unconditionally on teardown / sign-out).
+     */
+    func stopWalletEvents() async throws 
     
     /**
      * Attempt to rehydrate a previously-stored session from the
@@ -1869,6 +1903,64 @@ open func startMintQuote(amount: UInt64, accountId: String?, currency: String?)a
             completeFunc: ffi_agicash_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMintQuoteHandle_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Start the realtime wallet-event subscription for the
+     * currently-logged-in user. Joins `realtime:wallet:<userId>` and
+     * forwards every DB broadcast + (re)connect signal to `listener`.
+     * This replaces the platform Tier-1 balance pollers (the
+     * `on_connected` callback is the no-replay catch-up trigger, spec
+     * §5.5; `on_event` carries the opaque `(event, payload_json)` the
+     * caller demuxes).
+     *
+     * The supervisor runs on a tokio task; the user JWT comes from the
+     * **same** `OpenSecretTokenProvider` the wallet builds for storage
+     * (`new`, wrapped through `TokenProviderJwtSource`), so the
+     * realtime `access_token` rotates with the rest of the session. A
+     * prior subscription (if any) is replaced + aborted.
+     *
+     * Errors with `FfiError::Auth { UNAUTHENTICATED }` if no session is
+     * loaded (there is no user id to scope the channel to).
+     */
+open func startWalletEvents(listener: WalletEventListener)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_start_wallet_events(
+                    self.uniffiCloneHandle(),
+                    FfiConverterCallbackInterfaceWalletEventListener_lower(listener)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_void,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_void,
+            freeFunc: ffi_agicash_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * Stop the realtime subscription: `phx_leave` + close the socket
+     * (clean), then abort the supervisor task. Idempotent — calling it
+     * with nothing running is a no-op (the platform calls it
+     * unconditionally on teardown / sign-out).
+     */
+open func stopWalletEvents()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_stop_wallet_events(
+                    self.uniffiCloneHandle()
+                    
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_void,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_void,
+            freeFunc: ffi_agicash_ffi_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
@@ -4705,6 +4797,124 @@ public func FfiConverterTypeMintQuoteFfiState_lower(_ value: MintQuoteFfiState) 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Lifecycle status forwarded for UI (spinner / "reconnecting" banner).
+ * 1:1 with `agicash_realtime::RealtimeStatus` — the [`From`] impl below
+ * is exhaustive over all six variants so a new realtime status can't
+ * silently drop on the FFI floor.
+ */
+
+public enum RealtimeStatusFfi: Equatable, Hashable {
+    
+    /**
+     * No subscription yet (pre-`start_wallet_events`).
+     */
+    case idle
+    /**
+     * Socket opening / channel join in flight.
+     */
+    case connecting
+    /**
+     * Channel joined; broadcasts flowing.
+     */
+    case subscribed
+    /**
+     * Lost the channel, backing off before the next attempt.
+     */
+    case reconnecting
+    /**
+     * A non-recoverable error path was hit (still followed by reconnect
+     * attempts unless `stop_wallet_events` was called).
+     */
+    case error
+    /**
+     * `stop_wallet_events` left the channel and closed the socket.
+     */
+    case closed
+
+
+
+}
+
+#if compiler(>=6)
+extension RealtimeStatusFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRealtimeStatusFfi: FfiConverterRustBuffer {
+    typealias SwiftType = RealtimeStatusFfi
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RealtimeStatusFfi {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .idle
+        
+        case 2: return .connecting
+        
+        case 3: return .subscribed
+        
+        case 4: return .reconnecting
+        
+        case 5: return .error
+        
+        case 6: return .closed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RealtimeStatusFfi, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .idle:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .subscribed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .reconnecting:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .error:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .closed:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRealtimeStatusFfi_lift(_ buf: RustBuffer) throws -> RealtimeStatusFfi {
+    return try FfiConverterTypeRealtimeStatusFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRealtimeStatusFfi_lower(_ value: RealtimeStatusFfi) -> RustBuffer {
+    return FfiConverterTypeRealtimeStatusFfi.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * FFI mirror of [`agicash_cashu::ReceiveFlowEvent`].
  */
 
@@ -5197,6 +5407,238 @@ public func FfiConverterTypeSendSwapClaimState_lower(_ value: SendSwapClaimState
 }
 
 
+
+
+
+/**
+ * Implemented on the Swift/Kotlin side; the wallet calls these on
+ * realtime activity. Registered via
+ * [`crate::AgicashWallet::start_wallet_events`] and dropped (with the
+ * supervisor task aborted) by
+ * [`crate::AgicashWallet::stop_wallet_events`].
+ *
+ * All four methods are invoked from the realtime supervisor's tokio
+ * task — never from the calling thread — so the foreign implementation
+ * must be thread-safe. UniFFI enforces `Send + Sync` on the boxed
+ * foreign object; the bridge additionally never re-enters the listener
+ * (each callback is a fire-and-forget notification, not a request).
+ */
+public protocol WalletEventListener: AnyObject, Sendable {
+    
+    /**
+     * Channel (re)connected & joined. The platform MUST refetch wallet
+     * + balance state — there is no replay; this is the catch-up hook
+     * that replaces the deleted Tier-1 pollers.
+     */
+    func onConnected() 
+    
+    /**
+     * A DB-originated broadcast. `event` ∈ {ACCOUNT_CREATED,
+     * ACCOUNT_UPDATED, TRANSACTION_CREATED, TRANSACTION_UPDATED,
+     * CASHU_RECEIVE_QUOTE_*, ...}. `payload_json` is the raw jsonb the
+     * trigger sent (opaque to transport; parsed by the caller).
+     */
+    func onEvent(event: String, payloadJson: String) 
+    
+    /**
+     * Status transitions for UI affordances.
+     */
+    func onStatus(status: RealtimeStatusFfi) 
+    
+    /**
+     * Non-fatal/observability error string.
+     */
+    func onError(message: String) 
+    
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceWalletEventListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // This creates 1-element array, since this seems to be the only way to construct a const
+    // pointer that we can pass to the Rust code.
+    static let vtable: [UniffiVTableCallbackInterfaceWalletEventListener] = [UniffiVTableCallbackInterfaceWalletEventListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceWalletEventListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface WalletEventListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceWalletEventListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface WalletEventListener: handle missing in uniffiClone")
+            }
+        },
+        onConnected: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onConnected(
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onEvent: { (
+            uniffiHandle: UInt64,
+            event: RustBuffer,
+            payloadJson: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onEvent(
+                     event: try FfiConverterString.lift(event),
+                     payloadJson: try FfiConverterString.lift(payloadJson)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onStatus: { (
+            uniffiHandle: UInt64,
+            status: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onStatus(
+                     status: try FfiConverterTypeRealtimeStatusFfi_lift(status)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onError: { (
+            uniffiHandle: UInt64,
+            message: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onError(
+                     message: try FfiConverterString.lift(message)
+                )
+            }
+
+            
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )]
+}
+
+private func uniffiCallbackInitWalletEventListener() {
+    uniffi_agicash_ffi_fn_init_callback_vtable_walleteventlistener(UniffiCallbackInterfaceWalletEventListener.vtable)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceWalletEventListener {
+    fileprivate static let handleMap = UniffiHandleMap<WalletEventListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceWalletEventListener : FfiConverter {
+    typealias SwiftType = WalletEventListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceWalletEventListener_lift(_ handle: UInt64) throws -> WalletEventListener {
+    return try FfiConverterCallbackInterfaceWalletEventListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceWalletEventListener_lower(_ v: WalletEventListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceWalletEventListener.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -5534,6 +5976,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_start_mint_quote() != 60988) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_start_wallet_events() != 57713) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_stop_wallet_events() != 53162) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_try_restore_session() != 65288) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5546,7 +5994,20 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_constructor_agicashwallet_new() != 44726) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_connected() != 385) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_event() != 39256) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_status() != 9782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_error() != 44003) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitWalletEventListener()
     return InitializationResult.ok
 }()
 
