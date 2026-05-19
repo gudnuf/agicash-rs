@@ -42,6 +42,7 @@ result-*
 
 # Rust
 /target
+/target-devsim
 /crates/target
 /crates/**/pkg
 # Per-machine cargo cache config (shared CARGO_TARGET_DIR + sccache wrapper).
@@ -56,6 +57,8 @@ result-*
 /bindings/swift/rust/target
 /bindings/swift/build
 /bindings/swift/Sources
+# dev-sim stamps (xcframework / xcodeproj / .app input-hash markers)
+/bindings/swift/.dev-sim
 /ios/**/build
 /ios/**/*.xcodeproj
 /ios/**/DerivedData

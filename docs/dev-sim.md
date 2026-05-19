@@ -18,9 +18,12 @@ is idempotent — a second invocation with no changes is fast and prints
    `--device "<name>"` or `--udid <udid>`. If the sim is already booted,
    no-op.
 2. **Install the mkcert root CA into the sim trust store.** Idempotency
-   check matches the rootCA's SHA-1 fingerprint against
-   `TrustStore.sqlite3` (the sim's trust store). If present: no-op. If
-   absent: `xcrun simctl keychain <udid> add-root-cert <rootCA.pem>`.
+   check matches the rootCA's SHA-256 fingerprint against the sim's
+   `TrustStore.sqlite3` — modern (Xcode 26 / iOS 26) sims hold it under
+   `data/private/var/protected/trustd/private/`, older layouts under
+   `data/Library/Keychains/` with a `sha1` column. The script probes
+   both paths + both columns. If present: no-op. If absent:
+   `xcrun simctl keychain <udid> add-root-cert <rootCA.pem>`.
    This is the **permanent fix for F12** (`reqwest`/rust-tls couldn't
    validate the local Supabase HTTPS cert because the sim lacked the
    mkcert CA — `NSAllowsArbitraryLoads` only affects URLSession-side

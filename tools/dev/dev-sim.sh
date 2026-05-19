@@ -168,7 +168,11 @@ else
 fi
 
 # ----- 3. build + install ------------------------------------------------
-STAMP_DIR="$ROOT/bindings/swift/build/.dev-sim"
+# NOTE: do NOT put STAMP_DIR under bindings/swift/build/ — generate-bindings.sh
+# `rm -rf $BUILD_DIR` at the start of each xcframework rebuild and would
+# nuke our stamps, defeating idempotency. Use a sibling dir under
+# bindings/swift/ that the build script doesn't touch.
+STAMP_DIR="$ROOT/bindings/swift/.dev-sim"
 mkdir -p "$STAMP_DIR"
 XCFRAMEWORK="$ROOT/bindings/swift/build/xcframework/agicash_ffiFFI.xcframework"
 APP_TRACKED_SWIFT="$ROOT/ios/Agicash/Agicash/AgicashSDK/agicash_ffi.swift"
