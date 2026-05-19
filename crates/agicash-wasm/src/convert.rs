@@ -62,6 +62,33 @@ pub fn wallet_error_to_js(e: WalletError) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
+/// Minor-unit label for a currency. `"sat"` for BTC, `"cent"` for
+/// USD/USDB — verbatim `ffi::convert::unit_label`.
+#[must_use]
+fn unit_label(c: Currency) -> &'static str {
+    match c {
+        Currency::Btc => "sat",
+        Currency::Usd | Currency::Usdb => "cent",
+    }
+}
+
+/// Facade `AccountSummary` → `AccountWasm`. Mirror of
+/// `ffi::convert::account_ffi_from_summary`: stringified id,
+/// `account_type`/`currency` Display labels, `mint_url` passthrough,
+/// decimal balance, currency-derived unit label.
+#[must_use]
+pub fn account_wasm_from_summary(s: &agicash_wallet::AccountSummary) -> crate::types::AccountWasm {
+    crate::types::AccountWasm {
+        id: s.id.to_string(),
+        name: s.name.clone(),
+        account_type: s.account_type.to_string(),
+        currency: s.currency.to_string(),
+        mint_url: s.mint_url.clone(),
+        balance: s.balance.clone(),
+        unit: unit_label(s.currency).to_string(),
+    }
+}
+
 /// Facade `Session` → `SessionWasm`. Mirror of
 /// `ffi::convert::session_from_facade`.
 #[must_use]
@@ -117,6 +144,34 @@ mod tests {
     fn wallet_error_message_preserved() {
         let js = wallet_error_to_js(WalletError::Cashu("boom".into()));
         assert!(js.as_string().unwrap().contains("boom"));
+    }
+
+    #[wasm_bindgen_test]
+    fn account_wasm_from_summary_maps_all_fields_and_derives_unit() {
+        let id = Uuid::new_v4();
+        let summary = agicash_wallet::AccountSummary {
+            id: AccountId::from(id),
+            user_id: agicash_domain::UserId::from(Uuid::new_v4()),
+            name: "My Mint".into(),
+            account_type: agicash_domain::AccountType::Cashu,
+            currency: Currency::Btc,
+            mint_url: Some("https://mint.example".into()),
+            balance: "1234".into(),
+        };
+        let w = account_wasm_from_summary(&summary);
+        assert_eq!(w.id, id.to_string());
+        assert_eq!(w.name, "My Mint");
+        assert_eq!(w.account_type, "cashu");
+        assert_eq!(w.currency, "BTC");
+        assert_eq!(w.mint_url, Some("https://mint.example".to_string()));
+        assert_eq!(w.balance, "1234");
+        assert_eq!(w.unit, "sat");
+
+        let usd = agicash_wallet::AccountSummary {
+            currency: Currency::Usd,
+            ..summary
+        };
+        assert_eq!(account_wasm_from_summary(&usd).unit, "cent");
     }
 
     #[wasm_bindgen_test]

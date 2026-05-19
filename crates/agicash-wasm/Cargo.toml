@@ -22,6 +22,7 @@ agicash-domain = { path = "../agicash-domain" }
 agicash-money = { path = "../agicash-money" }
 agicash-traits = { path = "../agicash-traits" }
 wasm-bindgen-futures = { workspace = true }
+serde = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
 rust_decimal = { workspace = true }

@@ -7,6 +7,7 @@
 //! in `convert.rs`). NOT uniffi — a parallel wasm-bindgen shell.
 #![cfg(target_arch = "wasm32")]
 
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 /// Mirror of FFI `session::Session`. Facade `Session.user_id` is
@@ -28,6 +29,30 @@ pub struct AuthStatusWasm {
     pub logged_in: bool,
     #[wasm_bindgen(getter_with_clone)]
     pub user_id: Option<String>,
+}
+
+/// Mirror of FFI `account::AccountFfi`. Returned as a JSON array
+/// element via `serde_wasm_bindgen::to_value` (wasm-bindgen cannot
+/// return `Vec<Struct>` directly — the standard idiom, not an
+/// invention). Derives `Serialize` *in addition to* `#[wasm_bindgen]`
+/// for the Vec case. Field set + types verbatim the FFI record.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Serialize)]
+pub struct AccountWasm {
+    #[wasm_bindgen(getter_with_clone)]
+    pub id: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub name: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub account_type: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub currency: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub mint_url: Option<String>,
+    #[wasm_bindgen(getter_with_clone)]
+    pub balance: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub unit: String,
 }
 
 #[cfg(test)]

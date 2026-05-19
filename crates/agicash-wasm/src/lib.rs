@@ -108,6 +108,26 @@ mod wasm_impl {
                 .map_err(crate::convert::wallet_error_to_js)
         }
 
+        /// List the logged-in user's accounts. Pure delegate to
+        /// `WalletClient::list_accounts` (mirrors FFI 7.1). Returns a
+        /// JSON array of `AccountWasm` via `serde_wasm_bindgen::to_value`
+        /// (wasm-bindgen cannot return `Vec<Struct>` directly — the
+        /// standard idiom; the FFI returns `Vec<AccountFfi>`).
+        #[wasm_bindgen(js_name = listAccounts)]
+        pub async fn list_accounts(&self) -> Result<JsValue, JsValue> {
+            let accounts = self
+                .client
+                .list_accounts()
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            let mapped: Vec<crate::types::AccountWasm> = accounts
+                .iter()
+                .map(crate::convert::account_wasm_from_summary)
+                .collect();
+            serde_wasm_bindgen::to_value(&mapped)
+                .map_err(|e| JsValue::from_str(&format!("serialize accounts: {e}")))
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]
