@@ -1,4 +1,16 @@
-use crate::composition::{AuthDeps, StorageDeps};
+//! `account` subcommands.
+//!
+//! `account list` emits the raw `wallet.accounts` rows and `account
+//! default` calls `update_user_defaults` — neither is on the
+//! `WalletClient` facade surface (the facade's `set_default_account` is
+//! `Unsupported` in slice 12 and `list_accounts` returns the reshaped
+//! `AccountSummary`, not the raw row). Both run against the
+//! shell-resident `UserStorage` handle the composition root builds from
+//! the SAME endpoint config as the facade — there is no second
+//! composition of the network stack. Behavior + stdout JSON are
+//! byte-for-byte the pre-migration contract.
+
+use crate::composition::CliDeps;
 use agicash_domain::{AccountId, Currency, UserId};
 use agicash_traits::{AuthError, StorageError, UpdateUserDefaults, UserStorage};
 use uuid::Uuid;
@@ -19,14 +31,14 @@ pub enum AccountCmdError {
     Storage(#[from] StorageError),
 }
 
-pub async fn cmd_list(auth: &AuthDeps, storage: &StorageDeps) -> Result<(), AccountCmdError> {
-    let session = auth
-        .storage
+pub async fn cmd_list(deps: &CliDeps) -> Result<(), AccountCmdError> {
+    let session = deps
+        .keyring
         .load()
         .await?
         .ok_or(AccountCmdError::NotLoggedIn)?;
     let user_id = UserId::from(session.user_id);
-    let accounts = storage.storage.list_accounts(user_id).await?;
+    let accounts = deps.user_storage.list_accounts(user_id).await?;
     println!(
         "{}",
         serde_json::to_string(&accounts).expect("serialize accounts")
@@ -34,13 +46,9 @@ pub async fn cmd_list(auth: &AuthDeps, storage: &StorageDeps) -> Result<(), Acco
     Ok(())
 }
 
-pub async fn cmd_set_default(
-    auth: &AuthDeps,
-    storage: &StorageDeps,
-    id_str: &str,
-) -> Result<(), AccountCmdError> {
-    let session = auth
-        .storage
+pub async fn cmd_set_default(deps: &CliDeps, id_str: &str) -> Result<(), AccountCmdError> {
+    let session = deps
+        .keyring
         .load()
         .await?
         .ok_or(AccountCmdError::NotLoggedIn)?;
@@ -50,7 +58,7 @@ pub async fn cmd_set_default(
     let account_id = AccountId::from(parsed);
 
     // Look up the account to figure out which per-currency slot to set.
-    let accounts = storage.storage.list_accounts(user_id).await?;
+    let accounts = deps.user_storage.list_accounts(user_id).await?;
     let account = accounts
         .into_iter()
         .find(|a| a.id == account_id)
@@ -68,7 +76,10 @@ pub async fn cmd_set_default(
         other @ Currency::Usdb => return Err(AccountCmdError::UnsupportedCurrency(other)),
     };
 
-    let user = storage.storage.update_user_defaults(user_id, patch).await?;
+    let user = deps
+        .user_storage
+        .update_user_defaults(user_id, patch)
+        .await?;
     println!("{}", serde_json::to_string(&user).expect("serialize user"));
     Ok(())
 }
