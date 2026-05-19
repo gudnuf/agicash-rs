@@ -49,6 +49,12 @@ default = []
 # bindings wrapper enables this on the agicash-ffi dep; iOS + tests leave
 # it off (the cfg-not branch falls back to InMemory).
 android-file-storage = ["agicash-auth-opensecret/android-file-storage"]
+# Tier 2 real-service e2e (tests/tier2_e2e.rs). Opt-in, native/local-only:
+# enables the `agicash-testing` ServiceHarness (real cdk-mintd + real
+# OpenSecret enclave, no docker). Without it tier2_e2e.rs compiles to a
+# single skipped test (mirrors agicash-cashu's `cdk-mint-e2e` gate). NOT a
+# per-PR CI gate — see the plan's CI-viability assessment.
+tier2-e2e = ["agicash-testing/tier2-e2e"]
 
 [dev-dependencies]
 # Tier 1 hermetic suite (tests/tier1_hermetic.rs). `agicash-testing`

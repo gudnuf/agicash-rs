@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -54,15 +54,11 @@ const ENCLAVE_CLIENT_ID: &str = "ba5a14b5-d915-47b1-b7b1-afda52bc5fc6";
 /// future real-Supabase Tier 3 is one seam swap away.
 const JWT_SECRET: &str = "super-secret-jwt-token-with-at-least-32-characters-long";
 
-/// Per-process listen-port allocator so a future parallel run can't
-/// collide on the cdk-mintd port. Tier 2 tests still run
-/// `--test-threads=1` (the spawned mint binds a fixed port per process);
-/// this base is the `scripts/cdk-mint-e2e.sh` default.
-static MINT_PORT: AtomicU16 = AtomicU16::new(8087);
+/// Monotonic counter making each real-proof fund derive a unique NUT-13
+/// seed, so blinded messages never collide across funds against the
+/// shared mint (a replayed blinded message is rejected by the real mint).
+static FUND_SEED_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn next_mint_port() -> u16 {
-    MINT_PORT.fetch_add(1, Ordering::SeqCst)
-}
 
 // ---------------------------------------------------------------------------
 // MintProcess — Task 4
@@ -97,17 +93,60 @@ impl std::fmt::Debug for MintProcess {
 }
 
 impl MintProcess {
-    /// Resolve the cached `cdk-mintd`, write the `FakeWallet` config into a
-    /// fresh tempdir, spawn it, and poll `GET {url}/v1/info` until 200
-    /// (≤60 × 0.5 s). Errors clearly if the binary isn't cached (does NOT
-    /// auto-`cargo install` inside a test — too slow/networked; the
-    /// operator runs `bash scripts/cdk-mint-e2e.sh start` once).
+    /// **Probe-first**, mirroring the proven `scripts/cdk-mint-e2e.sh`
+    /// `is_up()` reuse model + the enclave attach-or-spawn pattern: if a
+    /// cdk-mintd already answers `GET http://127.0.0.1:<port>/v1/info`
+    /// 200 (the fixed `cdk-mint-e2e.sh` default port 8087, or
+    /// `$CDK_MINT_PORT`), ATTACH to it — do NOT spawn, do NOT kill on
+    /// drop (it is a standing reusable service; this also prevents
+    /// process accumulation when the shared singleton is held in a
+    /// never-dropped `static`). Otherwise resolve the cached binary,
+    /// write the script's exact `FakeWallet` TOML into a tempdir, spawn,
+    /// and poll readiness. Errors clearly if the binary isn't cached
+    /// (does NOT auto-`cargo install` inside a test — the operator runs
+    /// `bash scripts/cdk-mint-e2e.sh start` once).
     pub async fn start() -> Result<Self, String> {
-        let bin = resolve_cdk_mintd_bin()?;
-        let port = next_mint_port();
         let listen_host = "127.0.0.1";
+        // Fixed port = the proven `cdk-mint-e2e.sh` default (overridable),
+        // so re-runs reuse a standing mint instead of accumulating one
+        // per run on an ever-incrementing port.
+        let port: u16 = std::env::var("CDK_MINT_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8087);
         let url = format!("http://{listen_host}:{port}");
+        let info_url = format!("{url}/v1/info");
 
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| format!("MintProcess: reqwest client build failed: {e}"))?;
+
+        // Probe-first: attach to a healthy standing mint (fast path,
+        // never killed — the standing-service reuse model).
+        if let Ok(resp) = http.get(&info_url).send().await {
+            if resp.status().is_success() {
+                eprintln!(
+                    "[harness] cdk-mintd: ATTACHED to standing {url} \
+                     (/v1/info 200) — reuse fast path, will NOT be killed"
+                );
+                // A throwaway tempdir keeps the field type uniform; it is
+                // unused (we attached, not spawned) and auto-cleans.
+                let state_dir = tempfile::tempdir().map_err(|e| {
+                    format!("MintProcess: tempdir (attach placeholder): {e}")
+                })?;
+                let state_dir_path = state_dir.path().to_path_buf();
+                return Ok(Self {
+                    child: None, // attached → Drop must NOT kill it
+                    url,
+                    _state_dir: state_dir,
+                    state_dir_path,
+                });
+            }
+        }
+
+        // Cold spawn.
+        let bin = resolve_cdk_mintd_bin()?;
         let state_dir = tempfile::tempdir()
             .map_err(|e| format!("MintProcess: tempdir for cdk-mintd state failed: {e}"))?;
         let state_dir_path = state_dir.path().to_path_buf();
@@ -139,19 +178,15 @@ impl MintProcess {
             state_dir_path,
         };
 
-        // Readiness: GET {url}/v1/info → 200, ≤60 × 0.5 s (same window as
-        // the shell script's `is_up` loop).
-        let info_url = format!("{url}/v1/info");
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .map_err(|e| format!("MintProcess: reqwest client build failed: {e}"))?;
-        for attempt in 0..60u32 {
+        // Readiness: GET {url}/v1/info → 200. A cold sqlite create +
+        // keyset generation can exceed the shell script's 30s window on a
+        // loaded host; widen to ≤120 × 0.5 s (60s).
+        for attempt in 0..120u32 {
             if let Ok(resp) = http.get(&info_url).send().await {
                 if resp.status().is_success() {
                     eprintln!(
-                        "[harness] cdk-mintd: READY at {url} (/v1/info 200 after \
-                         {} probe(s))",
+                        "[harness] cdk-mintd: SPAWNED + READY at {url} \
+                         (/v1/info 200 after {} probe(s))",
                         attempt + 1
                     );
                     return Ok(this);
@@ -160,7 +195,7 @@ impl MintProcess {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         Err(format!(
-            "MintProcess: cdk-mintd at {url} did not answer /v1/info 200 within 30s"
+            "MintProcess: cdk-mintd at {url} did not answer /v1/info 200 within 60s"
         ))
     }
 
@@ -174,12 +209,22 @@ impl MintProcess {
 
 impl Drop for MintProcess {
     fn drop(&mut self) {
-        // kill_on_drop handles the tokio child; belt-and-suspenders
-        // pkill matches the shell script's teardown (covers a
-        // re-exec'd grandchild). The TempDir auto-cleans the sqlite db.
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-        }
+        // ATTACHED (child: None) → a standing reusable mint; NEVER kill
+        // it (mirrors the enclave attach contract + the shell script's
+        // reuse model). Only tear down a mint THIS handle spawned.
+        let Some(mut child) = self.child.take() else {
+            eprintln!(
+                "[harness] cdk-mintd: leaving ATTACHED standing instance {} \
+                 running (not harness-owned)",
+                self.url
+            );
+            return;
+        };
+        // kill_on_drop handles the tokio child; belt-and-suspenders pkill
+        // scoped to THIS handle's tempdir matches the shell script's
+        // teardown (covers a re-exec'd grandchild). The TempDir
+        // auto-cleans the sqlite db.
+        let _ = child.start_kill();
         let pat = format!("cdk-mintd -w {}", self.state_dir_path.display());
         let _ = std::process::Command::new("pkill")
             .arg("-f")
@@ -514,52 +559,94 @@ fn home_path(sub: &str) -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------
-// ServiceHarness — Task 5
+// Shared long-lived services (one mint + one enclave per test BINARY) —
+// Task 5
 // ---------------------------------------------------------------------------
 
-/// The RAII Tier 2 fixture. `up()` brings the real services online
-/// (assert pg → enclave attach/spawn → seed JWT → spawn cdk-mintd) and
-/// composes a real `Arc<WalletClient>` (real `OpenSecret` auth + real
-/// `CdkCashuProvider` against the spawned mint + in-memory storage).
-///
-/// Field drop order matters: `wallet` first (drops the `Arc`s), then the
-/// processes. `MintProcess`/`EnclaveProcess` own their own RAII teardown
-/// (mint always killed; enclave killed ONLY if cold-spawned, never if
-/// attached).
-#[derive(Debug)]
-pub struct ServiceHarness {
-    /// The composed real wallet + owned in-memory stores for assertions.
-    wallet: super::wallet::RealWallet,
+/// The long-lived processes, brought up ONCE per test binary and reused
+/// by every `ServiceHarness::up()`. This mirrors the proven
+/// `scripts/cdk-mint-e2e.sh` model (one mint, reused — `is_up()` short-
+/// circuits a respawn) and the enclave attach-once fast path. Respawning
+/// `cdk-mintd` per test was both slow (cold sqlite + keyset gen) and
+/// flaky (port-release lag); a single shared mint is deterministic
+/// (fixed mnemonic → stable keysets) and matches production's
+/// one-mint-many-flows shape.
+struct SharedServices {
     mint: MintProcess,
+    // `EnclaveProcess` carries the attach/cold disposition + (only when
+    // cold-spawned) the child to tear down at binary exit.
     enclave: EnclaveProcess,
 }
 
+// Held for the lifetime of the test binary. `tokio::sync::OnceCell`
+// because bring-up is async (probes/seed/spawn). The processes' `Drop`
+// runs at process exit (the cell is never cleared) — mint killed, an
+// attached enclave deliberately left running.
+static SHARED: tokio::sync::OnceCell<SharedServices> = tokio::sync::OnceCell::const_new();
+
+async fn shared_services() -> Result<&'static SharedServices, String> {
+    SHARED
+        .get_or_try_init(|| async {
+            // Order per the plan: assert pg (inside enclave.up) → enclave
+            // (attach/spawn) → seed JWT (idempotent) → spawn the single
+            // shared cdk-mintd.
+            let enclave = EnclaveProcess::up().await?;
+            seed_jwt_secret().await?;
+            let mint = MintProcess::start().await?;
+            eprintln!(
+                "[harness] SHARED services UP (once per test binary) — \
+                 enclave={:?} mint={} (no docker invoked)",
+                enclave.disposition(),
+                mint.url()
+            );
+            Ok(SharedServices { mint, enclave })
+        })
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// ServiceHarness — Task 5
+// ---------------------------------------------------------------------------
+
+/// The Tier 2 fixture. `up()` is cheap: it lazily brings the long-lived
+/// real services online ONCE per test binary (assert pg → enclave
+/// attach/spawn → seed JWT → spawn one cdk-mintd) and then, per call,
+/// composes a **fresh** real `Arc<WalletClient>` — a fresh
+/// `OpenSecretAuthClient` (so each test does its own real guest-auth /
+/// JWT chain) over fresh in-memory storages, pointed at the shared real
+/// mint. The shared processes live until process exit; only the
+/// per-test `RealWallet` is dropped between tests.
+///
+/// Run Tier 2 tests `--test-threads=1` (mirrors the existing
+/// `cdk_mint_money_flows` gate; the shared mint binds a fixed port).
+#[derive(Debug)]
+pub struct ServiceHarness {
+    /// A fresh composed real wallet + its owned in-memory stores.
+    wallet: super::wallet::RealWallet,
+    mint_url: String,
+    enclave_disposition: EnclaveDisposition,
+}
+
 impl ServiceHarness {
-    /// Bring everything up and compose the real wallet. Run Tier 2 tests
-    /// `--test-threads=1` (the spawned mint binds a fixed port per
-    /// process; mirrors the existing `cdk_mint_money_flows` gate).
+    /// Get (or lazily bring up once) the shared real services, then
+    /// compose a fresh real wallet for this test.
     pub async fn up() -> Result<Self, String> {
-        // Order per the plan: assert pg (inside enclave.up) → enclave
-        // (attach/spawn) → seed JWT → mint.
-        let enclave = EnclaveProcess::up().await?;
-        seed_jwt_secret().await?;
-        let mint = MintProcess::start().await?;
-
+        let shared = shared_services().await?;
         let wallet = super::wallet::RealWallet::compose(
-            enclave.url(),
+            shared.enclave.url(),
             ENCLAVE_CLIENT_ID,
-            mint.url(),
+            shared.mint.url(),
         )?;
-
         eprintln!(
-            "[harness] ServiceHarness UP — enclave={:?} mint={} (no docker invoked)",
-            enclave.disposition(),
-            mint.url()
+            "[harness] ServiceHarness::up — fresh wallet on shared \
+             enclave={:?} mint={} (no docker invoked)",
+            shared.enclave.disposition(),
+            shared.mint.url()
         );
         Ok(Self {
             wallet,
-            mint,
-            enclave,
+            mint_url: shared.mint.url().to_string(),
+            enclave_disposition: shared.enclave.disposition(),
         })
     }
 
@@ -570,15 +657,244 @@ impl ServiceHarness {
         &self.wallet
     }
 
-    /// The spawned mint's base URL (use as the account `mint_url`).
+    /// The shared mint's base URL (use as the account `mint_url`).
     #[must_use]
     pub fn mint_url(&self) -> &str {
-        self.mint.url()
+        &self.mint_url
     }
 
     /// Whether the enclave was attached (fast) or cold-spawned (slow).
     #[must_use]
     pub fn enclave_disposition(&self) -> EnclaveDisposition {
-        self.enclave.disposition()
+        self.enclave_disposition
     }
+
+    /// Mint `amount` sat of **genuinely real** proofs from the shared
+    /// real mint (real NUT-04 mint-quote → `FakeWallet` auto-settles →
+    /// real `post_mint` → real `construct_proofs` crypto) and fund the
+    /// account's in-memory send storage with them.
+    ///
+    /// WHY a helper and not the `WalletClient::complete_receive_lightning`
+    /// facade path: the four in-memory fake storages are **independent**
+    /// (the declared Tier 2 fake seam — the docker-wedge constraint). In
+    /// the real Supabase backend they are views over one unified
+    /// `wallet.cashu_*` schema, so a NUT-04-minted proof is spendable by
+    /// `send_token`/`balance`; the in-memory fakes do NOT cross-populate
+    /// (mint-quote storage ≠ send storage). Funding the **send** storage
+    /// (which `compute_cashu_balance`/`send_token`/`begin_send_lightning`
+    /// read) with proofs minted by the **real** protocol against the
+    /// **real** mint keeps every cryptographic + wire link real; only the
+    /// proofs' placement uses the storage seam that is fake by design.
+    /// The real NUT-04 *facade* path is still asserted directly by
+    /// `lightning_mint_quote_receive_credits_balance` /
+    /// `add_mint_then_token_send_receive_round_trips` via
+    /// `quote/poll/complete_receive_lightning`.
+    pub async fn fund_account_with_real_proofs(
+        &self,
+        account: &agicash_domain::Account,
+        amount: u64,
+    ) -> Result<(), String> {
+        let proofs = mint_real_proofs(&self.mint_url, amount).await?;
+        self.wallet
+            .send_storage()
+            .fund_account(account.id, token_proofs(&proofs));
+        Ok(())
+    }
+
+    /// Like [`Self::fund_account_with_real_proofs`] but also returns the
+    /// **real `cdk::Proof`s** that were funded, so a Tier 2 test can
+    /// assert the no-double-pay invariant at the **protocol level**
+    /// (NUT-07 `post_check_state` against the real mint) — the
+    /// storage-independent, hermetic-impossible assertion the proven
+    /// `cdk_mint_money_flows.rs` P0 driver uses, lifted to the facade.
+    pub async fn fund_account_returning_proofs(
+        &self,
+        account: &agicash_domain::Account,
+        amount: u64,
+    ) -> Result<Vec<cdk::nuts::Proof>, String> {
+        let proofs = mint_real_proofs(&self.mint_url, amount).await?;
+        self.wallet
+            .send_storage()
+            .fund_account(account.id, token_proofs(&proofs));
+        Ok(proofs)
+    }
+
+    /// Protocol-level no-double-pay assertion: every one of `proofs` must
+    /// report SPENT at the real mint via NUT-07 `post_check_state`. After
+    /// a melt of these inputs reconciled to PAID, a SPENT result proves
+    /// the Lightning payment happened exactly once and a replay is
+    /// protocol-impossible (the real mint would reject a second
+    /// `post_melt` of spent inputs). Independent of the in-memory storage
+    /// (the fake seam) — it queries the real mint directly.
+    pub async fn assert_all_proofs_spent_at_mint(
+        &self,
+        proofs: &[cdk::nuts::Proof],
+    ) -> Result<(), String> {
+        use std::str::FromStr;
+
+        use cdk::mint_url::MintUrl;
+        use cdk::wallet::{HttpClient, MintConnector};
+
+        let url = MintUrl::from_str(&self.mint_url)
+            .map_err(|e| format!("mint url {}: {e}", self.mint_url))?;
+        let client = HttpClient::new(url, None);
+        let ys = proofs
+            .iter()
+            .map(cdk::nuts::Proof::y)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("proof.y(): {e}"))?;
+        let states = client
+            .post_check_state(cdk::nuts::CheckStateRequest { ys })
+            .await
+            .map_err(|e| format!("post_check_state: {e}"))?;
+        if states
+            .states
+            .iter()
+            .all(|s| s.state == cdk::nuts::State::Spent)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "no-double-pay invariant VIOLATED: not all melt-input \
+                 proofs are SPENT at the mint — states={:?}",
+                states.states.iter().map(|s| s.state).collect::<Vec<_>>()
+            ))
+        }
+    }
+}
+
+/// Map real `cdk::Proof`s into `agicash_cashu::TokenProof`s for
+/// `InMemorySendSwapStorage::fund_account`.
+fn token_proofs(proofs: &[cdk::nuts::Proof]) -> Vec<agicash_cashu::TokenProof> {
+    proofs
+        .iter()
+        .map(|p| agicash_cashu::TokenProof {
+            id: p.keyset_id.to_string(),
+            amount: u64::from(p.amount),
+            secret: p.secret.to_string(),
+            c: p.c.to_hex(),
+            dleq: None,
+            witness: None,
+        })
+        .collect()
+}
+
+/// Mint `amount` sat of real proofs from `mint_url` via a raw
+/// `cdk::wallet::HttpClient` / `MintConnector` — the exact proven
+/// `mint_proofs` recipe from `crates/agicash-cashu/tests/
+/// cdk_mint_money_flows.rs` (real NUT-04 mint-quote, `FakeWallet`
+/// auto-settle, real `post_mint`, real `construct_proofs`). Returns the
+/// real `cdk::Proof`s (map to `TokenProof` via [`token_proofs`] for
+/// `fund_account`; keep the raw form for protocol-level NUT-07 checks).
+async fn mint_real_proofs(
+    mint_url: &str,
+    amount: u64,
+) -> Result<Vec<cdk::nuts::Proof>, String> {
+    use std::str::FromStr;
+
+    use cdk::amount::{FeeAndAmounts, SplitTarget};
+    use cdk::dhke::construct_proofs;
+    use cdk::mint_url::MintUrl;
+    use cdk::nuts::{CurrencyUnit, MintQuoteBolt11Request, MintRequest, PaymentMethod, PreMintSecrets};
+    use cdk::wallet::{HttpClient, MintConnector};
+    use cdk::Amount;
+
+    let url = MintUrl::from_str(mint_url).map_err(|e| format!("mint url {mint_url}: {e}"))?;
+    let client = HttpClient::new(url, None);
+
+    let keysets = client
+        .get_mint_keysets()
+        .await
+        .map_err(|e| format!("get_mint_keysets: {e}"))?;
+    let active = keysets
+        .keysets
+        .iter()
+        .find(|k| k.unit == CurrencyUnit::Sat && k.active)
+        .ok_or("no active sat keyset on the shared mint")?
+        .clone();
+    let keyset_id = active.id;
+
+    let quote = client
+        .post_mint_quote(MintQuoteBolt11Request {
+            amount: Amount::from(amount),
+            unit: CurrencyUnit::Sat,
+            description: Some("agicash tier2 real-proof fund".into()),
+            pubkey: None,
+        })
+        .await
+        .map_err(|e| format!("post_mint_quote: {e}"))?;
+
+    // FakeWallet (min/max_delay_time=0) auto-settles instantly; poll
+    // defensively.
+    let mut paid = false;
+    for _ in 0..40 {
+        let st = client
+            .get_mint_quote_status(&quote.quote.to_string())
+            .await
+            .map_err(|e| format!("get_mint_quote_status: {e}"))?;
+        if matches!(st.state, cdk::nuts::nut23::QuoteState::Paid) {
+            paid = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if !paid {
+        return Err("shared FakeWallet mint did not auto-pay the funding quote".into());
+    }
+
+    // Run-unique seed so blinded messages never collide across funds.
+    let mut seed = [0u8; 64];
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let c = u128::from(FUND_SEED_CTR.fetch_add(1, Ordering::SeqCst));
+        let mut x = n ^ (c << 64) ^ 0x9E37_79B9_7F4A_7C15;
+        for chunk in seed.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let b = x.to_le_bytes();
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                *slot = b[i];
+            }
+        }
+    }
+
+    let fee_and_amounts = FeeAndAmounts::from((
+        active.input_fee_ppk,
+        (0..32).map(|i| 1u64 << i).collect::<Vec<_>>(),
+    ));
+    let pre_mint = PreMintSecrets::from_seed(
+        keyset_id,
+        0,
+        &seed,
+        Amount::from(amount),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .map_err(|e| format!("PreMintSecrets::from_seed: {e}"))?;
+
+    let resp = client
+        .post_mint(
+            &PaymentMethod::BOLT11,
+            MintRequest {
+                quote: quote.quote.to_string(),
+                outputs: pre_mint.blinded_messages(),
+                signature: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("post_mint: {e}"))?;
+
+    let keyset = client
+        .get_mint_keyset(keyset_id)
+        .await
+        .map_err(|e| format!("get_mint_keyset: {e}"))?;
+    let proofs = construct_proofs(resp.signatures, pre_mint.rs(), pre_mint.secrets(), &keyset.keys)
+        .map_err(|e| format!("construct_proofs: {e}"))?;
+
+    Ok(proofs)
 }
