@@ -14,7 +14,7 @@
 //!   swapping      → spinner ("Producing token…")
 //!     ↓ on success
 //!   share         → token + copy + share sheet, polling claim every 3s
-//!     ↓ poll returns .completed (mocked timer)
+//!     ↓ poll returns .completed (real NUT-07 check_send_swap_claimed)
 //!   claimed       → "Sent" check + Done
 //!     ↓ (or .failed / catch-all)
 //!   failure       → error + Retry
@@ -30,11 +30,11 @@
 //!     breakdown from `CashuSendSwapService.get_quote`).
 //!   - `on_confirm`  → `AgicashWasmWallet::create_send_swap` (real V4
 //!     `cashuB…` token + real swap id; claimable by a real receiver).
-//!   - `mock_poll_claim` **stays mocked** (flips to `.completed` after
-//!     ~9 s / three 3 s ticks): it maps to the facade's
-//!     `check_send_swap_claimed`, which ships in **12b-3**. 12d depends
-//!     on 12b-1 ONLY — un-mocking the poll is explicit conditional
-//!     follow-up (see the `TODO[12b-3-dependent]` on `mock_poll_claim`).
+//!   - `poll_claim_once` → `AgicashWasmWallet::check_send_swap_claimed`
+//!     (real single-shot NUT-07 claim poll over
+//!     `WalletClient::check_send_token_claimed`). 12b-3 un-mock of the
+//!     former `mock_poll_claim(tick)` timer — the share-screen 3 s loop
+//!     now asks the mint whether the receiver's proofs are SPENT.
 //!
 //! The view geometry, state machine, and UX timings are unchanged — only
 //! the data source moved from synthetic to real.
@@ -100,21 +100,24 @@ struct SendSwapHandle {
     unit: String,
 }
 
-/// Outcome of a single poll-claim shot.
+/// Outcome of a single poll-claim shot. Mapped from
+/// `agicash_wasm::SendClaimStatusWasm` (12b-3 un-mock); see
+/// `poll_claim_once`. Constructed only on the real wasm path — the
+/// native `rlib` (unit-test) build's `poll_claim_once` returns only
+/// `Pending` (no browser wallet), so `Completed`/`Failed` are
+/// native-dead. Same native-only honest `allow(dead_code)` idiom the
+/// `Phase` enum uses.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClaimPoll {
-    /// Receiver hasn't claimed yet; keep polling.
+    /// Receiver hasn't claimed yet (or a transient lookup error); keep
+    /// polling on the next tick.
     Pending,
     /// Receiver claimed the token. The view transitions to `Claimed`.
     Completed,
-    /// Mint declared the swap dead. Surfaces a reason on the failure card.
-    //
-    // TODO[slice-13]: emitted by the real `check_send_swap_claimed`
-    // wallet call when the mint returns a terminal-failed state. The
-    // mock today never returns this (the demo flow always completes on
-    // tick 3), but the match arm in the polling Effect is wired so the
-    // real wallet's failure path drops straight into Phase::Failure.
-    #[allow(dead_code)]
+    /// Mint declared the swap terminally FAILED — the real
+    /// `check_send_swap_claimed` returned `SendClaimStateWasm::Failed`.
+    /// Drops straight into `Phase::Failure` with the reason.
     Failed(String),
 }
 
@@ -294,13 +297,18 @@ pub fn SendCashuView() -> impl IntoView {
             return;
         };
         let swap_id = handle.swap_id.clone();
+        // Captured at the Effect's reactive owner (NOT inside
+        // spawn_local) per feedback_leptos_spawn_local_gotchas — same
+        // contract the on_continue/on_confirm handlers use.
+        let config = config.get_value();
 
         spawn_local(async move {
-            // Three ticks at 3 s ≈ 9 s end-to-end, matching the iOS
-            // SendCashuTokenView "Waiting for receiver…" loop. The mock
-            // counter flips to Completed on the third tick (see
-            // mock_poll_claim).
-            let mut tick: u32 = 0;
+            // 3 s-cadence single-shot poll matching the iOS
+            // SendCashuTokenView "Waiting for receiver…" loop. The
+            // facade's `check_send_token_claimed` is single-shot by
+            // design (runtime-agnostic — no sleep/spawn); the consumer
+            // (this loop) owns the cadence.
+            let _ = &config;
             loop {
                 #[cfg(feature = "hydrate")]
                 {
@@ -321,14 +329,17 @@ pub fn SendCashuView() -> impl IntoView {
                 if !still_sharing {
                     return;
                 }
-                tick = tick.saturating_add(1);
-                // TODO[slice-13]: replace with
-                // `WalletClient::check_send_swap_claimed(swap_id)`. The
-                // outcome maps onto `ClaimPoll` directly (state machine
-                // mirrors iOS `SendSwapClaimState`).
-                match mock_poll_claim(tick) {
-                    // Loop body falls through to the next iteration — no
-                    // explicit `continue` needed (and clippy flags it).
+                // 12b-3 un-mock: real single-shot NUT-07 claim poll over
+                // the wasm shell (was `mock_poll_claim(tick)`). A fresh
+                // handle per tick mirrors on_continue/on_confirm — the
+                // shell is a thin `from_config` delegate, construction is
+                // cheap + has no network I/O.
+                let outcome = poll_claim_once(&config, &swap_id).await;
+                match outcome {
+                    // Pending (or a transient lookup error — see
+                    // poll_claim_once): keep polling. Loop body falls
+                    // through to the next iteration — no explicit
+                    // `continue` (clippy flags it).
                     ClaimPoll::Pending => {}
                     ClaimPoll::Completed => {
                         phase.set(Phase::Claimed(handle));
@@ -1018,14 +1029,14 @@ fn truncate_token(s: &str) -> String {
     format!("{head}...{tail}")
 }
 
-// ---- Real SDK boundary (12d) ----------------------------------------------
+// ---- Real SDK boundary ----------------------------------------------------
 //
-// `on_continue` → `AgicashWasmWallet::prepare_send_quote`,
-// `on_confirm`  → `AgicashWasmWallet::create_send_swap`.
-// The claim-poll (`mock_poll_claim`) stays mocked: it maps to the
-// facade's `check_send_swap_claimed`, which ships in **12b-3**. 12d
-// depends on 12b-1 ONLY (NOT 12b-3) — un-mocking the poll is explicit
-// conditional follow-up, not a 12d requirement (see TODO below).
+// `on_continue`     → `AgicashWasmWallet::prepare_send_quote`,
+// `on_confirm`      → `AgicashWasmWallet::create_send_swap`,
+// `poll_claim_once` → `AgicashWasmWallet::check_send_swap_claimed`
+//                     (12b-3 un-mock — the former `mock_poll_claim`
+//                     timer is gone; the share-screen 3 s loop now
+//                     drives the real single-shot NUT-07 claim poll).
 
 /// Parse a wasm-shell decimal amount string (e.g. `"100"`) into the
 /// view's `u64` minor-unit. The shell already normalized to the
@@ -1076,17 +1087,55 @@ fn js_err_string(e: &wasm_bindgen::JsValue) -> String {
         .unwrap_or_else(|| "send failed (unknown error)".to_string())
 }
 
-fn mock_poll_claim(tick: u32) -> ClaimPoll {
-    // TODO[12b-3-dependent]: un-mock once `check_send_swap_claimed`
-    // lands in the facade (12b-3). 12d depends on 12b-1 ONLY — the
-    // claim-poll stays mocked here by design (D4). When 12b-3 merges,
-    // add `AgicashWasmWallet::checkSendSwapClaimed` (Task-9-style
-    // mini-task mirroring FFI `check_send_swap_claimed`) and replace
-    // this call. Flips to Completed on the third tick (≈ 9 s) so the
-    // demo share-screen flow still completes without a receiver acting.
-    if tick >= 3 {
-        ClaimPoll::Completed
-    } else {
+/// One single-shot NUT-07 claim poll over the wasm shell
+/// (`AgicashWasmWallet::check_send_swap_claimed` →
+/// `WalletClient::check_send_token_claimed`). 12b-3 un-mock of the
+/// former `mock_poll_claim(tick)`.
+///
+/// A transient error (handle construction, no session yet, mint
+/// round-trip blip) maps to [`ClaimPoll::Pending`] — NOT a hard
+/// failure: the facade poll is single-shot and the cadence-owning loop
+/// just retries on the next 3 s tick. A genuine terminal failure is
+/// carried by the snapshot's `state == Failed`, exactly as iOS reads
+/// `SendSwapClaimState`. The native `rlib` (unit-test) build has no
+/// browser wallet, so it returns `Pending` (the loop never runs there —
+/// the SSR `cfg(not(hydrate))` arm returns before the first call).
+// Native (`rlib`) has no `.await` in the body (no browser wallet) — the
+// signature stays `async` so the single wasm call site is uniform. The
+// allow is honest + native-only, same idiom as the dead_code gates.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(unused_variables, clippy::unused_async)
+)]
+async fn poll_claim_once(config: &AppConfig, swap_id: &str) -> ClaimPoll {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let wallet = match agicash_wasm::AgicashWasmWallet::new(
+            config.opensecret_base_url.clone(),
+            config.opensecret_client_id.to_string(),
+            config.supabase_url.clone(),
+            config.supabase_anon_key.clone(),
+        ) {
+            Ok(w) => w,
+            Err(_) => return ClaimPoll::Pending,
+        };
+        match wallet.check_send_swap_claimed(swap_id.to_string()).await {
+            Ok(status) => match status.state {
+                agicash_wasm::SendClaimStateWasm::Pending => ClaimPoll::Pending,
+                agicash_wasm::SendClaimStateWasm::Completed => ClaimPoll::Completed,
+                agicash_wasm::SendClaimStateWasm::Failed => ClaimPoll::Failed(
+                    status
+                        .failure_reason
+                        .unwrap_or_else(|| "send swap failed".to_string()),
+                ),
+            },
+            // Transient — retry on the next tick (single-shot poll
+            // philosophy; terminal failure rides the Failed state).
+            Err(_) => ClaimPoll::Pending,
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         ClaimPoll::Pending
     }
 }
@@ -1141,9 +1190,7 @@ fn copy_to_clipboard(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        display_amount, format_amount, mock_poll_claim, parsed_amount, truncate_token, ClaimPoll,
-    };
+    use super::{display_amount, format_amount, parsed_amount, truncate_token};
 
     #[test]
     fn parses_integer_buffer() {
@@ -1197,13 +1244,5 @@ mod tests {
         assert!(truncated.starts_with("cashuBAAAAAA"));
         assert!(truncated.ends_with("AAAAAAAA"));
         assert!(truncated.contains("..."));
-    }
-
-    #[test]
-    fn mock_poll_completes_on_third_tick() {
-        assert_eq!(mock_poll_claim(1), ClaimPoll::Pending);
-        assert_eq!(mock_poll_claim(2), ClaimPoll::Pending);
-        assert_eq!(mock_poll_claim(3), ClaimPoll::Completed);
-        assert_eq!(mock_poll_claim(99), ClaimPoll::Completed);
     }
 }
