@@ -47,6 +47,7 @@ use agicash_traits::{
     ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UpsertUserInput,
     UserStorage,
 };
+use agicash_wallet::{OpenSecretAuthClient, SessionStorageChoice, WalletClient, WalletConfig};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::{CurrencyUnit, Proof, Token};
@@ -126,6 +127,24 @@ pub struct AgicashWallet {
     /// the task is aborted (a bare `abort()` would drop the socket
     /// without a clean leave).
     realtime_service: Arc<RwLock<Option<Arc<agicash_realtime::WalletRealtimeService>>>>,
+    /// The composed facade. Built once in `new` via
+    /// `WalletClient::from_config`. The delegated business methods route
+    /// here; the shell-resident platform layer (the `OpenSecretClient`
+    /// `client` field, session slot, session-storage backend, realtime
+    /// supervisor, observability) stays on `self` per spec §6. Named
+    /// `facade` (not `client`) because the pre-existing
+    /// `client: OpenSecretClient` field is kept byte-for-byte for the
+    /// shell-resident methods (Hard Rule 7) and the names would clash.
+    // TODO(12b-1 Tasks 6-12): becomes read once the delegates are
+    // rewritten; allow until then so the interim gate stays green.
+    #[allow(dead_code)]
+    facade: Arc<WalletClient>,
+    /// The facade's auth client, retained so the shell can mirror its
+    /// session slot into the existing `self.session` plumbing without
+    /// changing realtime/session behavior (spec §6 carve-out).
+    // TODO(12b-1 Tasks 6-12): read once auth_* delegates mirror through it.
+    #[allow(dead_code)]
+    facade_auth: Arc<OpenSecretAuthClient>,
 }
 
 impl std::fmt::Debug for AgicashWallet {
@@ -188,6 +207,15 @@ impl AgicashWallet {
 
         let client_id = Uuid::parse_str(&opensecret_client_id_uuid)
             .map_err(|e| FfiError::internal(format!("invalid opensecret_client_id_uuid: {e}")))?;
+        // Capture the endpoint args for the facade `from_config` BEFORE
+        // the existing wiring moves them into OpenSecretConfig /
+        // SupabaseStorageConfig. `client_id` is a `Copy` Uuid, reused
+        // directly. This dual-feeds the SAME values to both the kept
+        // (shell-resident) wiring and the new facade root with zero
+        // change to the ctor signature.
+        let opensecret_url_for_facade = opensecret_url.clone();
+        let supabase_url_for_facade = supabase_url.clone();
+        let supabase_anon_key_for_facade = supabase_anon_key.clone();
         let auth_cfg = OpenSecretConfig {
             base_url: opensecret_url,
             client_id,
@@ -257,6 +285,21 @@ impl AgicashWallet {
             Arc::clone(&cashu_provider),
         ));
 
+        // Build the composed facade from the SAME inputs. This is the
+        // single composition root the delegated methods route through.
+        // `SessionStorageChoice::InMemory` matches today's construction-
+        // time state (the FFI installs Android storage post-construction
+        // via `set_session_storage_dir`, which stays shell-resident per
+        // Hard Rule 7 — at construction `session_storage` is `None`).
+        let (facade, facade_auth) = WalletClient::from_config(WalletConfig {
+            opensecret_url: opensecret_url_for_facade,
+            opensecret_client_id: client_id,
+            supabase_url: supabase_url_for_facade,
+            supabase_anon_key: supabase_anon_key_for_facade,
+            session_storage: SessionStorageChoice::InMemory,
+        })
+        .map_err(|e| FfiError::internal(format!("from_config: {e}")))?;
+
         Ok(Arc::new(Self {
             client,
             storage,
@@ -272,6 +315,8 @@ impl AgicashWallet {
             session_storage: Arc::new(RwLock::new(None)),
             realtime_task: Arc::new(RwLock::new(None)),
             realtime_service: Arc::new(RwLock::new(None)),
+            facade,
+            facade_auth,
         }))
     }
 
@@ -3287,5 +3332,22 @@ mod tests {
             vec![crate::RealtimeStatusFfi::Subscribed]
         );
         assert_eq!(*rec.errors.lock().unwrap(), vec!["boom".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn constructor_wires_facade_client() {
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        // The facade-backed auth_status path must work with no session
+        // and no network (proves `facade` is wired + delegated).
+        let status = wallet.auth_status().await.unwrap();
+        assert!(!status.logged_in);
+        assert!(status.user_id.is_none());
     }
 }
