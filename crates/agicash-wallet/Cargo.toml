@@ -28,6 +28,19 @@ tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+default = []
+# Re-export of `agicash-auth-opensecret`'s `android-file-storage` feature.
+# The `AndroidFileSessionStorage` type `from_config` installs for the
+# `SessionStorageChoice::Android` arm lives behind this feature. It is not
+# gated on `target_os = "android"` here because cargo features must be
+# target-independent; the storage type itself is only re-exported on
+# `target_os = "android"` (see `crates/agicash-auth-opensecret/src/lib.rs`),
+# so on iOS / host this feature only pulls in the `aes-gcm` dep. The Kotlin
+# bindings wrapper enables this on the agicash-ffi dep; iOS + tests leave
+# it off (the cfg-not branch falls back to InMemory).
+android-file-storage = ["agicash-auth-opensecret/android-file-storage"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }

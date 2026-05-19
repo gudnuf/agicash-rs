@@ -30,13 +30,26 @@
 
 use crate::auth::AuthClient;
 use crate::client::WalletClient;
+use crate::config::{SessionStorageChoice, WalletConfig};
 use crate::error::WalletError;
+use crate::opensecret_auth::OpenSecretAuthClient;
+use agicash_auth_opensecret::{
+    InMemorySessionStorage, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
+};
 use agicash_cashu::{
     CashuMeltQuoteService, CashuMeltQuoteStorage, CashuMintQuoteService, CashuMintQuoteStorage,
     CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSendSwapService, CashuSendSwapStorage,
+    CdkCashuProvider,
 };
 use agicash_exchange_rate::ExchangeRateProvider;
-use agicash_traits::{CashuProvider, UserStorage};
+use agicash_storage_supabase::{
+    SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage, SupabaseCashuReceiveSwapStorage,
+    SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
+};
+use agicash_traits::{
+    CashuProvider, PassthroughProofEncryption, ProofEncryption, SessionStorage, TokenProvider,
+    UserStorage,
+};
 use std::sync::Arc;
 
 /// Fluent builder. See the module doc for required vs optional fields.
@@ -188,6 +201,88 @@ impl WalletClientBuilder {
     }
 }
 
+impl WalletClient {
+    /// THE single composition root for binding shells. Wires OpenSecret +
+    /// Supabase + CDK cashu services + passthrough encryption identically
+    /// to the bespoke FFI `AgicashWallet::new` it replaces, then routes
+    /// through [`WalletClientBuilder`]. No network I/O at construction.
+    ///
+    /// Returns the built `Arc<WalletClient>` AND the `OpenSecretAuthClient`
+    /// so the FFI shell can mirror the session slot into its own
+    /// shell-resident plumbing (spec §6 platform-layer carve-out) without
+    /// changing realtime/session behavior.
+    pub fn from_config(
+        cfg: WalletConfig,
+    ) -> Result<(Arc<WalletClient>, Arc<OpenSecretAuthClient>), WalletError> {
+        let auth_cfg = OpenSecretConfig {
+            base_url: cfg.opensecret_url,
+            client_id: cfg.opensecret_client_id,
+        };
+        let client =
+            OpenSecretClient::new(auth_cfg).map_err(|e| WalletError::Auth(e.to_string()))?;
+
+        let storage_cfg = SupabaseStorageConfig {
+            url: cfg.supabase_url,
+            anon_key: cfg.supabase_anon_key,
+        };
+        let token_provider: Arc<dyn TokenProvider + Send + Sync> =
+            Arc::new(OpenSecretTokenProvider::new(client.clone()));
+        let storage = Arc::new(
+            SupabaseStorage::new(storage_cfg, token_provider)
+                .map_err(|e| WalletError::Storage(e.to_string()))?,
+        );
+
+        let cashu_provider: Arc<dyn CashuProvider> = Arc::new(CdkCashuProvider::new());
+        let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
+
+        let receive_storage = Arc::new(SupabaseCashuReceiveSwapStorage::new(
+            Arc::clone(&storage),
+            Arc::clone(&encryption),
+        ));
+        let send_storage = Arc::new(SupabaseCashuSendSwapStorage::new(
+            Arc::clone(&storage),
+            Arc::clone(&encryption),
+        ));
+        let mint_quote_storage = Arc::new(SupabaseCashuMintQuoteStorage::new(
+            Arc::clone(&storage),
+            Arc::clone(&encryption),
+        ));
+        let melt_quote_storage = Arc::new(SupabaseCashuMeltQuoteStorage::new(
+            Arc::clone(&storage),
+            Arc::clone(&encryption),
+        ));
+
+        let session_storage: Arc<dyn SessionStorage> = match cfg.session_storage {
+            SessionStorageChoice::InMemory => Arc::new(InMemorySessionStorage::new()),
+            SessionStorageChoice::Android { dir } => {
+                #[cfg(all(feature = "android-file-storage", target_os = "android"))]
+                {
+                    Arc::new(agicash_auth_opensecret::AndroidFileSessionStorage::new(dir))
+                }
+                #[cfg(not(all(feature = "android-file-storage", target_os = "android")))]
+                {
+                    let _ = dir;
+                    Arc::new(InMemorySessionStorage::new())
+                }
+            }
+        };
+
+        let auth = Arc::new(OpenSecretAuthClient::new(client, session_storage));
+
+        let wallet = WalletClientBuilder::new()
+            .auth(Arc::clone(&auth) as Arc<dyn AuthClient>)
+            .user_storage(Arc::clone(&storage) as Arc<dyn UserStorage>)
+            .cashu_provider(Arc::clone(&cashu_provider))
+            .cashu_receive_storage(receive_storage)
+            .cashu_send_storage(send_storage)
+            .cashu_mint_quote_storage(mint_quote_storage)
+            .cashu_melt_quote_storage(melt_quote_storage)
+            .build()?;
+
+        Ok((wallet, auth))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +298,23 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn from_config_constructs_without_network() {
+        // Unresolvable endpoints: from_config must NOT do network I/O at
+        // construction (mirrors FFI `constructor_returns_wallet_without_network`).
+        let cfg = crate::config::WalletConfig {
+            opensecret_url: "https://does-not-resolve-agicash.invalid".into(),
+            opensecret_client_id: uuid::Uuid::nil(),
+            supabase_url: "https://does-not-resolve-supabase.invalid".into(),
+            supabase_anon_key: "anon-key".into(),
+            session_storage: crate::config::SessionStorageChoice::InMemory,
+        };
+        let (wallet, _auth) = crate::WalletClient::from_config(cfg).expect("construct");
+        // No session loaded → auth_status reports logged_out, no I/O.
+        let status = wallet.auth_status().await.expect("auth_status");
+        assert!(!status.logged_in);
+        assert!(status.user_id.is_none());
     }
 }

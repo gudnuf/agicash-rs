@@ -56,7 +56,9 @@ pub mod types;
 pub use auth::{AuthClient, Session};
 pub use builder::WalletClientBuilder;
 pub use client::WalletClient;
+pub use config::{SessionStorageChoice, WalletConfig};
 pub use error::WalletError;
+pub use opensecret_auth::OpenSecretAuthClient;
 pub use types::{
     AccountSummary, AuthStatus, BalanceSummary, ExchangeRateSnapshot, MintSummary,
     ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState, ReceiveReceipt,
