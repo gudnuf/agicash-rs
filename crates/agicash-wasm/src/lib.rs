@@ -128,6 +128,29 @@ mod wasm_impl {
                 .map_err(|e| JsValue::from_str(&format!("serialize accounts: {e}")))
         }
 
+        /// Pre-commit send quote (fee breakdown for the confirm screen,
+        /// no persistence). Delegates to `WalletClient::quote_send_token`
+        /// (mirrors FFI 11.1). Returns the **field-complete subset** of
+        /// the facade quote — `mint_url` is omitted, NOT faked (note ◇:
+        /// facade `SendTokenQuote` has no `mint_url`).
+        #[wasm_bindgen(js_name = prepareSendQuote)]
+        pub async fn prepare_send_quote(
+            &self,
+            amount: u64,
+            account_id: Option<String>,
+            currency: Option<String>,
+        ) -> Result<crate::types::SendQuotePreviewWasm, JsValue> {
+            let currency_enum = crate::convert::parse_currency(currency)?;
+            let account_id = crate::convert::parse_opt_account_id(account_id)?;
+            let amount_money = crate::convert::amount_to_money(amount, currency_enum);
+            let quote = self
+                .client
+                .quote_send_token(account_id, amount_money)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::send_quote_preview_from_facade(&quote))
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]

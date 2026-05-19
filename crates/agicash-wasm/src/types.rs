@@ -55,6 +55,37 @@ pub struct AccountWasm {
     pub unit: String,
 }
 
+/// Mirror of FFI `send::SendQuotePreview` — the **field-complete
+/// subset** of facade `SendTokenQuote`. Per the 12b-1 facade-field-gap
+/// (note ◇): facade `SendTokenQuote` carries NO `mint_url` (the FFI
+/// reconstructs it off the picked account; that is a behavior/shape
+/// change → 12b-2/12c facade-surface work). `mint_url` is therefore
+/// **omitted here (NOT faked, NOT defaulted)** — a strict
+/// no-behavior-invention shell. All `Money` fields are
+/// decimal-stringified; `unit`/`currency` derived from the Money.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Serialize)]
+pub struct SendQuotePreviewWasm {
+    #[wasm_bindgen(getter_with_clone)]
+    pub amount_requested: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub amount_to_send: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub total_amount: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub total_fee: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub cashu_send_fee: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub cashu_receive_fee: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub unit: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub currency: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub account_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

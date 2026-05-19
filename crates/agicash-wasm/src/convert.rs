@@ -89,6 +89,31 @@ pub fn account_wasm_from_summary(s: &agicash_wallet::AccountSummary) -> crate::t
     }
 }
 
+/// Facade `SendTokenQuote` → `SendQuotePreviewWasm`. Mirrors the FFI
+/// `SendQuotePreview` Money→String shape for the **field-complete
+/// subset** only — `mint_url` is omitted (note ◇: facade
+/// `SendTokenQuote` has no `mint_url`; the FFI reconstructs it off the
+/// picked account, which is 12b-2/12c facade-surface work). `unit` /
+/// `currency` are derived from `amount_requested` (all the quote's
+/// Money fields share the account's unit/currency, exactly as the FFI
+/// derives them).
+#[must_use]
+pub fn send_quote_preview_from_facade(
+    q: &agicash_wallet::SendTokenQuote,
+) -> crate::types::SendQuotePreviewWasm {
+    crate::types::SendQuotePreviewWasm {
+        amount_requested: q.amount_requested.amount().to_string(),
+        amount_to_send: q.amount_to_send.amount().to_string(),
+        total_amount: q.total_amount.amount().to_string(),
+        total_fee: q.total_fee.amount().to_string(),
+        cashu_send_fee: q.cashu_send_fee.amount().to_string(),
+        cashu_receive_fee: q.cashu_receive_fee.amount().to_string(),
+        unit: q.amount_requested.unit().to_string(),
+        currency: q.amount_requested.currency().to_string(),
+        account_id: q.account_id.to_string(),
+    }
+}
+
 /// Facade `Session` → `SessionWasm`. Mirror of
 /// `ffi::convert::session_from_facade`.
 #[must_use]
@@ -172,6 +197,31 @@ mod tests {
             ..summary
         };
         assert_eq!(account_wasm_from_summary(&usd).unit, "cent");
+    }
+
+    #[wasm_bindgen_test]
+    fn send_quote_preview_maps_field_complete_subset_no_mint_url() {
+        let aid = Uuid::new_v4();
+        let m = |n: u64| Money::new(Decimal::from(n), Currency::Btc, Unit::Sat);
+        let q = agicash_wallet::SendTokenQuote {
+            amount_requested: m(100),
+            amount_to_send: m(101),
+            total_amount: m(103),
+            total_fee: m(3),
+            cashu_send_fee: m(2),
+            cashu_receive_fee: m(1),
+            account_id: AccountId::from(aid),
+        };
+        let w = send_quote_preview_from_facade(&q);
+        assert_eq!(w.amount_requested, "100");
+        assert_eq!(w.amount_to_send, "101");
+        assert_eq!(w.total_amount, "103");
+        assert_eq!(w.total_fee, "3");
+        assert_eq!(w.cashu_send_fee, "2");
+        assert_eq!(w.cashu_receive_fee, "1");
+        assert_eq!(w.unit, "sat");
+        assert_eq!(w.currency, "BTC");
+        assert_eq!(w.account_id, aid.to_string());
     }
 
     #[wasm_bindgen_test]
