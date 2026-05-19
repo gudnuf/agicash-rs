@@ -23,8 +23,8 @@ use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{
-    auth_error_from_opensecret, login_email, logout, register_email, register_guest,
-    OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
+    auth_error_from_opensecret, login_email, logout, register_email, OpenSecretClient,
+    OpenSecretConfig, OpenSecretTokenProvider,
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
@@ -169,6 +169,10 @@ impl std::fmt::Debug for AgicashWallet {
 /// Generate 16 random bytes hex-encoded; the `OpenSecret` guest-registration
 /// password slot accepts any string and we never need it after the first
 /// login (Swift persists only the resulting refresh token).
+// TODO(12b-1 Task 12): guest registration now happens inside the facade
+// (`OpenSecretAuthClient::register_guest`); this shell copy is dead once
+// the deletion pass runs. Allow until then so the gate stays green.
+#[allow(dead_code)]
 fn random_password() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).expect("OS RNG must be available");
@@ -475,15 +479,21 @@ impl AgicashWallet {
     /// throwaway password (the user never sees it) and returns the resulting
     /// `Session` so the Swift consumer can persist the refresh token.
     pub async fn auth_guest(&self) -> Result<Session, FfiError> {
-        let password = random_password();
-        let resp = register_guest(&self.client, password, self.client.client_id()).await?;
+        let s = self
+            .facade
+            .auth_guest()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // §6 carve-out (note ‡): mirror into the shell-resident session
+        // slot + persistence so realtime / set_session /
+        // try_restore_session keep working UNCHANGED (Hard Rule 7).
         let persisted = PersistedSession {
-            user_id: resp.id,
-            refresh_token: resp.refresh_token.clone(),
+            user_id: s.user_id.as_uuid(),
+            refresh_token: s.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        Ok(persisted.into())
+        Ok(crate::convert::session_from_facade(s))
     }
 
     /// Email + password login.

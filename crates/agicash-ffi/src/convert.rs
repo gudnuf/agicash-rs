@@ -81,6 +81,16 @@ pub fn wallet_error_to_ffi(e: WalletError) -> FfiError {
     }
 }
 
+/// Facade `Session` → FFI `Session` record. Verbatim the old
+/// `PersistedSession -> ffi::session::Session` mapping shape.
+#[must_use]
+pub fn session_from_facade(s: agicash_wallet::Session) -> crate::session::Session {
+    crate::session::Session {
+        user_id: s.user_id.to_string(),
+        refresh_token: s.refresh_token,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +143,17 @@ mod tests {
             e,
             FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED
         ));
+    }
+
+    #[test]
+    fn session_from_facade_stringifies_user_id() {
+        let uid = Uuid::new_v4();
+        let fs = agicash_wallet::Session {
+            user_id: agicash_domain::UserId::from(uid),
+            refresh_token: "rt.x".into(),
+        };
+        let ffi = session_from_facade(fs);
+        assert_eq!(ffi.user_id, uid.to_string());
+        assert_eq!(ffi.refresh_token, "rt.x");
     }
 }

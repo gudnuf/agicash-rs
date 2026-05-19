@@ -183,6 +183,7 @@ dependencies = [
  "agicash-realtime",
  "agicash-storage-supabase",
  "agicash-traits",
+ "agicash-wallet",
  "async-trait",
  "base64 0.22.1",
  "cdk",
@@ -338,21 +339,25 @@ dependencies = [
 name = "agicash-wallet"
 version = "0.1.0"
 dependencies = [
+ "agicash-auth-opensecret",
  "agicash-cashu",
  "agicash-domain",
  "agicash-exchange-rate",
  "agicash-lightning-address",
  "agicash-money",
+ "agicash-storage-supabase",
  "agicash-traits",
  "async-trait",
  "cdk",
  "chrono",
+ "getrandom 0.2.17",
  "hex",
  "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
