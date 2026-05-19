@@ -146,20 +146,26 @@ columns are encrypted client-side.
   the hot paths. P0 before mainnet. See
   `project_agicash_dleq_gap.md` for patch sites.
 
-## Prek hook escape
+## Prek hooks
 
-The prek hook is installed without a working config in some worktrees;
-`git commit` may hang. Two options:
+A tracked `.pre-commit-config.yaml` ships a **fast** `prek` hook chain
+(pre-commit: text hygiene + `rustfmt --check` on staged `.rs` only — no
+compile; pre-push: `cargo clippy -D warnings`). It is the same gate CI
+runs, caught locally. Setup:
 
 ```sh
-# 1. one-shot bypass (allowed):
-PREK_ALLOW_NO_CONFIG=1 git commit -m "..."
-
-# 2. disable the stale hook locally:
-mv .git/hooks/pre-commit .git/hooks/pre-commit.disabled-stale-devenv
+nix profile install nixpkgs#prek                          # once per machine (puts prek on PATH)
+prek install -t pre-commit -t pre-push                    # once per checkout/worktree
 ```
 
-Don't `--no-verify` blindly; the bypass above keeps real hooks intact.
+Commit/push normally — the hooks are fast and pass clean code. Run
+`git commit` inside the nix dev shell (direnv auto-loads it on
+`cd ~/agicash`, or `nix develop -c git commit ...`) so `rustfmt`/`cargo`
+are on PATH for the hooks.
+
+Do **not** use `PREK_ALLOW_NO_CONFIG=1`, `--no-verify`, or disable the
+hook — the config is now tracked and the hooks are designed to be fast.
+See `docs/contributing.md` for the full hook design and rationale.
 
 ## iOS rust logs
 
