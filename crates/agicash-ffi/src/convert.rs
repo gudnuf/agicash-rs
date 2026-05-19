@@ -170,6 +170,68 @@ pub fn receive_result_from_receipt(
     }
 }
 
+/// FFI `String` (UUID) quote id → `Uuid`. Bad UUID → `Internal`
+/// (verbatim message shape `"invalid quote_id: <e>"`).
+pub fn parse_quote_id(s: &str) -> Result<Uuid, FfiError> {
+    Uuid::parse_str(s.trim()).map_err(|e| FfiError::internal(format!("invalid quote_id: {e}")))
+}
+
+/// Facade `ReceiveLightningHandle` → FFI `MintQuoteHandle`. Verbatim
+/// the old `mint_quote_handle_from` shape: stringified ids, decimal
+/// `amount`/`fee`, `Money`-derived `unit`/`currency`, rfc3339 expiry.
+#[must_use]
+pub fn mint_quote_handle_from_facade(
+    h: &agicash_wallet::ReceiveLightningHandle,
+) -> crate::mint_quote::MintQuoteHandle {
+    crate::mint_quote::MintQuoteHandle {
+        quote_id: h.quote_id.to_string(),
+        mint_quote_id: h.mint_quote_id.clone(),
+        invoice: h.invoice.clone(),
+        payment_hash: h.payment_hash.clone(),
+        amount: h.amount.amount().to_string(),
+        fee: h.fee.amount().to_string(),
+        unit: h.amount.unit().to_string(),
+        currency: h.amount.currency().to_string(),
+        account_id: h.account_id.to_string(),
+        expires_at: h.expires_at.to_rfc3339(),
+    }
+}
+
+/// Facade `ReceiveLightningState` → FFI `MintQuoteFfiState`. 1:1.
+#[must_use]
+fn mint_quote_state_from_facade(
+    s: agicash_wallet::ReceiveLightningState,
+) -> crate::mint_quote::MintQuoteFfiState {
+    match s {
+        agicash_wallet::ReceiveLightningState::Unpaid => {
+            crate::mint_quote::MintQuoteFfiState::Unpaid
+        }
+        agicash_wallet::ReceiveLightningState::Paid => crate::mint_quote::MintQuoteFfiState::Paid,
+        agicash_wallet::ReceiveLightningState::Completed => {
+            crate::mint_quote::MintQuoteFfiState::Completed
+        }
+        agicash_wallet::ReceiveLightningState::Expired => {
+            crate::mint_quote::MintQuoteFfiState::Expired
+        }
+        agicash_wallet::ReceiveLightningState::Failed => {
+            crate::mint_quote::MintQuoteFfiState::Failed
+        }
+    }
+}
+
+/// Facade `ReceiveLightningSnapshot` → FFI `MintQuoteSnapshot`.
+/// Verbatim the old `mint_quote_snapshot_from` shape (state + Failed's
+/// `failure_reason` passthrough).
+#[must_use]
+pub fn mint_quote_snapshot_from_facade(
+    s: &agicash_wallet::ReceiveLightningSnapshot,
+) -> crate::mint_quote::MintQuoteSnapshot {
+    crate::mint_quote::MintQuoteSnapshot {
+        state: mint_quote_state_from_facade(s.state),
+        failure_reason: s.failure_reason.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +403,74 @@ mod tests {
             receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::Pending)).status,
             crate::receive::ReceiveStatus::Pending
         ));
+    }
+
+    #[test]
+    fn parse_quote_id_ok_and_bad() {
+        let u = Uuid::new_v4();
+        assert_eq!(parse_quote_id(&u.to_string()).unwrap(), u);
+        let e = parse_quote_id("nope").unwrap_err();
+        assert!(
+            matches!(e, FfiError::Internal { ref message } if message.contains("invalid quote_id"))
+        );
+    }
+
+    #[test]
+    fn mint_quote_handle_from_facade_maps_fields() {
+        let qid = Uuid::new_v4();
+        let acct = Uuid::new_v4();
+        let exp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let h = agicash_wallet::ReceiveLightningHandle {
+            quote_id: qid,
+            mint_quote_id: "mq-1".into(),
+            invoice: "lnbc1...".into(),
+            payment_hash: "ph".into(),
+            amount: amount_to_money(5000, Currency::Btc),
+            fee: amount_to_money(2, Currency::Btc),
+            account_id: AccountId::from(acct),
+            expires_at: exp,
+        };
+        let ffi = mint_quote_handle_from_facade(&h);
+        assert_eq!(ffi.quote_id, qid.to_string());
+        assert_eq!(ffi.mint_quote_id, "mq-1");
+        assert_eq!(ffi.invoice, "lnbc1...");
+        assert_eq!(ffi.payment_hash, "ph");
+        assert_eq!(ffi.amount, "5000");
+        assert_eq!(ffi.fee, "2");
+        assert_eq!(ffi.unit, "sat");
+        assert_eq!(ffi.currency, "BTC");
+        assert_eq!(ffi.account_id, acct.to_string());
+        assert_eq!(ffi.expires_at, exp.to_rfc3339());
+    }
+
+    #[test]
+    fn mint_quote_snapshot_from_facade_maps_state_and_reason() {
+        let s = mint_quote_snapshot_from_facade(&agicash_wallet::ReceiveLightningSnapshot {
+            state: agicash_wallet::ReceiveLightningState::Failed,
+            failure_reason: Some("rejected".into()),
+        });
+        assert!(matches!(
+            s.state,
+            crate::mint_quote::MintQuoteFfiState::Failed
+        ));
+        assert_eq!(s.failure_reason, Some("rejected".to_string()));
+
+        for (fac, _ffi) in [
+            agicash_wallet::ReceiveLightningState::Unpaid,
+            agicash_wallet::ReceiveLightningState::Paid,
+            agicash_wallet::ReceiveLightningState::Completed,
+            agicash_wallet::ReceiveLightningState::Expired,
+        ]
+        .into_iter()
+        .map(|s| (s, ()))
+        {
+            let snap = mint_quote_snapshot_from_facade(&agicash_wallet::ReceiveLightningSnapshot {
+                state: fac,
+                failure_reason: None,
+            });
+            assert!(snap.failure_reason.is_none());
+        }
     }
 }

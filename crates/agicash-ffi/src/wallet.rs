@@ -79,10 +79,15 @@ pub struct AgicashWallet {
     /// `receive_swap_service` — same `SupabaseStorage`, same provider,
     /// same passthrough encryption stub. Drives `start_mint_quote`,
     /// `poll_mint_quote`, `complete_mint_quote`.
+    // TODO(12b-1 Task 12): mint-quote flow now delegates to the facade;
+    // this slot is dead once the deletion pass runs.
+    #[allow(dead_code)]
     mint_quote_service: Arc<CashuMintQuoteService>,
     /// Storage handle for the mint-quote rows. Kept as its own slot so
     /// `poll_mint_quote` can read the persisted quote by id without
     /// holding the service.
+    // TODO(12b-1 Task 12): dead with the facade-delegated mint-quote flow.
+    #[allow(dead_code)]
     mint_quote_storage: Arc<dyn CashuMintQuoteStorage>,
     /// Send-swap orchestrator. Wired against the same `send_swap_storage`
     /// + `cashu_provider` the wallet already owns. Drives
@@ -869,33 +874,20 @@ impl AgicashWallet {
         account_id: Option<String>,
         currency: Option<String>,
     ) -> Result<MintQuoteHandle, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
-        if amount == 0 {
-            return Err(FfiError::internal("amount too small"));
-        }
-
-        let currency_str = currency.unwrap_or_else(|| "BTC".to_string());
-        let currency_enum = Currency::from_str(&currency_str)
-            .map_err(|_| FfiError::internal(format!("unsupported currency: {currency_str}")))?;
-        let unit = unit_for_currency(currency_enum);
-        let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account =
-            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?;
-
-        let quote = self
-            .mint_quote_service
-            .create_quote(user_id, account, amount_money, None)
+        // The facade `quote_receive_lightning` does the same
+        // `require_session()` + account-pick + `create_quote` the
+        // bespoke body did, on the shared session slot. Arg parsing
+        // (currency default-BTC, account-id UUID, minor-unit Money)
+        // routes through `convert::*`.
+        let currency_enum = crate::convert::parse_currency(currency.as_deref())?;
+        let account_id = crate::convert::parse_opt_account_id(account_id.as_deref())?;
+        let amount_money = crate::convert::amount_to_money(amount, currency_enum);
+        let handle = self
+            .facade
+            .quote_receive_lightning(account_id, amount_money)
             .await
-            .map_err(mint_quote_error_to_ffi)?;
-
-        Ok(mint_quote_handle_from(&quote, account))
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::mint_quote_handle_from_facade(&handle))
     }
 
     /// Poll the mint for the current state of a previously-started
@@ -919,53 +911,17 @@ impl AgicashWallet {
     ///   failure during the single poll round-trip.
     /// - `FfiError::Storage` for raw Supabase failures.
     pub async fn poll_mint_quote(&self, quote_id: String) -> Result<MintQuoteSnapshot, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
-        let id = Uuid::parse_str(&quote_id)
-            .map_err(|e| FfiError::internal(format!("invalid quote_id: {e}")))?;
-        let quote = self
-            .mint_quote_storage
-            .get(id)
+        // The facade `poll_receive_lightning` does the same
+        // `require_session()` + ownership check + persisted-state
+        // fast-path + zero-timeout `poll_until_paid` the bespoke body
+        // did, on the shared session slot.
+        let id = crate::convert::parse_quote_id(&quote_id)?;
+        let snap = self
+            .facade
+            .poll_receive_lightning(id)
             .await
-            .map_err(|e| FfiError::internal(format!("storage error: {e}")))?;
-        if quote.user_id != user_id {
-            return Err(FfiError::internal("quote belongs to a different user"));
-        }
-
-        // Fast-path: if the row is already PAID/COMPLETED/EXPIRED/FAILED,
-        // return that immediately. The mint round-trip is only worth doing
-        // when the persisted state is still UNPAID.
-        if !matches!(quote.state, CashuMintQuoteState::Unpaid) {
-            return Ok(mint_quote_snapshot_from(&quote));
-        }
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account = accounts
-            .iter()
-            .find(|a| a.id == quote.account_id && a.account_type == AccountType::Cashu)
-            .ok_or_else(|| FfiError::internal("no matching account for quote"))?;
-
-        // Use `poll_until_paid` with a zero timeout — effectively "one
-        // status check, then return". The service does at most one mint
-        // round-trip; if status is still UNPAID we get back the same
-        // unmodified quote, if PAID/ISSUED the service transitions
-        // storage and returns the updated row.
-        let polled = self
-            .mint_quote_service
-            .poll_until_paid(
-                account,
-                quote.clone(),
-                std::time::Duration::from_millis(0),
-                std::time::Duration::from_millis(0),
-            )
-            .await
-            .map_err(mint_quote_error_to_ffi)?;
-
-        Ok(mint_quote_snapshot_from(&polled))
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::mint_quote_snapshot_from_facade(&snap))
     }
 
     /// Drive a PAID quote to COMPLETED — mint proofs and credit the
@@ -983,40 +939,17 @@ impl AgicashWallet {
     ///   minting / restore round-trip.
     /// - `FfiError::Storage` for raw Supabase failures.
     pub async fn complete_mint_quote(&self, quote_id: String) -> Result<ReceiveResult, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
-        let id = Uuid::parse_str(&quote_id)
-            .map_err(|e| FfiError::internal(format!("invalid quote_id: {e}")))?;
-        let quote = self
-            .mint_quote_storage
-            .get(id)
+        // The facade `complete_receive_lightning` does the same
+        // `require_session()` + ownership check + account lookup + seed
+        // + `complete_receive` the bespoke body did, on the shared
+        // session slot, and returns the shared `ReceiveReceipt` shape.
+        let id = crate::convert::parse_quote_id(&quote_id)?;
+        let receipt = self
+            .facade
+            .complete_receive_lightning(id)
             .await
-            .map_err(|e| FfiError::internal(format!("storage error: {e}")))?;
-        if quote.user_id != user_id {
-            return Err(FfiError::internal("quote belongs to a different user"));
-        }
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account = accounts
-            .iter()
-            .find(|a| a.id == quote.account_id && a.account_type == AccountType::Cashu)
-            .ok_or_else(|| FfiError::internal("no matching account for quote"))?
-            .clone();
-
-        let seed = self.client.get_cashu_seed().await?;
-        let outcome = self
-            .mint_quote_service
-            .complete_receive(&account, quote.clone(), &seed)
-            .await
-            .map_err(mint_quote_error_to_ffi)?;
-
-        Ok(receive_result_from_mint_quote_outcome(
-            outcome, &account, &quote,
-        ))
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::receive_result_from_receipt(&receipt))
     }
 
     // ---- cashu send-swap surface ----
@@ -1994,6 +1927,9 @@ fn pick_cashu_account_for_lightning<'a>(
 /// in `Internal` with a discriminator-bearing message; validation
 /// failures (amount-too-small, currency mismatch) stay as their own
 /// strings so the iOS UI can pattern-match the prefix.
+// TODO(12b-1 Task 12): facade `WalletError` path replaces this; only
+// referenced by its own unit tests now. Allow until the deletion pass.
+#[allow(dead_code)]
 fn mint_quote_error_to_ffi(e: MintQuoteError) -> FfiError {
     match e {
         MintQuoteError::AmountTooSmall => FfiError::internal("amount too small"),
@@ -2054,6 +1990,8 @@ fn unit_for_currency(currency: Currency) -> Unit {
 /// Build the `MintQuoteHandle` returned by `start_mint_quote`. The
 /// amount + fee are decimal-stringified to match the
 /// `ReceiveResult` convention.
+// TODO(12b-1 Task 12): replaced by `convert::mint_quote_handle_from_facade`.
+#[allow(dead_code)]
 fn mint_quote_handle_from(quote: &CashuMintQuote, account: &Account) -> MintQuoteHandle {
     MintQuoteHandle {
         quote_id: quote.id.to_string(),
@@ -2071,6 +2009,8 @@ fn mint_quote_handle_from(quote: &CashuMintQuote, account: &Account) -> MintQuot
 
 /// Convert a persisted `CashuMintQuote` into the FFI snapshot. Maps
 /// the per-state Rust enum down to the flat FFI discriminator.
+// TODO(12b-1 Task 12): replaced by `convert::mint_quote_snapshot_from_facade`.
+#[allow(dead_code)]
 fn mint_quote_snapshot_from(quote: &CashuMintQuote) -> MintQuoteSnapshot {
     match &quote.state {
         CashuMintQuoteState::Unpaid => MintQuoteSnapshot {
@@ -2101,6 +2041,9 @@ fn mint_quote_snapshot_from(quote: &CashuMintQuote) -> MintQuoteSnapshot {
 /// can render uniformly across both flows. Mirrors
 /// `receive_result_from_outcome` (which handles the Cashu-token swap
 /// outcome) but for the `CompleteMintQuoteOutcome` enum.
+// TODO(12b-1 Task 12): replaced by the facade `ReceiveReceipt` →
+// `convert::receive_result_from_receipt` path.
+#[allow(dead_code)]
 fn receive_result_from_mint_quote_outcome(
     outcome: CompleteMintQuoteOutcome,
     fallback_account: &Account,
@@ -2166,6 +2109,9 @@ fn receive_result_from_mint_quote_outcome(
 /// `details` blob. Defaults to empty string if the column is missing or
 /// malformed — the iOS UI tolerates empty mint URLs in its success card
 /// rendering (drops the line) so we don't need to error here.
+// TODO(12b-1 Task 12): only the now-dead `receive_result_from_mint_quote_outcome`
+// used this; dead until the deletion pass.
+#[allow(dead_code)]
 fn mint_url_from_account(account: &Account) -> String {
     account
         .details
