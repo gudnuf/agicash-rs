@@ -1,0 +1,88 @@
+# Fast pre-commit hooks for agicash-rs.
+#
+# Runner: `prek` (pre-commit-compatible, Rust). Reads this file.
+#
+# DESIGN CONSTRAINT: commits must stay FAST. The pre-commit stage does NO
+# compilation — only `cargo fmt --check` (parse-only, no build) plus cheap
+# text hygiene implemented as pure-shell `language: system` hooks. Heavy
+# checks (clippy/build/test) stay on CI; clippy ALSO runs at the pre-push
+# stage so a push that would fail CI is caught locally without slowing
+# down `git commit`.
+#
+# Why the hygiene hooks are local shell, not the upstream
+# pre-commit/pre-commit-hooks repo: those hooks are Python and prek builds
+# them with `uv pip` from PyPI on first run — a heavy, network-dependent,
+# offline-fragile step that violates "basic and fast" (it added ~10s and
+# failed entirely with no network). The shell equivalents below need zero
+# deps, zero network, zero build, and run in milliseconds.
+#
+# Install once per checkout/worktree:
+#     prek install --hook-type pre-commit --hook-type pre-push
+# (prek must be on PATH: `nix profile install nixpkgs#prek`)
+#
+# The cargo workspace root is crates/Cargo.toml (there is NO root
+# Cargo.toml), so the Rust hooks pass `--manifest-path crates/Cargo.toml`,
+# exactly mirroring CI's `working-directory: crates` jobs.
+
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: local
+    hooks:
+      # ---- cheap text hygiene (pure shell, no deps/network/build) ------
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+        language: system
+        entry: tools/dev/hooks/trailing-whitespace.sh
+        types: [text]
+        stages: [pre-commit]
+
+      - id: end-of-file-fixer
+        name: fix end of files (single trailing newline)
+        language: system
+        entry: tools/dev/hooks/end-of-file-fixer.sh
+        types: [text]
+        stages: [pre-commit]
+
+      - id: check-added-large-files
+        name: check for added large files (>2MB)
+        language: system
+        entry: tools/dev/hooks/check-added-large-files.sh
+        args: ["2048"]
+        pass_filenames: true
+        stages: [pre-commit]
+
+      - id: check-merge-conflict
+        name: check for merge conflict markers
+        language: system
+        entry: tools/dev/hooks/check-merge-conflict.sh
+        types: [text]
+        stages: [pre-commit]
+
+      # ---- Rust formatting (parse-only, NO compile -> fast) ------------
+      - id: cargo-fmt
+        name: cargo fmt --check (crates workspace)
+        description: >-
+          Rejects unformatted Rust. Mirrors CI `cd crates && cargo fmt
+          --all --check`. rustfmt only parses; it does not compile.
+        language: system
+        entry: cargo fmt --manifest-path crates/Cargo.toml --all --check --
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # ---- clippy at PRE-PUSH only (never pre-commit) -----------------
+      # Catches the lint failures that fail CI, before the push that
+      # triggers CI. Pushes may be slower than commits; that is the
+      # accepted trade. Mirrors CI `cargo clippy --workspace
+      # --all-targets -- -D warnings`.
+      - id: cargo-clippy
+        name: cargo clippy -D warnings (crates workspace)
+        description: >-
+          Same lint gate as CI. Pre-push only so `git commit` stays
+          fast; warm shared cargo cache keeps the push reasonable.
+        language: system
+        entry: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
