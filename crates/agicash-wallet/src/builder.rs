@@ -218,8 +218,10 @@ impl WalletClient {
             base_url: cfg.opensecret_url,
             client_id: cfg.opensecret_client_id,
         };
-        let client =
-            OpenSecretClient::new(auth_cfg).map_err(|e| WalletError::Auth(e.to_string()))?;
+        let client = OpenSecretClient::new(auth_cfg).map_err(|e| WalletError::Auth {
+            code: crate::discriminator::AuthErrorCode::Internal,
+            message: e.to_string(),
+        })?;
 
         let storage_cfg = SupabaseStorageConfig {
             url: cfg.supabase_url,

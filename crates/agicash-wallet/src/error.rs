@@ -16,6 +16,7 @@
 //! `remove_mint`, transaction history) returns it with a stable string
 //! prefix the caller can match on.
 
+use crate::discriminator::AuthErrorCode;
 use agicash_cashu::{
     MeltQuoteError, MintQuoteError, ReceiveFlowError, ReceiveSwapError, SendSwapError,
 };
@@ -41,9 +42,12 @@ pub enum WalletError {
     #[error("not authenticated")]
     Unauthenticated,
 
-    /// Auth backend (OpenSecret) failure: network, refresh, signup.
-    #[error("auth error: {0}")]
-    Auth(String),
+    /// Auth backend (OpenSecret) failure. `code` distinguishes a
+    /// transient backend/internal blip (keep the signed-in UI alive)
+    /// from a genuine expiry (`WalletError::Unauthenticated`) and an
+    /// auth-network drop (`WalletError::Network`, retry-able). P0-2.
+    #[error("auth error [{code:?}]: {message}")]
+    Auth { code: AuthErrorCode, message: String },
 
     /// Storage backend (Supabase) failure: network, RLS, missing row.
     #[error("storage error: {0}")]
@@ -120,7 +124,18 @@ impl From<AuthError> for WalletError {
     fn from(e: AuthError) -> Self {
         match e {
             AuthError::Unauthenticated => Self::Unauthenticated,
-            other => Self::Auth(other.to_string()),
+            // Auth-network is a transport blip — route to the 12a
+            // `Network` variant so it inherits `ExponentialBackoff`
+            // and stays distinct from a genuine expiry (P0-2).
+            AuthError::Network(m) => Self::Network(m),
+            AuthError::Backend(m) => Self::Auth {
+                code: AuthErrorCode::Backend,
+                message: m,
+            },
+            AuthError::Internal(m) => Self::Auth {
+                code: AuthErrorCode::Internal,
+                message: m,
+            },
         }
     }
 }
@@ -404,5 +419,60 @@ mod tests {
         let src = ReceiveFlowError::TokenParse("bad token".into());
         let w: WalletError = src.into();
         assert!(matches!(w, WalletError::Cashu(_)), "got {w:?}");
+    }
+
+    // --- 12b-2 Task 3: P0-2 structured auth discriminator ---
+
+    #[test]
+    fn p0_2_auth_network_routes_to_network_variant_and_is_retryable() {
+        // iOS keeps the signed-in UI + in-flight payment alive on an
+        // auth-network blip; it must be retry-able and NOT a session expiry.
+        let w: WalletError = AuthError::Network("opensecret dns".into()).into();
+        assert!(matches!(w, WalletError::Network(_)), "got {w:?}");
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn p0_2_auth_unauthenticated_stays_distinct() {
+        let w: WalletError = AuthError::Unauthenticated.into();
+        assert!(matches!(w, WalletError::Unauthenticated), "got {w:?}");
+    }
+
+    #[test]
+    fn p0_2_auth_backend_carries_backend_code() {
+        let w: WalletError = AuthError::Backend("opensecret 500".into()).into();
+        match w {
+            WalletError::Auth { code, ref message } => {
+                assert_eq!(code, AuthErrorCode::Backend);
+                assert!(message.contains("opensecret 500"));
+            }
+            other => panic!("expected Auth{{Backend}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p0_2_auth_internal_carries_internal_code() {
+        let w: WalletError = AuthError::Internal("bug".into()).into();
+        assert!(
+            matches!(
+                w,
+                WalletError::Auth {
+                    code: AuthErrorCode::Internal,
+                    ..
+                }
+            ),
+            "got {w:?}"
+        );
+    }
+
+    #[test]
+    fn p0_2_auth_backend_is_never_retry() {
+        // Backend is transient for the UI but not auto-retried by the
+        // facade's retry policy (only Network/Concurrency are).
+        let w: WalletError = AuthError::Backend("x".into()).into();
+        assert_eq!(w.retry_policy(), RetryPolicy::Never);
     }
 }
