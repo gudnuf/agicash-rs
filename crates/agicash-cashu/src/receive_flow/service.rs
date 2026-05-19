@@ -31,13 +31,31 @@ use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Marker bound alias — `Send + Sync` on native, empty on wasm. Lets
+/// `CashuSeedProvider` carry the right bound for each target without
+/// duplicating the trait method behind `cfg`. Mirrors
+/// `ExchangeRateProviderBounds` / `KeyProviderBounds` — required because
+/// `agicash-wallet`'s `AuthClientSeedProvider` wraps a `dyn AuthClient`
+/// that is `!Send` on wasm32, so an unconditional `Send + Sync` here
+/// breaks the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CashuSeedProviderBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> CashuSeedProviderBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CashuSeedProviderBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> CashuSeedProviderBounds for T {}
+
 /// Provider of the BIP-39 cashu seed bytes used to derive blinded outputs.
 ///
 /// Boxed as a trait so the FFI / CLI / WASM compositions can each plug a
 /// different source (OpenSecret on FFI, keychain on CLI, etc.) without
 /// pulling those crates into `agicash-cashu`.
-#[async_trait::async_trait]
-pub trait CashuSeedProvider: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait CashuSeedProvider: CashuSeedProviderBounds {
     /// Return the 64-byte cashu seed for the current session.
     async fn get_cashu_seed(&self) -> Result<[u8; 64], ReceiveFlowError>;
 }

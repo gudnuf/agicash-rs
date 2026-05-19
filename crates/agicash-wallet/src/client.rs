@@ -1112,7 +1112,8 @@ struct AuthClientSeedProvider {
     auth: Arc<dyn AuthClient>,
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl CashuSeedProvider for AuthClientSeedProvider {
     async fn get_cashu_seed(&self) -> Result<[u8; 64], ReceiveFlowError> {
         self.auth
