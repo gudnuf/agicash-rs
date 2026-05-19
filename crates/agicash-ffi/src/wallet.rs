@@ -20,30 +20,20 @@ use crate::mint::MintAddResult;
 use crate::mint_quote::{MintQuoteHandle, MintQuoteSnapshot};
 use crate::receive::ReceiveResult;
 use crate::receive_flow::ReceiveFlow;
-// TODO(12c Task 7): pruned with OpenSecretSeedProvider removal — the
-// pre-12c receive_flow body was its sole user; Task 6 re-pointed onto
-// the facade accessor, leaving these dead until Task 7 deletes the type.
-#[allow(unused_imports)]
-use crate::receive_flow::OpenSecretSeedProvider;
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
-    CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSendSwapService, CashuSendSwapStorage,
-    CdkCashuProvider, MeltOutcome, MeltQuoteError, MeltQuotePreview,
+    CashuSendSwapService, CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
+    MeltQuotePreview,
 };
-// TODO(12c Task 7): pruned with OpenSecretSeedProvider removal — only
-// the pre-12c self-constructing receive_flow body used these; Task 6
-// re-pointed onto the facade accessor, so they are dead until Task 7.
-#[allow(unused_imports)]
-use agicash_cashu::{CashuSeedProvider, ReceiveFlowService};
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
 use agicash_money::{Money, Unit};
 use agicash_storage_supabase::{
-    SupabaseCashuMeltQuoteStorage, SupabaseCashuReceiveSwapStorage, SupabaseCashuSendSwapStorage,
-    SupabaseStorage, SupabaseStorageConfig,
+    SupabaseCashuMeltQuoteStorage, SupabaseCashuSendSwapStorage, SupabaseStorage,
+    SupabaseStorageConfig,
 };
 use agicash_traits::{
     CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
@@ -63,18 +53,10 @@ pub struct AgicashWallet {
     /// Cashu provider (CDK-backed). Created once at construction; cheap to
     /// share across receive/send swaps.
     cashu_provider: Arc<dyn CashuProvider>,
-    /// Receive-swap orchestrator. Wired against the same `SupabaseStorage`
-    /// and `cashu_provider` the wallet already owns, with the slice-5
-    /// `PassthroughProofEncryption` stub matching the CLI composition root.
-    /// Once the encryption seam ships, this slot swaps to a real impl
-    /// without the FFI surface changing.
-    // TODO(12c Task 7): dead since Task 6 re-pointed `receive_flow` onto
-    // the facade accessor — the facade now owns `ReceiveFlowService`
-    // construction (incl. its own `receive_swap_service`), so this FFI-
-    // held copy has no remaining reader. Task 7 removes the field + its
-    // constructor wiring together with the dead `OpenSecretSeedProvider`.
-    #[allow(dead_code)]
-    receive_swap_service: Arc<CashuReceiveSwapService>,
+    // 12c Task 7: the `receive_swap_service` field was removed — Task 6
+    // re-pointed `receive_flow` onto `WalletClient::receive_flow()`,
+    // which constructs its own `ReceiveFlowService` (incl. receive-swap)
+    // from the facade's deps, so the FFI no longer holds this orchestrator.
     /// Send-swap storage handle, reused here purely to call
     /// `list_unspent_proofs` from `list_accounts` so the per-account
     /// balance can be computed. Naming is awkward (the trait shape was
@@ -237,13 +219,9 @@ impl AgicashWallet {
         // this constructor without the FFI shape moving.
         let cashu_provider: Arc<dyn CashuProvider> = Arc::new(CdkCashuProvider::new());
         let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
-        let receive_storage: Arc<dyn CashuReceiveSwapStorage> = Arc::new(
-            SupabaseCashuReceiveSwapStorage::new(Arc::clone(&storage), Arc::clone(&encryption)),
-        );
-        let receive_swap_service = Arc::new(CashuReceiveSwapService::new(
-            receive_storage,
-            Arc::clone(&cashu_provider),
-        ));
+        // 12c Task 7: the FFI no longer constructs its own receive-swap
+        // service / storage — `receive_flow` delegates to the facade,
+        // which builds `ReceiveFlowService` (incl. receive-swap) itself.
         // Reuse the same passthrough encryption seam so per-account
         // balance reads can decrypt the proofs the receive-swap service
         // wrote. Slice 5+ swaps the encryption arc without touching this
@@ -320,7 +298,6 @@ impl AgicashWallet {
             client,
             storage,
             cashu_provider,
-            receive_swap_service,
             send_swap_storage,
             send_swap_service,
             melt_quote_service,

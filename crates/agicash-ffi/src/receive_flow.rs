@@ -12,10 +12,9 @@
 //! [`ReceiveFlowStateFfi`] without re-implementing the orchestration.
 
 use crate::error::{auth_code, FfiError};
-use agicash_auth_opensecret::OpenSecretClient;
 use agicash_cashu::{
-    AlreadyClaimedInfo, CashuSeedProvider, MintConfirmation, ReceiveFlowError, ReceiveFlowEvent,
-    ReceiveFlowResult, ReceiveFlowService, ReceiveFlowState, ReceiveFlowStatus,
+    AlreadyClaimedInfo, MintConfirmation, ReceiveFlowError, ReceiveFlowEvent, ReceiveFlowResult,
+    ReceiveFlowService, ReceiveFlowState, ReceiveFlowStatus,
 };
 use tokio::sync::Mutex;
 
@@ -246,33 +245,10 @@ impl ReceiveFlow {
     }
 }
 
-/// `CashuSeedProvider` impl that pulls from a shared `OpenSecretClient`.
-/// Lives in the FFI layer (rather than `agicash-cashu`) so the cashu crate
-/// stays free of the auth dependency.
-pub struct OpenSecretSeedProvider {
-    client: OpenSecretClient,
-}
-
-impl OpenSecretSeedProvider {
-    #[must_use]
-    pub fn new(client: OpenSecretClient) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait::async_trait]
-impl CashuSeedProvider for OpenSecretSeedProvider {
-    async fn get_cashu_seed(&self) -> Result<[u8; 64], ReceiveFlowError> {
-        // The seed call returns an AuthError. Map to the dedicated
-        // `ReceiveFlowError::Auth` variant so the orchestrator surfaces
-        // `code::AUTH` (not `code::UNKNOWN`) on the Failed state — the UI
-        // can then prompt for re-authentication instead of a generic error.
-        self.client
-            .get_cashu_seed()
-            .await
-            .map_err(|e| ReceiveFlowError::Auth(format!("fetch cashu seed: {e}")))
-    }
-}
+// 12c Task 7: `OpenSecretSeedProvider` deleted — the facade's
+// `AuthClientSeedProvider` (agicash-wallet) is now the sole seed path;
+// `AgicashWallet::receive_flow` delegates to `WalletClient::receive_flow()`
+// which constructs the service (incl. its seed provider) itself.
 
 /// Translate a [`ReceiveFlowError`] from the inner orchestrator (which
 /// happens on `dispatch` failures like invalid-event) to `FfiError`. Most
