@@ -55,6 +55,14 @@ targets:
         # hits the same bug. Xcode IDE Cmd-B isn't affected.
         ENABLE_DEBUG_DYLIB: NO
         LD: $(TOOLCHAIN_DIR)/usr/bin/clang
+        # Keychain-access-group entitlement. Without it, the team-less /
+        # ad-hoc signing this project uses (DEVELOPMENT_TEAM="" /
+        # CODE_SIGN_IDENTITY="") yields an app with NO default
+        # application-identifier keychain group, so SessionStore's
+        # SecItem* calls fail with errSecMissingEntitlement (-34018) and
+        # bootstrap() shows a fatal error screen on first launch. See the
+        # comment in Agicash.entitlements.
+        CODE_SIGN_ENTITLEMENTS: Agicash/Agicash.entitlements
     dependencies:
       # Static-library XCFramework (sapling pattern). Linked at build
       # time; nothing to embed at runtime.

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Keychain access group. The app persists its session
+	  (`PersistedSession`) via `SessionStore` (kSecClassGenericPassword).
+	  Without an explicit keychain-access-group entitlement an ad-hoc /
+	  team-less signed build (the simulator + CI path: project.yml sets
+	  DEVELOPMENT_TEAM="" / CODE_SIGN_IDENTITY="") has NO default
+	  application-identifier keychain group, so every SecItem* call fails
+	  with errSecMissingEntitlement (-34018). `bootstrap()` maps that to a
+	  fatal `phase = .error("session load failed: keychain error: -34018")`
+	  screen on first launch — the user never even reaches the sign-in /
+	  guest screen. Declaring an explicit group makes the Keychain usable
+	  on every signing configuration (the group string is arbitrary; it
+	  just has to exist).
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>com.makeprisms.agicash</string>
+	</array>
+</dict>
+</plist>
