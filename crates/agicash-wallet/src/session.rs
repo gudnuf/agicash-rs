@@ -130,4 +130,66 @@ mod tests {
         // INV-1: must be Ok despite the inner client erroring.
         assert!(contract.logout().await.is_ok());
     }
+
+    /// Storage fake whose `clear` ALWAYS errors — proves INV-1 swallows the
+    /// disk failure too (logout still Ok).
+    #[derive(Debug, Default)]
+    struct ErroringClearStorage;
+
+    #[async_trait]
+    impl SessionStorage for ErroringClearStorage {
+        async fn store(&self, _s: &PersistedSession) -> Result<(), agicash_traits::AuthError> {
+            Ok(())
+        }
+        async fn load(&self) -> Result<Option<PersistedSession>, agicash_traits::AuthError> {
+            Ok(None)
+        }
+        async fn clear(&self) -> Result<(), agicash_traits::AuthError> {
+            Err(agicash_traits::AuthError::Internal("disk full on clear".into()))
+        }
+    }
+
+    /// Auth fake whose logout succeeds (isolate the storage-clear path).
+    #[derive(Debug, Default)]
+    struct OkLogoutAuth;
+
+    #[async_trait]
+    impl AuthClient for OkLogoutAuth {
+        async fn register_guest(&self) -> Result<Session, WalletError> {
+            Ok(Session { user_id: UserId::new(), refresh_token: "rt".into() })
+        }
+        async fn login_email(&self, _e: &str, _p: &str) -> Result<Session, WalletError> {
+            unimplemented!()
+        }
+        async fn register_email(
+            &self,
+            _e: &str,
+            _p: &str,
+            _n: Option<&str>,
+        ) -> Result<Session, WalletError> {
+            unimplemented!()
+        }
+        async fn logout(&self) -> Result<(), WalletError> {
+            Ok(())
+        }
+        async fn set_session(&self, _s: Session) -> Result<(), WalletError> {
+            unimplemented!()
+        }
+        async fn get_session(&self) -> Result<Option<Session>, WalletError> {
+            Ok(None)
+        }
+        async fn cashu_seed(&self) -> Result<[u8; 64], WalletError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_returns_ok_even_when_storage_clear_errors() {
+        let contract = SessionContract::with_storage(
+            Arc::new(OkLogoutAuth),
+            Arc::new(ErroringClearStorage),
+        );
+        // INV-1: a disk-clear failure must NOT fail logout.
+        assert!(contract.logout().await.is_ok());
+    }
 }
