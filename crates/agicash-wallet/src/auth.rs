@@ -43,8 +43,24 @@ pub struct Session {
 /// byte master seed the cashu state machines (mint_quote, receive_swap)
 /// need for blinded message generation. Returned freshly each call —
 /// consumers cache it themselves if they want.
-#[async_trait]
-pub trait AuthClient: Send + Sync + std::fmt::Debug {
+/// Marker bound alias — `Send + Sync` on native, dropped on wasm.
+/// `std::fmt::Debug` is required on every target (the builder + the
+/// `WalletClient` Debug impl need it). Mirrors `KeyProviderBounds`
+/// (`agicash-traits/src/key_provider.rs`) with the extra `Debug`
+/// super-bound this trait already carried.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait AuthClientBounds: Send + Sync + std::fmt::Debug {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + std::fmt::Debug> AuthClientBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait AuthClientBounds: std::fmt::Debug {}
+#[cfg(target_arch = "wasm32")]
+impl<T: std::fmt::Debug> AuthClientBounds for T {}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait AuthClient: AuthClientBounds {
     /// Register a fresh guest account on the auth backend.
     async fn register_guest(&self) -> Result<Session, WalletError>;
 
@@ -164,5 +180,17 @@ mod tests {
         a.register_guest().await.unwrap();
         a.logout().await.unwrap();
         assert!(a.get_session().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn auth_client_bound_alias_is_object_safe() {
+        // Compile-time proof: `Arc<dyn AuthClient>` still works (native
+        // bound = Send+Sync+Debug via AuthClientBounds) AND the marker
+        // alias exists so the wasm cfg arm can drop Send+Sync without
+        // touching any method. On native this asserts the Send+Sync arm.
+        fn assert_bounds<T: AuthClientBounds>() {}
+        fn takes_dyn(_: std::sync::Arc<dyn AuthClient>) {}
+        assert_bounds::<crate::auth::tests::FakeAuth>();
+        let _ = takes_dyn;
     }
 }

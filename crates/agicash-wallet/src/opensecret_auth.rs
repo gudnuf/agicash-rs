@@ -76,7 +76,8 @@ impl OpenSecretAuthClient {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl AuthClient for OpenSecretAuthClient {
     async fn register_guest(&self) -> Result<Session, WalletError> {
         let password = random_password();
