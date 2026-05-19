@@ -417,6 +417,7 @@ dependencies = [
  "leptos_meta",
  "leptos_router",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "uuid",
  "wasm-bindgen",

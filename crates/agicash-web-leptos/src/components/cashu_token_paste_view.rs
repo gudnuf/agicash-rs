@@ -13,13 +13,13 @@
 //!     `AgicashWasmWallet::receive_token(preview.raw)` over the
 //!     `WalletClient::from_config` core. `Ok` → success card, `Err` →
 //!     inline error (edit + retry).
-//!   - "Mint already added?" remains a **pure client-side UX hint**
-//!     against `KNOWN_MINTS` (the unknown-mint "Add mint first?" CTA).
-//!     The real `receive_token` handles unknown mints per the facade's
-//!     one-shot semantics — no pre-check gates the receive. Replacing
-//!     this hint with an interactive add-mint confirmation against the
-//!     real account list is **12c receive-flow scope**, NOT 12d (see
-//!     the `TODO[12c-receive-flow]` markers below).
+//!   - "Mint already added?" is now a **real** UX hint: the preview
+//!     flow asks `AgicashWasmWallet::list_accounts()` whether the
+//!     token's mint is one of the user's existing Cashu accounts (12c
+//!     `receive_flow()` + `add_mint_account` landed). The real
+//!     `receive_token` still handles unknown mints per the facade's
+//!     one-shot semantics — the lookup only drives the "Add mint
+//!     first?" CTA, it does NOT gate the receive.
 
 // The view body is long but linear; splitting into private sub-components
 // would just add indirection without reuse benefit.
@@ -34,20 +34,6 @@ use leptos_router::hooks::use_navigate;
 
 use crate::config::AppConfig;
 use crate::tokens;
-
-/// Well-known mints used for the client-side "already added?" UX hint.
-/// Pure presentational — the real `receive_token` (12d) does NOT gate
-/// on this; it handles unknown mints itself.
-//
-// TODO[12c-receive-flow]: replace this hard-coded allowlist with a real
-// `AgicashWasmWallet::listAccounts()` lookup + interactive add-mint
-// confirmation. That is 12c receive-flow scope, NOT 12d (12d depends on
-// 12b-1 only and does not touch the receive-flow orchestrator).
-const KNOWN_MINTS: &[&str] = &[
-    "https://nofees.testnut.cashu.space",
-    "https://mint.minibits.cash/Bitcoin",
-    "https://testnut.cashu.space",
-];
 
 /// Parsed token preview — what we render between "user pasted + clicked
 /// Preview" and "user clicked Receive". All fields are cheap derivations
@@ -67,8 +53,12 @@ struct TokenPreview {
     unit: String,
     mint_url: String,
     memo: Option<String>,
-    /// True iff `mint_url` is in `KNOWN_MINTS`. Client-side UX hint
-    /// only; see the `TODO[12c-receive-flow]` on `KNOWN_MINTS`.
+    /// True iff `mint_url` matches one of the user's existing Cashu
+    /// accounts (real `AgicashWasmWallet::list_accounts()` lookup).
+    /// Drives only the "Add mint first?" CTA — does NOT gate receive.
+    /// Defaults to `true` from the synchronous parse (CTA hidden) and
+    /// is corrected by the async account-list lookup once it resolves,
+    /// so the unknown-mint CTA never flashes before the answer is known.
     mint_known: bool,
 }
 
@@ -132,7 +122,10 @@ pub fn CashuTokenPasteView() -> impl IntoView {
             return;
         }
         match parse_token(&raw) {
-            Ok(preview) => phase.set(Phase::Preview(preview)),
+            Ok(preview) => {
+                phase.set(Phase::Preview(preview.clone()));
+                resolve_mint_known(config, phase, preview);
+            }
             Err(msg) => phase.set(Phase::Error(msg)),
         }
     };
@@ -165,7 +158,10 @@ pub fn CashuTokenPasteView() -> impl IntoView {
             return;
         }
         match parse_token(&raw) {
-            Ok(preview) => phase.set(Phase::Preview(preview)),
+            Ok(preview) => {
+                phase.set(Phase::Preview(preview.clone()));
+                resolve_mint_known(config, phase, preview);
+            }
             Err(msg) => phase.set(Phase::Error(msg)),
         }
     };
@@ -234,14 +230,15 @@ pub fn CashuTokenPasteView() -> impl IntoView {
     let on_add_mint = {
         let navigate = navigate.clone();
         move |_ev| {
-            // TODO[12c-receive-flow]: real add-mint route + interactive
-            // confirmation lands with the 12c receive-flow work. For now
-            // this is a placeholder so the CTA goes somewhere
-            // intentional rather than no-op'ing (not a 12d concern).
-            navigate(
-                "/accounts/add-mint",
-                leptos_router::NavigateOptions::default(),
-            );
+            // Whether to show this CTA is now a REAL decision (the
+            // account-list lookup in `resolve_mint_known`). The
+            // destination is the real registered add-mint route
+            // (`/accounts/add`, app.rs) — was `/accounts/add-mint`,
+            // which matched no route and 404'd to "Not found.". The
+            // add-mint *form page itself* is still a placeholder
+            // (tracked in `pages/accounts.rs`); inline pre-fill of the
+            // pasted mint URL is a follow-up there, not in this view.
+            navigate("/accounts/add", leptos_router::NavigateOptions::default());
         }
     };
 
@@ -607,14 +604,16 @@ fn parse_token(raw: &str) -> Result<TokenPreview, String> {
         .value()
         .map_err(|e| format!("Could not compute token amount: {e}"))?;
     let memo = token.memo().clone();
-    let mint_known = is_known_mint(&mint_url);
     Ok(TokenPreview {
         raw: raw.to_string(),
         amount: amount.into(),
         unit: unit_label,
         mint_url,
         memo,
-        mint_known,
+        // Optimistically hide the "Add mint first?" CTA; the async
+        // account-list lookup (`fetch_mint_known`) corrects this once
+        // the real wallet answers, so the CTA never flashes.
+        mint_known: true,
     })
 }
 
@@ -632,14 +631,103 @@ fn unit_label(unit: Option<CurrencyUnit>) -> String {
     }
 }
 
-fn is_known_mint(mint_url: &str) -> bool {
-    // Trim trailing slash for the comparison so
-    // "https://mint.example.com" and "https://mint.example.com/" both
-    // match the same allowlist entry.
+/// True iff `mint_url` matches any URL in `account_mint_urls`. Trailing
+/// slash is normalized on both sides so `https://m.example` and
+/// `https://m.example/` compare equal (the user-pasted token URL and
+/// the stored account URL may differ only by a trailing slash).
+//
+// Called only from `fetch_mint_known` (wasm-only) + the unit tests; the
+// native `rlib` build sees no non-test caller. Same native-only honest
+// `allow(dead_code)` idiom the `Phase` enum uses above.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn mint_in_accounts<'a>(
+    mint_url: &str,
+    account_mint_urls: impl IntoIterator<Item = &'a str>,
+) -> bool {
     let needle = mint_url.trim_end_matches('/');
-    KNOWN_MINTS
-        .iter()
+    account_mint_urls
+        .into_iter()
         .any(|known| known.trim_end_matches('/') == needle)
+}
+
+/// Cashu account mint URL fetched from the real wallet. Local
+/// deserialize target for the JSON array `AgicashWasmWallet::
+/// list_accounts()` returns (`AccountWasm` serializes with verbatim
+/// field names; only the two fields the CTA hint needs are read).
+#[cfg(target_arch = "wasm32")]
+#[derive(serde::Deserialize)]
+struct AccountMintUrl {
+    account_type: String,
+    mint_url: Option<String>,
+}
+
+/// Real "is this mint already a wallet account?" lookup. Asks
+/// `AgicashWasmWallet::list_accounts()` (12c receive-flow path) and
+/// returns whether `mint_url` matches any of the user's existing Cashu
+/// accounts. On any error (no session, network) returns `true` — the
+/// CTA is a non-blocking hint, so a failed lookup must NOT pop a
+/// spurious "Add mint first?" prompt; `receive_token` handles unknown
+/// mints itself regardless.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_mint_known(config: &AppConfig, mint_url: &str) -> bool {
+    let wallet = match agicash_wasm::AgicashWasmWallet::new(
+        config.opensecret_base_url.clone(),
+        config.opensecret_client_id.to_string(),
+        config.supabase_url.clone(),
+        config.supabase_anon_key.clone(),
+    ) {
+        Ok(w) => w,
+        Err(_) => return true,
+    };
+    let js = match wallet.list_accounts().await {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let accounts: Vec<AccountMintUrl> = match serde_wasm_bindgen::from_value(js) {
+        Ok(a) => a,
+        Err(_) => return true,
+    };
+    let cashu_mint_urls = accounts
+        .iter()
+        .filter(|a| a.account_type == "cashu")
+        .filter_map(|a| a.mint_url.as_deref());
+    mint_in_accounts(mint_url, cashu_mint_urls)
+}
+
+/// Spawn the real account-list lookup for `preview`'s mint and patch
+/// the live phase's `mint_known` once it resolves. The write is guarded
+/// on the phase still showing this exact token (Preview/Working with
+/// the same `raw`) so a late answer can't clobber a phase the user
+/// already moved away from. Native (`rlib` unit-test) builds have no
+/// browser wallet, so this is a no-op there (`config` is consumed to
+/// keep the handler's capture honest).
+fn resolve_mint_known(
+    config: StoredValue<AppConfig>,
+    phase: RwSignal<Phase>,
+    preview: TokenPreview,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let config = config.get_value();
+        spawn_local(async move {
+            let known = fetch_mint_known(&config, &preview.mint_url).await;
+            // Default is already `true`; only a confirmed-unknown mint
+            // needs a phase patch (and only if we're still on it).
+            if known {
+                return;
+            }
+            phase.update(|p| match p {
+                Phase::Preview(cur) | Phase::Working(cur) if cur.raw == preview.raw => {
+                    cur.mint_known = false;
+                }
+                _ => {}
+            });
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (config, phase, preview);
+    }
 }
 
 /// Format an integer amount with `_` thousand separators so a 100,000
@@ -715,7 +803,7 @@ fn button_style(variant: ButtonVariant) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_known_mint, parse_token, KNOWN_MINTS};
+    use super::{mint_in_accounts, parse_token};
 
     /// V3 token (cashuA) fixture copied from `cashu-0.15.1` upstream
     /// tests. 2+8 = 10 sat at <https://8333.space:3338>, memo "Thank you
@@ -730,9 +818,10 @@ mod tests {
         assert_eq!(preview.unit, "sats");
         assert_eq!(preview.mint_url, "https://8333.space:3338");
         assert_eq!(preview.memo.as_deref(), Some("Thank you very much."));
-        // Mint isn't in our hard-coded test list, so the unknown-mint
-        // CTA should be active.
-        assert!(!preview.mint_known);
+        // The synchronous parse no longer gates on a static allowlist;
+        // it optimistically defaults `mint_known = true` (CTA hidden)
+        // and the real async `list_accounts()` lookup corrects it.
+        assert!(preview.mint_known);
     }
 
     #[test]
@@ -752,20 +841,27 @@ mod tests {
     }
 
     #[test]
-    fn known_mint_matches_with_trailing_slash() {
-        // The known-mints list entries don't have trailing slashes; the
-        // comparison must normalize so user-pasted URLs match.
-        for known in KNOWN_MINTS {
-            let with_slash = format!("{known}/");
-            assert!(
-                is_known_mint(&with_slash),
-                "{with_slash} should match {known}",
-            );
-        }
+    fn mint_in_accounts_matches_with_trailing_slash() {
+        // The pasted token URL and the stored account URL may differ
+        // only by a trailing slash; the comparison must normalize both
+        // sides so they still match.
+        assert!(mint_in_accounts(
+            "https://m.example/",
+            ["https://m.example"],
+        ));
+        assert!(mint_in_accounts(
+            "https://m.example",
+            ["https://m.example/"],
+        ));
     }
 
     #[test]
-    fn unknown_mint_returns_false() {
-        assert!(!is_known_mint("https://example.com"));
+    fn mint_in_accounts_false_when_absent() {
+        assert!(!mint_in_accounts(
+            "https://example.com",
+            ["https://other.example", "https://third.example"],
+        ));
+        // Empty account list (no Cashu accounts yet) ⇒ not known.
+        assert!(!mint_in_accounts("https://example.com", []));
     }
 }
