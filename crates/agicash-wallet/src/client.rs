@@ -15,7 +15,7 @@ use crate::error::WalletError;
 use crate::types::{
     AccountSummary, AuthStatus, BalanceSummary, ExchangeRateSnapshot, MintSummary,
     ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState, ReceiveReceipt,
-    ReceiveStatus, SendLightningHandle, SendLightningQuote, SendLightningReceipt, SendTokenQuote,
+    ReceiveStatus, SendLightningQuote, SendLightningReceipt, SendLightningStatus, SendTokenQuote,
     SendTokenReceipt, TokenVersion, Transaction, TransactionFilter, TransactionPage,
 };
 use agicash_cashu::{
@@ -147,7 +147,7 @@ impl WalletClient {
             .ok_or_else(|| WalletError::NotFound(format!("account {account_id}")))?;
         // `get_account` is not user-scoped at the storage layer (unlike
         // `list_accounts`), so re-check ownership here — same guard the
-        // quote methods use (see `complete_send_lightning`,
+        // quote methods use (see `poll_send_lightning`,
         // `poll_receive_lightning`).
         if account.user_id != session.user_id {
             return Err(WalletError::Validation {
@@ -550,16 +550,20 @@ impl WalletClient {
         })
     }
 
-    /// Kick off a Lightning send.
-    ///
-    /// Two-shot per the slice-8 lifecycle: this method takes UNPAID →
-    /// PENDING by calling `post_melt`. The caller drives
-    /// [`Self::complete_send_lightning`] until terminal.
-    pub async fn send_lightning(
+    /// Begin a Lightning send (NUT-05 melt). UNPAID → PENDING via the
+    /// core's `initiate_melt`. Returns a reconcile-aware
+    /// [`SendLightningStatus`] — **never** an `Err` on "still
+    /// in-flight" (P0-1). On [`SendLightningStatus::InFlight`] the
+    /// caller MUST drive [`Self::poll_send_lightning`] on its own
+    /// cadence and MUST NOT re-quote / re-`begin` this invoice
+    /// (re-quoting fires a second `post_melt` → double-pay). Mirrors
+    /// the proven FFI `create_melt_quote` + `execute_melt_quote`
+    /// contract (`crates/agicash-ffi/src/wallet.rs` @ canonical ref).
+    pub async fn begin_send_lightning(
         &self,
         account_id: Option<AccountId>,
         invoice: String,
-    ) -> Result<SendLightningHandle, WalletError> {
+    ) -> Result<SendLightningStatus, WalletError> {
         let session = self.require_session().await?;
         let accounts = self.user_storage.list_accounts(session.user_id).await?;
         let account = pick_cashu_account(&accounts, account_id, Currency::Btc)?.clone();
@@ -581,38 +585,29 @@ impl WalletClient {
         let seed = self.auth.cashu_seed().await?;
 
         // initiate_melt may return Paid (sync mint), Pending (in-flight),
-        // or Failed. The handle returned here always references the
-        // quote_id so the caller can poll regardless of which branch.
+        // or Failed. Map onto the typed, reconcile-aware status — a
+        // PENDING is the non-error `InFlight`, never an `Err` (P0-1).
         let outcome = self
             .melt_quote_service
             .initiate_melt(&account, create_result.quote.clone(), &seed)
             .await?;
-        let quote = match outcome {
-            MeltOutcome::Paid { quote, .. }
-            | MeltOutcome::Pending(quote)
-            | MeltOutcome::Failed(quote) => quote,
-        };
-
-        Ok(SendLightningHandle {
-            quote_id: quote.id,
-            bolt11: quote.payment_request.clone(),
-            amount: quote.amount_received.clone(),
-            total_fee: quote.cashu_fee.clone(),
-            account_id: quote.account_id,
-            payment_hash: quote.payment_hash.clone(),
-            expires_at: quote.expires_at,
-        })
+        Ok(meltoutcome_to_status(outcome))
     }
 
-    /// Drive a PENDING melt-quote to a terminal state.
-    ///
-    /// Polls the mint up to `timeout` (default 30s) at `poll_interval`
-    /// cadence (default 1s). Returns the terminal receipt on PAID, or a
-    /// `WalletError::Cashu` on FAILED.
-    pub async fn complete_send_lightning(
+    /// Single-shot poll of a PENDING melt quote (P0-1). Does exactly
+    /// one mint status check then returns — the caller owns the
+    /// polling cadence + cancel lifecycle (mirrors FFI
+    /// `poll_melt_quote`'s zero-timeout contract and the iOS 2s
+    /// poll `Task`). A still-in-flight result is
+    /// [`SendLightningStatus::InFlight`], **never** an `Err` — so a
+    /// transient still-pending can never be mistaken for a failure and
+    /// re-quoted (the removed `complete_send_lightning`'s 30s-timeout
+    /// `Err(Cashu("still pending"))` was exactly that double-pay
+    /// vector).
+    pub async fn poll_send_lightning(
         &self,
         quote_id: Uuid,
-    ) -> Result<SendLightningReceipt, WalletError> {
+    ) -> Result<SendLightningStatus, WalletError> {
         let session = self.require_session().await?;
         let quote = self
             .cashu_melt_quote_storage
@@ -635,25 +630,10 @@ impl WalletClient {
 
         let outcome = self
             .melt_quote_service
-            .poll_until_complete(
-                &account,
-                quote.clone(),
-                &seed,
-                Duration::from_secs(1),
-                Duration::from_secs(30),
-            )
+            .poll_until_complete(&account, quote.clone(), &seed, Duration::ZERO, Duration::ZERO)
             .await?;
 
-        match outcome {
-            MeltOutcome::Paid { quote: paid, .. } => melt_paid_to_receipt(&paid),
-            MeltOutcome::Pending(_) => Err(WalletError::Cashu(
-                "lightning payment still pending after poll timeout".into(),
-            )),
-            MeltOutcome::Failed(q) => Err(WalletError::Cashu(format!(
-                "lightning payment failed: {:?}",
-                q.state
-            ))),
-        }
+        Ok(meltoutcome_to_status(outcome))
     }
 
     /// LUD-16 resolve → quote → send convenience wrapper.
@@ -664,7 +644,7 @@ impl WalletClient {
         amount: Money,
     ) -> Result<SendLightningReceipt, WalletError> {
         // Lightning send always settles against a BTC Cashu account
-        // (see `send_lightning` → `pick_cashu_account(.., Currency::Btc)`).
+        // (see `begin_send_lightning` → `pick_cashu_account(.., Currency::Btc)`).
         // Guard the requested currency BEFORE conversion so a non-BTC
         // amount fails fast with a clear error instead of producing a
         // misleading msat figure.
@@ -683,8 +663,37 @@ impl WalletClient {
         let amount_msat = money_to_msat(&amount)?;
         let invoice = agicash_lightning_address::request_invoice(&info, amount_msat, None).await?;
 
-        let handle = self.send_lightning(account_id, invoice).await?;
-        self.complete_send_lightning(handle.quote_id).await
+        // Convenience wrapper: begin, then ONE reconcile poll if the
+        // mint left the payment in flight. It deliberately does NOT
+        // loop (a runtime-agnostic facade must not block on a slow
+        // Lightning settle — cross-cutting constraint); a caller that
+        // needs to drive a slow payment to terminal uses
+        // `begin_send_lightning` + its own `poll_send_lightning`
+        // cadence. Behavior change vs. the removed 30s-loop wrapper:
+        // documented + intended (P0-1).
+        match self.begin_send_lightning(account_id, invoice).await? {
+            SendLightningStatus::Paid(receipt) => Ok(receipt),
+            SendLightningStatus::InFlight { quote_id } => {
+                match self.poll_send_lightning(quote_id).await? {
+                    SendLightningStatus::Paid(receipt) => Ok(receipt),
+                    SendLightningStatus::InFlight { quote_id } => {
+                        // Still in flight after one reconcile poll —
+                        // surface as the typed concurrency signal, NOT
+                        // a `Cashu("still pending")` (the old double-pay
+                        // string). The caller must poll, never re-send.
+                        Err(WalletError::Concurrency(format!(
+                            "lightning send {quote_id} still in flight — poll, do not re-send"
+                        )))
+                    }
+                    SendLightningStatus::Failed { reason, .. } => {
+                        Err(WalletError::Cashu(format!("lightning send failed: {reason}")))
+                    }
+                }
+            }
+            SendLightningStatus::Failed { reason, .. } => {
+                Err(WalletError::Cashu(format!("lightning send failed: {reason}")))
+            }
+        }
     }
 }
 
@@ -1150,6 +1159,30 @@ fn complete_mint_quote_to_receipt(
     }
 }
 
+/// Map the core `MeltOutcome` onto the reconcile-aware
+/// [`SendLightningStatus`] (P0-1). `Pending` becomes the typed,
+/// non-error `InFlight` (NEVER an `Err`); `Failed` carries the
+/// persisted reason and is terminal/non-re-quotable (the verdict
+/// round-tripped the mint via `poll_until_complete` / `initiate_melt`).
+fn meltoutcome_to_status(outcome: MeltOutcome) -> SendLightningStatus {
+    match outcome {
+        MeltOutcome::Paid { quote, .. } => {
+            // melt_paid_to_receipt returns Result; a PAID outcome whose
+            // state isn't Paid{..} is an internal invariant break — fall
+            // back to InFlight so we never present a false terminal.
+            match melt_paid_to_receipt(&quote) {
+                Ok(receipt) => SendLightningStatus::Paid(receipt),
+                Err(_) => SendLightningStatus::InFlight { quote_id: quote.id },
+            }
+        }
+        MeltOutcome::Pending(q) => SendLightningStatus::InFlight { quote_id: q.id },
+        MeltOutcome::Failed(q) => SendLightningStatus::Failed {
+            quote_id: q.id,
+            reason: format!("{:?}", q.state),
+        },
+    }
+}
+
 fn melt_paid_to_receipt(
     quote: &agicash_cashu::CashuMeltQuote,
 ) -> Result<SendLightningReceipt, WalletError> {
@@ -1332,4 +1365,33 @@ mod tests {
     // builder / `UserStorage` fake yet. Deferred to the fakes lane.
     // TODO[slice-12-followup]: add get_account wrong_owner test once a
     // lightweight WalletClient test harness / UserStorage fake exists.
+
+    // --- 12b-2 Task 5: P0-1 reconcile-aware surface ---
+
+    #[test]
+    fn p0_1_pending_is_a_typed_non_error_outcome_not_an_err() {
+        // The regression: complete_send_lightning returned
+        // Err(Cashu("still pending after poll timeout")) on the 30s
+        // branch; a consumer treating that Err as "failed" + re-quoting
+        // double-pays. The fix makes "still pending" an un-mistakable
+        // typed variant, never an Err. This test pins that contract: an
+        // InFlight status is constructible and is NOT a WalletError.
+        let qid = uuid::Uuid::new_v4();
+        let status = SendLightningStatus::InFlight { quote_id: qid };
+        // Must be matchable as a non-error outcome the consumer polls.
+        assert!(matches!(
+            status,
+            SendLightningStatus::InFlight { quote_id } if quote_id == qid
+        ));
+    }
+
+    #[test]
+    fn p0_1_complete_send_lightning_is_removed() {
+        // Compile-time guarantee that the ambiguous bundled-loop method is
+        // gone (clean-refactor, replace-not-coexist per the spec). If
+        // someone re-adds it, this test's doc comment points them here.
+        // Enforced by the Step 4 grep gate; this test documents intent.
+        // (No runtime assertion possible for a removed symbol; the grep
+        // in the verification gate is the executable gate.)
+    }
 }

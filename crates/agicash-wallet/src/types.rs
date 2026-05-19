@@ -169,8 +169,10 @@ pub struct SendLightningQuote {
 
 /// Handle for an in-flight Lightning send.
 ///
-/// Returned by `send_lightning` once the quote is PENDING; the caller
-/// drives `complete_send_lightning(quote_id)` until terminal.
+/// The reconcile-aware send surface ([`crate::WalletClient::begin_send_lightning`]
+/// / [`crate::WalletClient::poll_send_lightning`]) returns
+/// [`SendLightningStatus`] carrying the `quote_id` directly (P0-1); this
+/// struct is retained for the stable public type surface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendLightningHandle {
     /// Wallet-side UUID of the persisted quote row.
