@@ -28,8 +28,8 @@ pub use mint_quote::{
 };
 pub use provider::CdkCashuProvider;
 pub use receive_flow::{
-    AlreadyClaimedInfo, CashuSeedProvider, MintConfirmation, ReceiveFlowError, ReceiveFlowEvent,
-    ReceiveFlowMachine, ReceiveFlowResult, ReceiveFlowService, ReceiveFlowState,
+    add_mint_account, AlreadyClaimedInfo, CashuSeedProvider, MintConfirmation, ReceiveFlowError,
+    ReceiveFlowEvent, ReceiveFlowMachine, ReceiveFlowResult, ReceiveFlowService, ReceiveFlowState,
     ReceiveStatus as ReceiveFlowStatus,
 };
 pub use receive_swap::{

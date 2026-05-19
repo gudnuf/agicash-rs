@@ -232,103 +232,18 @@ impl ReceiveFlowService {
 
     /// Add a Cashu mint to the user's wallet account list. Mirrors
     /// `crates/agicash-cli/src/mint.rs::cmd_mint_add` minus the print step.
+    ///
+    /// Thin delegate to the shared [`add_mint_account`] primitive so the
+    /// `agicash-wallet` facade can reuse the identical upsert path (12c
+    /// add-mint dedup, D2) without duplicating it. Behavior is
+    /// byte-identical to the prior inline body.
     async fn add_mint(
         &self,
         mint_url: &str,
         mint_name: &str,
         currency: Currency,
     ) -> Result<Account, ReceiveFlowError> {
-        let existing = self.storage.get_user(self.user_id).await?;
-        let (
-            email,
-            email_verified,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        ) = if let Some(u) = existing.as_ref() {
-            (
-                u.email.clone(),
-                u.email_verified,
-                u.cashu_locking_xpub.clone(),
-                u.encryption_public_key.clone(),
-                u.spark_identity_public_key.clone(),
-                u.terms_accepted_at,
-                u.gift_card_mint_terms_accepted_at,
-            )
-        } else {
-            let placeholder_prefix = format!("uninitialized-{}-", self.user_id);
-            (
-                None,
-                false,
-                format!("{placeholder_prefix}cashu"),
-                format!("{placeholder_prefix}encryption"),
-                format!("{placeholder_prefix}spark"),
-                None,
-                None,
-            )
-        };
-
-        let mut accounts = vec![AccountInput {
-            account_type: AccountType::Cashu,
-            purpose: AccountPurpose::Transactional,
-            currency,
-            name: mint_name.to_string(),
-            details: json!({
-                "mint_url": mint_url,
-                "keyset_counters": {},
-            }),
-            is_default: false,
-        }];
-        if existing.is_none() {
-            accounts.push(AccountInput {
-                account_type: AccountType::Spark,
-                purpose: AccountPurpose::Transactional,
-                currency: Currency::Btc,
-                name: "Lightning".into(),
-                details: json!({
-                    "network": "MAINNET",
-                    "cli_placeholder": true,
-                }),
-                is_default: true,
-            });
-        }
-
-        let input = UpsertUserInput {
-            user_id: self.user_id,
-            email,
-            email_verified,
-            accounts,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        };
-
-        let result = self
-            .storage
-            .upsert_user_with_accounts(input)
-            .await
-            .map_err(ReceiveFlowError::MintAdd)?;
-
-        let new_account = result
-            .accounts
-            .into_iter()
-            .find(|a| {
-                a.account_type == AccountType::Cashu
-                    && a.details
-                        .get("mint_url")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| mint_urls_equal(s, mint_url))
-            })
-            .ok_or_else(|| {
-                ReceiveFlowError::MintAdd(agicash_traits::StorageError::Internal(
-                    "upsert returned no account matching the new mint URL".into(),
-                ))
-            })?;
-        Ok(new_account)
+        add_mint_account(self.user_id, &self.storage, mint_url, mint_name, currency).await
     }
 
     async fn run_swap(
@@ -402,6 +317,119 @@ impl ReceiveFlowService {
     fn go_failed_from_swap(&mut self, err: ReceiveSwapError) -> ReceiveFlowState {
         self.go_failed_from(&ReceiveFlowError::Swap(err))
     }
+}
+
+/// Shared, sans-session add-mint primitive: given a `user_id`, the user
+/// storage, a discovered `mint_url`/`mint_name`, and the target currency,
+/// preserve the existing user row (or seed placeholder values for a
+/// brand-new guest), upsert a Cashu account (+ a placeholder Spark
+/// account for first-time guests so the RPC's "≥1 BTC Spark" constraint
+/// holds), and return the newly-created Cashu [`Account`].
+///
+/// This is the de-duplicated core BOTH `ReceiveFlowService::add_mint`
+/// (here, after `handle_start`'s NUT-06 discovery) and
+/// `agicash_wallet::WalletClient::add_mint` (after its own NUT-06
+/// discovery + `require_session`) call. Discovery + session live in the
+/// callers (they each fetch `mint_info` at different points in their
+/// flow, so discovery cannot be hoisted here without changing one
+/// caller's timing). Behavior byte-identical to the prior inline bodies.
+pub async fn add_mint_account(
+    user_id: UserId,
+    storage: &Arc<dyn UserStorage>,
+    mint_url: &str,
+    mint_name: &str,
+    currency: Currency,
+) -> Result<Account, ReceiveFlowError> {
+    let existing = storage.get_user(user_id).await?;
+    let (
+        email,
+        email_verified,
+        cashu_locking_xpub,
+        encryption_public_key,
+        spark_identity_public_key,
+        terms_accepted_at,
+        gift_card_mint_terms_accepted_at,
+    ) = if let Some(u) = existing.as_ref() {
+        (
+            u.email.clone(),
+            u.email_verified,
+            u.cashu_locking_xpub.clone(),
+            u.encryption_public_key.clone(),
+            u.spark_identity_public_key.clone(),
+            u.terms_accepted_at,
+            u.gift_card_mint_terms_accepted_at,
+        )
+    } else {
+        let placeholder_prefix = format!("uninitialized-{user_id}-");
+        (
+            None,
+            false,
+            format!("{placeholder_prefix}cashu"),
+            format!("{placeholder_prefix}encryption"),
+            format!("{placeholder_prefix}spark"),
+            None,
+            None,
+        )
+    };
+
+    let mut accounts = vec![AccountInput {
+        account_type: AccountType::Cashu,
+        purpose: AccountPurpose::Transactional,
+        currency,
+        name: mint_name.to_string(),
+        details: json!({
+            "mint_url": mint_url,
+            "keyset_counters": {},
+        }),
+        is_default: false,
+    }];
+    if existing.is_none() {
+        accounts.push(AccountInput {
+            account_type: AccountType::Spark,
+            purpose: AccountPurpose::Transactional,
+            currency: Currency::Btc,
+            name: "Lightning".into(),
+            details: json!({
+                "network": "MAINNET",
+                "cli_placeholder": true,
+            }),
+            is_default: true,
+        });
+    }
+
+    let input = UpsertUserInput {
+        user_id,
+        email,
+        email_verified,
+        accounts,
+        cashu_locking_xpub,
+        encryption_public_key,
+        spark_identity_public_key,
+        terms_accepted_at,
+        gift_card_mint_terms_accepted_at,
+    };
+
+    let result = storage
+        .upsert_user_with_accounts(input)
+        .await
+        .map_err(ReceiveFlowError::MintAdd)?;
+
+    let new_account = result
+        .accounts
+        .into_iter()
+        .find(|a| {
+            a.account_type == AccountType::Cashu
+                && a.details
+                    .get("mint_url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| mint_urls_equal(s, mint_url))
+        })
+        .ok_or_else(|| {
+            ReceiveFlowError::MintAdd(agicash_traits::StorageError::Internal(
+                "upsert returned no account matching the new mint URL".into(),
+            ))
+        })?;
+    Ok(new_account)
 }
 
 fn receipt_from_outcome(
@@ -885,6 +913,65 @@ mod tests {
         assert!(
             !j.contains("\"amount\""),
             "AlreadyClaimed must carry NO amount (P0-4); json was {j}"
+        );
+    }
+
+    // ---- Task 2: shared `add_mint_account` primitive (D2) ------------
+
+    #[tokio::test]
+    async fn add_mint_account_builds_cashu_account_and_finds_it() {
+        let new_acct = Account {
+            id: AccountId::new(),
+            created_at: Utc::now(),
+            user_id: UserId::new(),
+            name: "Test Mint".into(),
+            account_type: AccountType::Cashu,
+            purpose: AccountPurpose::Transactional,
+            currency: Currency::Btc,
+            details: serde_json::json!({
+                "mint_url": "https://mint.example",
+                "keyset_counters": {},
+            }),
+            version: 0,
+            state: AccountState::Active,
+            expires_at: None,
+        };
+        let upsert_user = User {
+            id: new_acct.user_id,
+            created_at: Utc::now(),
+            email: None,
+            email_verified: false,
+            username: "u".into(),
+            default_btc_account_id: None,
+            default_usd_account_id: None,
+            default_currency: Currency::Btc,
+            cashu_locking_xpub: "x".into(),
+            encryption_public_key: "e".into(),
+            spark_identity_public_key: "s".into(),
+            terms_accepted_at: None,
+            gift_card_mint_terms_accepted_at: None,
+        };
+        let storage: Arc<dyn UserStorage> = Arc::new(StubStorage {
+            accounts: vec![],
+            user: None,
+            upsert_response: std::sync::Mutex::new(Some(UpsertUserResult {
+                user: upsert_user,
+                accounts: vec![new_acct.clone()],
+            })),
+        });
+        let got = add_mint_account(
+            UserId::new(),
+            &storage,
+            "https://mint.example",
+            "Test Mint",
+            Currency::Btc,
+        )
+        .await
+        .expect("add_mint_account");
+        assert_eq!(got.account_type, AccountType::Cashu);
+        assert_eq!(
+            got.details.get("mint_url").and_then(|v| v.as_str()),
+            Some("https://mint.example")
         );
     }
 }
