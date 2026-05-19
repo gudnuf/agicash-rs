@@ -51,6 +51,10 @@ default = []
 android-file-storage = ["agicash-auth-opensecret/android-file-storage"]
 
 [dev-dependencies]
+# Tier 1 hermetic suite (tests/tier1_hermetic.rs). `agicash-testing`
+# dev-depends on `agicash-wallet` while `agicash-wallet` dev-depends on
+# `agicash-testing` — a dev-only edge, no cargo cycle.
+agicash-testing = { path = "../agicash-testing" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
 

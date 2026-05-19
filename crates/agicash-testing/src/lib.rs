@@ -11,6 +11,7 @@
 //! `wasm32-unknown-unknown`.
 
 pub mod fakes;
+pub mod wallet;
 
 pub use fakes::auth::FakeAuthClient;
 pub use fakes::cashu_storage::{
@@ -19,3 +20,4 @@ pub use fakes::cashu_storage::{
 };
 pub use fakes::misc::{FixedExchangeRate, StubCashuProvider};
 pub use fakes::user_storage::{cashu_account, InMemoryUserStorage};
+pub use wallet::TestWallet;

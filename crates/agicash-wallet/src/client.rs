@@ -1602,13 +1602,11 @@ mod tests {
         );
     }
 
-    // M1 follow-up: a `get_account` ownership-mismatch test would require
-    // constructing a full `WalletClient` (11 `Arc<dyn …>` deps incl. 4
-    // concrete cashu service structs + an `AuthClient` for `require_session`)
-    // — well over the ~50 LOC inline-double budget, and there is no test
-    // builder / `UserStorage` fake yet. Deferred to the fakes lane.
-    // TODO[slice-12-followup]: add get_account wrong_owner test once a
-    // lightweight WalletClient test harness / UserStorage fake exists.
+    // M1-test (CLOSED): `get_account` ownership-mismatch is now covered
+    // hermetically via the all-fakes facade — see
+    // `tests/tier1_hermetic.rs::get_account_for_foreign_owner_is_wrong_owner_validation`
+    // (+ the owner-succeeds control). The fakes lane shipped the
+    // `agicash-testing` `TestWallet`/`InMemoryUserStorage`.
 
     // --- 12b-2 Task 5: P0-1 reconcile-aware surface ---
 
@@ -1681,17 +1679,12 @@ mod tests {
 
     #[tokio::test]
     async fn check_send_token_claimed_without_session_is_unauthenticated() {
-        // We only exercise the `require_session` guard, which short-circuits
-        // before any storage/provider call. Building a real `WalletClient`
-        // to call `check_send_token_claimed` needs all 11 deps and the
-        // builder rejects a partial set; the facade has no test harness
-        // (documented M1 TODO above) and building one is the deferred fakes
-        // lane (out of 12b-3 scope). The load-bearing NUT-07 correctness is
-        // fully covered by `claim_check` unit tests. The guard precondition
-        // is `require_session` ⇒ `get_session().is_none()`, asserted here
-        // through the public auth seam the method's first line delegates to
-        // (`self.require_session().await?`), exactly as the FFI proves the
-        // same guard (`wallet.rs:2766-2784`).
+        // 12c-3 (CLOSED): the full facade path
+        // `check_send_token_claimed` → `require_session` → `Unauthenticated`
+        // is now proven through the real `WalletClient` hermetically — see
+        // `tests/tier1_hermetic.rs::check_send_token_claimed_without_session_is_unauthenticated`.
+        // This inline assertion stays as the cheap direct-seam precondition
+        // (`require_session` ⇒ `get_session().is_none()`).
         let auth = NoSessionAuth;
         assert!(auth.get_session().await.unwrap().is_none());
     }

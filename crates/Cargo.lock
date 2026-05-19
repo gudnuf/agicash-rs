@@ -358,6 +358,7 @@ dependencies = [
  "agicash-lightning-address",
  "agicash-money",
  "agicash-storage-supabase",
+ "agicash-testing",
  "agicash-traits",
  "async-trait",
  "cdk",
