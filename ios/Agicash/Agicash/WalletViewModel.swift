@@ -147,6 +147,55 @@ final class WalletViewModel {
         )
     }
 
+    /// Wall-clock budget for a single FFI auth/session round-trip before
+    /// we stop waiting on the UI thread. The OpenSecret SDK builds its
+    /// `reqwest::Client` with NO connect/read timeout (see
+    /// `crates/agicash-auth-opensecret/src/client.rs` →
+    /// `opensecret::OpenSecretClient::new_with_user_agent`, which is
+    /// `reqwest::Client::builder().user_agent(..).build()` with no
+    /// `.timeout()`), and `ce446af7` only added timeouts to the
+    /// *non-auth* direct reqwest clients (supabase postgrest, exchange
+    /// rate). So if the enclave is down/slow when guest-signup /
+    /// login / signup / Keychain-rehydrate runs, the FFI future hangs
+    /// indefinitely and the UI sits on a perpetual spinner ("loads then
+    /// stops" — bug F5). Until the SDK/FFI grows a real transport
+    /// timeout, this Swift-side deadline guarantees the UI always
+    /// recovers to an actionable error the user can retry from.
+    private static let authFfiTimeout: Duration = .seconds(30)
+
+    /// Race an FFI auth call against `authFfiTimeout`. On timeout throws
+    /// `AuthTimeout` so the caller surfaces a retryable error instead of
+    /// blocking the spinner forever.
+    ///
+    /// Caveat (honest): a UniFFI async call is NOT cancelled by Swift
+    /// task cancellation — the orphaned Rust future keeps running on the
+    /// tokio runtime until it completes or the process exits. This
+    /// wrapper does NOT abort the network call; it frees the *UI* so the
+    /// user is no longer stuck. That is the correct fix for "loads then
+    /// stops": the real transport-timeout fix belongs in the FFI/SDK
+    /// (separate crate/repo) and is tracked separately.
+    private func withAuthTimeout<T: Sendable>(
+        _ op: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await op() }
+            group.addTask {
+                try await Task.sleep(for: Self.authFfiTimeout)
+                throw AuthTimeout()
+            }
+            // First to finish wins; cancel the loser (the sleep, or the
+            // detached FFI task whose Rust future leaks per the caveat).
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// Thrown by `withAuthTimeout` when the FFI call outruns the
+    /// deadline. Mapped to a user-facing "couldn't reach the server"
+    /// message by the auth callers.
+    struct AuthTimeout: Error {}
+
     /// Attempt to rehydrate a Keychain session. Called on app launch.
     func bootstrap() async {
         do {
@@ -154,10 +203,12 @@ final class WalletViewModel {
                 phase = .signedOut
                 return
             }
-            try await wallet.setSession(
-                userIdUuid: stored.userId,
-                refreshToken: stored.refreshToken
-            )
+            try await withAuthTimeout { [wallet] in
+                try await wallet.setSession(
+                    userIdUuid: stored.userId,
+                    refreshToken: stored.refreshToken
+                )
+            }
             phase = .signedIn(userId: stored.userId)
             await refreshAccounts()
             // Session is live — open the realtime channel. `onConnected`
@@ -165,6 +216,15 @@ final class WalletViewModel {
             // while the app was killed); this is the replacement for the
             // deleted Home poll.
             await subscribeWalletEvents()
+        } catch is AuthTimeout {
+            // Enclave unreachable/slow during Keychain rehydrate. A slow
+            // rehydrate must NOT brick the app on the fatal `.error`
+            // screen (that's the "loads then stops" symptom). Fall back
+            // to the sign-in screen with the stored session intact — the
+            // next launch retries the rehydrate; meanwhile the user can
+            // sign in fresh. (Keychain copy is deliberately NOT cleared:
+            // a timeout is not a rejected token.)
+            phase = .signedOut
         } catch let err as SessionStoreError {
             phase = .error("session load failed: \(err)")
         } catch let err as FfiError {
@@ -228,7 +288,12 @@ final class WalletViewModel {
         loginErrorMessage = nil
         defer { isWorking = false }
         do {
-            let session = try await call()
+            // F5: the auth FFI call (guest / login / signup) goes through
+            // the timeout-less OpenSecret SDK client. Without this bound
+            // a down/slow enclave hangs `runSignIn` forever and the
+            // sign-in / guest button spins indefinitely ("loads then
+            // stops"). The deadline turns that into a retryable error.
+            let session = try await withAuthTimeout { try await call() }
             try SessionStore.save(
                 PersistedSession(
                     userId: session.userId,
@@ -241,6 +306,9 @@ final class WalletViewModel {
             // here) — start realtime so the balance stays live without
             // the deleted foreground poll.
             await subscribeWalletEvents()
+        } catch is AuthTimeout {
+            loginErrorMessage =
+                "Couldn't reach the server. Check your connection and try again."
         } catch let err as FfiError {
             loginErrorMessage = ffiErrorMessage(err)
         } catch let err as SessionStoreError {
