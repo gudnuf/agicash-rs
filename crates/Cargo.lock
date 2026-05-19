@@ -315,8 +315,20 @@ dependencies = [
 name = "agicash-testing"
 version = "0.1.0"
 dependencies = [
+ "agicash-cashu",
  "agicash-domain",
+ "agicash-exchange-rate",
  "agicash-money",
+ "agicash-traits",
+ "agicash-wallet",
+ "async-trait",
+ "cdk",
+ "chrono",
+ "parking_lot",
+ "rust_decimal",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
