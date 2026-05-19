@@ -49,6 +49,7 @@ pub mod auth;
 pub mod builder;
 pub mod client;
 pub mod config;
+pub mod discriminator;
 pub mod error;
 pub mod opensecret_auth;
 pub mod types;
@@ -57,6 +58,7 @@ pub use auth::{AuthClient, Session};
 pub use builder::WalletClientBuilder;
 pub use client::WalletClient;
 pub use config::{SessionStorageChoice, WalletConfig};
+pub use discriminator::{AuthErrorCode, CashuDiscriminator};
 pub use error::WalletError;
 pub use opensecret_auth::OpenSecretAuthClient;
 pub use types::{
