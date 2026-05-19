@@ -19,22 +19,21 @@ use crate::types::{
     SendTokenReceipt, TokenVersion, Transaction, TransactionFilter, TransactionPage,
 };
 use agicash_cashu::{
-    CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage, CashuMintQuoteService,
-    CashuMintQuoteState, CashuMintQuoteStorage, CashuReceiveSwapService, CashuReceiveSwapState,
-    CashuSendSwapService, CashuSendSwapStorage, CompleteMintQuoteOutcome, CompleteOutcome,
-    MeltOutcome, MeltQuoteError, ParsedToken, ReceiveSwapError, ReceiveSwapStorageError,
-    TokenProof,
+    add_mint_account, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
+    CashuMintQuoteService, CashuMintQuoteState, CashuMintQuoteStorage, CashuReceiveSwapService,
+    CashuReceiveSwapState, CashuSendSwapService, CashuSendSwapStorage, CompleteMintQuoteOutcome,
+    CompleteOutcome, MeltOutcome, MeltQuoteError, ParsedToken, ReceiveFlowError, ReceiveSwapError,
+    ReceiveSwapStorageError, TokenProof,
 };
-use agicash_domain::{Account, AccountId, AccountPurpose, AccountState, AccountType, Currency};
+use agicash_domain::{Account, AccountId, AccountState, AccountType, Currency};
 use agicash_exchange_rate::ExchangeRateProvider;
 use agicash_money::{Money, Unit};
-use agicash_traits::{AccountInput, CashuProvider, UpsertUserInput, UpsertUserResult, UserStorage};
+use agicash_traits::{CashuProvider, UserStorage};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::{CurrencyUnit, Proof, Token};
 use cdk::Amount;
 use rust_decimal::Decimal;
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -250,93 +249,23 @@ impl WalletClient {
         let canonical_url = parsed_url.to_string();
         let mint_name = info.name.clone().unwrap_or_else(|| canonical_url.clone());
 
-        // Preserve the existing user row (placeholder values for new guests).
-        let existing = self.user_storage.get_user(user_id).await?;
-        let (
-            email,
-            email_verified,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        ) = if let Some(u) = existing.as_ref() {
-            (
-                u.email.clone(),
-                u.email_verified,
-                u.cashu_locking_xpub.clone(),
-                u.encryption_public_key.clone(),
-                u.spark_identity_public_key.clone(),
-                u.terms_accepted_at,
-                u.gift_card_mint_terms_accepted_at,
-            )
-        } else {
-            let placeholder_prefix = format!("uninitialized-{user_id}-");
-            (
-                None,
-                false,
-                format!("{placeholder_prefix}cashu"),
-                format!("{placeholder_prefix}encryption"),
-                format!("{placeholder_prefix}spark"),
-                None,
-                None,
-            )
-        };
-
-        let mut accounts = vec![AccountInput {
-            account_type: AccountType::Cashu,
-            purpose: AccountPurpose::Transactional,
-            currency,
-            name: mint_name.clone(),
-            details: json!({
-                "mint_url": canonical_url,
-                "keyset_counters": {},
-            }),
-            is_default: false,
-        }];
-        if existing.is_none() {
-            // Mirror the CLI / FFI workaround for brand-new guests.
-            accounts.push(AccountInput {
-                account_type: AccountType::Spark,
-                purpose: AccountPurpose::Transactional,
-                currency: Currency::Btc,
-                name: "Lightning".into(),
-                details: json!({
-                    "network": "MAINNET",
-                    "cli_placeholder": true,
-                }),
-                is_default: true,
-            });
-        }
-
-        let input = UpsertUserInput {
+        // 12c D2: the user-row-preservation + AccountInput payload +
+        // brand-new-guest Spark workaround + currency-filtered
+        // find-matching-account logic is the de-duplicated
+        // `agicash_cashu::add_mint_account` primitive. `map_add_mint_err`
+        // pins the error classification byte-identical to the pre-12c
+        // inline body on BOTH the upsert-failure and not-found paths
+        // (Tension T1; the primitive's find is currency-filtered as of
+        // Task 3, matching the pre-12c facade `&& a.currency == currency`).
+        let new_account = add_mint_account(
             user_id,
-            email,
-            email_verified,
-            accounts,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        };
-
-        let UpsertUserResult { accounts, .. } =
-            self.user_storage.upsert_user_with_accounts(input).await?;
-
-        let new_account = accounts
-            .into_iter()
-            .find(|a| {
-                a.account_type == AccountType::Cashu
-                    && a.currency == currency
-                    && a.details
-                        .get("mint_url")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| mint_urls_equal(s, &canonical_url))
-            })
-            .ok_or_else(|| {
-                WalletError::Internal("upsert returned no account matching the new mint URL".into())
-            })?;
+            &self.user_storage,
+            &canonical_url,
+            &mint_name,
+            currency,
+        )
+        .await
+        .map_err(map_add_mint_err)?;
 
         // Brand-new account has zero balance — skip the storage round-trip.
         Ok(AccountSummary::from_account(&new_account, 0))
@@ -1098,6 +1027,48 @@ fn mint_urls_equal(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+/// 12c Tension T1: pin `WalletClient::add_mint`'s error classification
+/// byte-identical to the pre-12c inline body.
+///
+/// The pre-12c facade had TWO distinct error paths:
+///  1. `upsert_user_with_accounts(..).await?` — a `StorageError`
+///     propagated via `From<StorageError> for WalletError` (`error.rs`):
+///     `NotFound` → `WalletError::NotFound`; any other → `WalletError::Storage`.
+///  2. upsert succeeded but no account matched — an explicit
+///     `WalletError::Internal("upsert returned no account matching the
+///     new mint URL")`.
+///
+/// The shared `add_mint_account` primitive (in `agicash-cashu`, which
+/// has no `WalletError`) wraps BOTH as `ReceiveFlowError::MintAdd(
+/// StorageError)`. Routing through the blanket `From<ReceiveFlowError>
+/// for WalletError` would land on its `_ => Self::Cashu(..)` arm — a
+/// user-visible reclassification. Naively unwrapping via
+/// `WalletError::from(se)` fixes path 1 but mis-maps path 2's
+/// `StorageError::Internal(<sentinel>)` to `Storage` instead of
+/// `Internal`. This adapter special-cases the path-2 sentinel message
+/// so BOTH paths are byte-identical to pre-12c.
+fn map_add_mint_err(e: ReceiveFlowError) -> WalletError {
+    use agicash_cashu::ReceiveFlowError as RFE;
+    /// The exact sentinel `add_mint_account` emits when `upsert`
+    /// succeeded but returned no matching account
+    /// (`agicash-cashu/src/receive_flow/service.rs`); pre-12c the facade
+    /// classified this as `WalletError::Internal`, not `Storage`.
+    const NO_MATCH_SENTINEL: &str = "upsert returned no account matching the new mint URL";
+    match e {
+        RFE::MintAdd(agicash_traits::StorageError::Internal(msg))
+        | RFE::Storage(agicash_traits::StorageError::Internal(msg))
+            if msg == NO_MATCH_SENTINEL =>
+        {
+            WalletError::Internal(msg)
+        }
+        RFE::MintAdd(se) | RFE::Storage(se) => WalletError::from(se),
+        // add_mint_account never parses tokens / discovers / swaps, so
+        // no other RFE variant is reachable from it; fall back to the
+        // existing blanket mapping defensively (unreachable in practice).
+        other => WalletError::from(other),
+    }
+}
+
 fn unit_matches_currency(unit: &CurrencyUnit, currency: Currency) -> bool {
     matches!(
         (unit, currency),
@@ -1361,6 +1332,7 @@ mod tests {
     use super::*;
     use agicash_domain::{AccountPurpose, AccountState, UserId};
     use chrono::Utc;
+    use serde_json::json;
 
     fn account(currency: Currency, mint_url: &str) -> Account {
         Account {
@@ -1469,6 +1441,39 @@ mod tests {
         assert!(
             matches!(err, WalletError::Validation { ref code, .. } if code == "bad_amount"),
             "expected bad_amount validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn map_add_mint_err_pins_pre_12c_classification() {
+        use agicash_cashu::ReceiveFlowError as RFE;
+        // Path 1a: upsert itself fails with a non-NotFound StorageError.
+        // Pre-12c: `?` via From<StorageError> → WalletError::Storage.
+        let e = map_add_mint_err(RFE::MintAdd(agicash_traits::StorageError::Internal(
+            "db down".into(),
+        )));
+        assert!(
+            matches!(e, WalletError::Storage(_)),
+            "upsert StorageError::Internal must stay WalletError::Storage (T1 path 1), got {e:?}"
+        );
+        // Path 1b: upsert fails with StorageError::NotFound.
+        // Pre-12c: From<StorageError> → WalletError::NotFound.
+        let e = map_add_mint_err(RFE::MintAdd(agicash_traits::StorageError::NotFound));
+        assert!(
+            matches!(e, WalletError::NotFound(_)),
+            "upsert StorageError::NotFound must stay WalletError::NotFound (T1 path 1b), got {e:?}"
+        );
+        // Path 2 (Defect-2 δ2): upsert SUCCEEDS but no account matched —
+        // the primitive emits MintAdd(StorageError::Internal(<sentinel>)).
+        // Pre-12c facade: WalletError::Internal (NOT Storage). A naive
+        // From<StorageError> remap would wrongly produce Storage here.
+        let e = map_add_mint_err(RFE::MintAdd(agicash_traits::StorageError::Internal(
+            "upsert returned no account matching the new mint URL".into(),
+        )));
+        assert!(
+            matches!(e, WalletError::Internal(_)),
+            "post-upsert not-found must be WalletError::Internal byte-identical to \
+             pre-12c (Defect-2 δ2), NOT Storage; got {e:?}"
         );
     }
 
