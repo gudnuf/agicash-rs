@@ -315,6 +315,7 @@ dependencies = [
 name = "agicash-testing"
 version = "0.1.0"
 dependencies = [
+ "agicash-auth-opensecret",
  "agicash-cashu",
  "agicash-domain",
  "agicash-exchange-rate",
@@ -323,10 +324,13 @@ dependencies = [
  "agicash-wallet",
  "async-trait",
  "cdk",
+ "cdk-fake-wallet",
  "chrono",
  "parking_lot",
+ "reqwest",
  "rust_decimal",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
