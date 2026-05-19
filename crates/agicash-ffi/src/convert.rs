@@ -52,12 +52,17 @@ pub fn amount_to_money(amount: u64, currency: Currency) -> Money {
     Money::new(Decimal::from(amount), currency, unit)
 }
 
-/// `WalletError` → `FfiError`. 12b-1 PRESERVES today's behavior: the
-/// bespoke FFI funneled cashu/validation/etc through
-/// `FfiError::Internal { message }` carrying the discriminator-bearing
-/// string; only `Unauthenticated` mapped to the structured `Auth`
-/// variant. This keeps that exact shape (structured auth-code
-/// granularity is **12b-2**, NOT here). Storage/NotFound keep the
+/// `WalletError` → `FfiError`. 12b-2 reconstructs the exact iOS wire
+/// contract over the new structured facade error surface: structured
+/// `WalletError::Auth { code }` and `WalletError::Network` map back to
+/// `FfiError::Auth { code: BACKEND|INTERNAL|NETWORK }` (iOS
+/// `isGenuineAuthExpiry` keeps the signed-in UI alive on these,
+/// tearing it down ONLY on UNAUTHENTICATED); `WalletError::CashuTyped`
+/// re-synthesizes the `DUPLICATE_PAYMENT:` / `DLEQ verification
+/// failed:` / `insufficient balance:` / `quote expired before
+/// payment` prefixes iOS branches on. Everything else funnels to
+/// `FfiError::Internal { message }` carrying the Display string
+/// (verbatim pre-refactor FFI behavior). Storage/NotFound keep the
 /// structured `Storage` mapping the FFI `From<StorageError>` gave.
 pub fn wallet_error_to_ffi(e: WalletError) -> FfiError {
     match e {
@@ -73,10 +78,63 @@ pub fn wallet_error_to_ffi(e: WalletError) -> FfiError {
             code: crate::error::storage_code::NOT_FOUND,
             message: m,
         },
-        // Auth/Cashu/Network/Concurrency/Validation/Unsupported/etc —
-        // all funnel to Internal with the Display string (verbatim
-        // pre-refactor FFI behavior; the message text carries the
-        // discriminator the iOS UI parses).
+        // P0-2: reconstruct the iOS auth_code wire contract. iOS
+        // `isGenuineAuthExpiry` tears the signed-in UI down ONLY on
+        // code==UNAUTHENTICATED; BACKEND/INTERNAL/NETWORK are transient
+        // blips that must keep the UI alive.
+        WalletError::Auth { code, message } => {
+            let ffi_code = match code {
+                agicash_wallet::AuthErrorCode::Backend => crate::error::auth_code::BACKEND,
+                agicash_wallet::AuthErrorCode::Internal => crate::error::auth_code::INTERNAL,
+            };
+            FfiError::Auth {
+                code: ffi_code,
+                message,
+            }
+        }
+        // Auth-network now lands in WalletError::Network (12b-2 P0-2).
+        // iOS's isGenuineAuthExpiry treats Auth{code=NETWORK=1} as a
+        // transient blip (keep UI alive). Network maps to Auth{NETWORK}
+        // — NOT a bare Internal — so that discipline is preserved.
+        WalletError::Network(message) => FfiError::Auth {
+            code: crate::error::auth_code::NETWORK,
+            message,
+        },
+        // P0-3: re-synthesize the exact prefixes iOS branches on
+        // (`DUPLICATE_PAYMENT:` → resume-don't-re-quote, `DLEQ
+        // verification failed:` → malicious mint, etc.).
+        WalletError::CashuTyped {
+            discriminator,
+            message,
+        } => {
+            let prefixed = match discriminator {
+                agicash_wallet::CashuDiscriminator::DuplicatePayment => {
+                    format!("DUPLICATE_PAYMENT: {message}")
+                }
+                agicash_wallet::CashuDiscriminator::DleqVerificationFailed => {
+                    if message.starts_with("DLEQ verification failed") {
+                        message
+                    } else {
+                        format!("DLEQ verification failed: {message}")
+                    }
+                }
+                agicash_wallet::CashuDiscriminator::InsufficientBalance => {
+                    if message.starts_with("insufficient balance") {
+                        message
+                    } else {
+                        format!("insufficient balance: {message}")
+                    }
+                }
+                agicash_wallet::CashuDiscriminator::QuoteExpired => {
+                    "quote expired before payment".into()
+                }
+            };
+            FfiError::internal(prefixed)
+        }
+        // Cashu/Concurrency/Validation/Unsupported/etc — all funnel to
+        // Internal with the Display string (verbatim pre-refactor FFI
+        // behavior; the message text carries the discriminator the iOS
+        // UI parses).
         other => FfiError::internal(other.to_string()),
     }
 }
@@ -492,6 +550,85 @@ mod tests {
             });
             assert!(snap.failure_reason.is_none());
         }
+    }
+
+    // --- 12b-2 Task 6: FFI wire-contract preservation ---
+
+    #[test]
+    fn p0_2_walleterror_auth_backend_maps_to_ffi_auth_backend_code() {
+        use agicash_wallet::AuthErrorCode;
+        let w = WalletError::Auth {
+            code: AuthErrorCode::Backend,
+            message: "opensecret 500".into(),
+        };
+        let f = wallet_error_to_ffi(w);
+        assert!(
+            matches!(f, FfiError::Auth { code, .. } if code == crate::error::auth_code::BACKEND),
+            "got {f:?}"
+        );
+    }
+
+    #[test]
+    fn p0_2_walleterror_auth_internal_maps_to_ffi_auth_internal_code() {
+        use agicash_wallet::AuthErrorCode;
+        let w = WalletError::Auth {
+            code: AuthErrorCode::Internal,
+            message: "bug".into(),
+        };
+        let f = wallet_error_to_ffi(w);
+        assert!(
+            matches!(f, FfiError::Auth { code, .. } if code == crate::error::auth_code::INTERNAL),
+            "got {f:?}"
+        );
+    }
+
+    #[test]
+    fn p0_2_walleterror_network_maps_to_ffi_auth_network_code() {
+        // AuthError::Network now lands in WalletError::Network; the FFI
+        // must still present it to iOS as Auth{code=NETWORK=1} so
+        // isGenuineAuthExpiry keeps the UI alive on the blip.
+        let w = WalletError::Network("opensecret dns".into());
+        let f = wallet_error_to_ffi(w);
+        assert!(
+            matches!(f, FfiError::Auth { code, .. } if code == crate::error::auth_code::NETWORK),
+            "got {f:?}"
+        );
+    }
+
+    #[test]
+    fn p0_2_walleterror_unauthenticated_maps_to_ffi_unauthenticated_code() {
+        let f = wallet_error_to_ffi(WalletError::Unauthenticated);
+        assert!(
+            matches!(f, FfiError::Auth { code, .. } if code == crate::error::auth_code::UNAUTHENTICATED),
+            "got {f:?}"
+        );
+    }
+
+    #[test]
+    fn p0_3_duplicate_payment_keeps_ffi_prefix() {
+        use agicash_wallet::CashuDiscriminator;
+        let w = WalletError::CashuTyped {
+            discriminator: CashuDiscriminator::DuplicatePayment,
+            message: "duplicate payment: an active melt quote already exists for this invoice"
+                .into(),
+        };
+        let f = wallet_error_to_ffi(w);
+        let msg = f.to_string();
+        assert!(msg.contains("DUPLICATE_PAYMENT:"), "got {msg:?}");
+    }
+
+    #[test]
+    fn p0_3_dleq_failure_keeps_ffi_prefix() {
+        use agicash_wallet::CashuDiscriminator;
+        let w = WalletError::CashuTyped {
+            discriminator: CashuDiscriminator::DleqVerificationFailed,
+            message: "DLEQ verification failed: proof".into(),
+        };
+        let f = wallet_error_to_ffi(w);
+        assert!(
+            f.to_string().contains("DLEQ verification failed"),
+            "got {f}"
+        );
     }
 
     #[test]
