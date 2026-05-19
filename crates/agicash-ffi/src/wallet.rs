@@ -17,8 +17,8 @@ use crate::melt_quote::{
     MeltQuoteFfiState, MeltQuoteHandle, MeltQuotePreview as MeltQuotePreviewFfi, MeltQuoteSnapshot,
 };
 use crate::mint::MintAddResult;
-use crate::mint_quote::{MintQuoteFfiState, MintQuoteHandle, MintQuoteSnapshot};
-use crate::receive::{ReceiveResult, ReceiveStatus};
+use crate::mint_quote::{MintQuoteHandle, MintQuoteSnapshot};
+use crate::receive::ReceiveResult;
 use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
@@ -27,30 +27,22 @@ use agicash_auth_opensecret::{
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
-    CashuMintQuote, CashuMintQuoteService, CashuMintQuoteState, CashuMintQuoteStorage,
-    CashuReceiveSwapService, CashuReceiveSwapState, CashuReceiveSwapStorage, CashuSeedProvider,
-    CashuSendSwapService, CashuSendSwapState, CashuSendSwapStorage, CdkCashuProvider,
-    CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError, MeltQuotePreview,
-    MintQuoteError, ParsedToken, ReceiveFlowService, ReceiveSwapError, TokenProof,
+    CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSeedProvider, CashuSendSwapService,
+    CashuSendSwapState, CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
+    MeltQuotePreview, ReceiveFlowService,
 };
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
 use agicash_money::{Money, Unit};
 use agicash_storage_supabase::{
-    SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage, SupabaseCashuReceiveSwapStorage,
-    SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
+    SupabaseCashuMeltQuoteStorage, SupabaseCashuReceiveSwapStorage, SupabaseCashuSendSwapStorage,
+    SupabaseStorage, SupabaseStorageConfig,
 };
 use agicash_traits::{
     CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
     ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UserStorage,
 };
-use agicash_wallet::{
-    OpenSecretAuthClient, SessionStorageChoice, TokenVersion, WalletClient, WalletConfig,
-};
-use cdk::mint_url::MintUrl;
-use cdk::nuts::nut02::Id as KeysetId;
-use cdk::nuts::{CurrencyUnit, Proof, Token};
-use cdk::Amount;
+use agicash_wallet::{SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -77,20 +69,6 @@ pub struct AgicashWallet {
     /// lift `list_unspent_proofs` to a balance-focused trait. Until then
     /// this is the only call-site here.
     send_swap_storage: Arc<dyn CashuSendSwapStorage>,
-    /// Mint-quote (Lightning receive) orchestrator. Wired the same way as
-    /// `receive_swap_service` — same `SupabaseStorage`, same provider,
-    /// same passthrough encryption stub. Drives `start_mint_quote`,
-    /// `poll_mint_quote`, `complete_mint_quote`.
-    // TODO(12b-1 Task 12): mint-quote flow now delegates to the facade;
-    // this slot is dead once the deletion pass runs.
-    #[allow(dead_code)]
-    mint_quote_service: Arc<CashuMintQuoteService>,
-    /// Storage handle for the mint-quote rows. Kept as its own slot so
-    /// `poll_mint_quote` can read the persisted quote by id without
-    /// holding the service.
-    // TODO(12b-1 Task 12): dead with the facade-delegated mint-quote flow.
-    #[allow(dead_code)]
-    mint_quote_storage: Arc<dyn CashuMintQuoteStorage>,
     /// Send-swap orchestrator. Wired against the same `send_swap_storage`
     /// + `cashu_provider` the wallet already owns. Drives
     ///   `prepare_send_quote`, `create_send_swap`, `check_send_swap_claimed`.
@@ -130,24 +108,18 @@ pub struct AgicashWallet {
     /// the task is aborted (a bare `abort()` would drop the socket
     /// without a clean leave).
     realtime_service: Arc<RwLock<Option<Arc<agicash_realtime::WalletRealtimeService>>>>,
-    /// The composed facade. Built once in `new` via
-    /// `WalletClient::from_config`. The delegated business methods route
-    /// here; the shell-resident platform layer (the `OpenSecretClient`
-    /// `client` field, session slot, session-storage backend, realtime
+    /// The composed facade — THE single composition root for this
+    /// binding shell. The delegated business methods route here; the
+    /// shell-resident platform layer (the `OpenSecretClient` `client`
+    /// field, session slot, session-storage backend, realtime
     /// supervisor, observability) stays on `self` per spec §6. Named
     /// `facade` (not `client`) because the pre-existing
     /// `client: OpenSecretClient` field is kept byte-for-byte for the
     /// shell-resident methods (Hard Rule 7) and the names would clash.
-    // TODO(12b-1 Tasks 6-12): becomes read once the delegates are
-    // rewritten; allow until then so the interim gate stays green.
-    #[allow(dead_code)]
+    /// The facade owns the `OpenSecretAuthClient` (via its `auth`
+    /// `Arc<dyn AuthClient>`), so its session slot — shared with
+    /// `self.session` — stays alive without a separate field.
     facade: Arc<WalletClient>,
-    /// The facade's auth client, retained so the shell can mirror its
-    /// session slot into the existing `self.session` plumbing without
-    /// changing realtime/session behavior (spec §6 carve-out).
-    // TODO(12b-1 Tasks 6-12): read once auth_* delegates mirror through it.
-    #[allow(dead_code)]
-    facade_auth: Arc<OpenSecretAuthClient>,
 }
 
 impl std::fmt::Debug for AgicashWallet {
@@ -167,19 +139,6 @@ impl std::fmt::Debug for AgicashWallet {
             )
             .finish_non_exhaustive()
     }
-}
-
-/// Generate 16 random bytes hex-encoded; the `OpenSecret` guest-registration
-/// password slot accepts any string and we never need it after the first
-/// login (Swift persists only the resulting refresh token).
-// TODO(12b-1 Task 12): guest registration now happens inside the facade
-// (`OpenSecretAuthClient::register_guest`); this shell copy is dead once
-// the deletion pass runs. Allow until then so the gate stays green.
-#[allow(dead_code)]
-fn random_password() -> String {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).expect("OS RNG must be available");
-    hex::encode(buf)
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -261,17 +220,6 @@ impl AgicashWallet {
             SupabaseCashuSendSwapStorage::new(Arc::clone(&storage), Arc::clone(&encryption)),
         );
 
-        // Mint-quote service wiring mirrors the CLI's
-        // `build_mint_quote_deps` (composition.rs). Same Supabase
-        // storage, same passthrough encryption stub, same CDK provider.
-        let mint_quote_storage: Arc<dyn CashuMintQuoteStorage> = Arc::new(
-            SupabaseCashuMintQuoteStorage::new(Arc::clone(&storage), Arc::clone(&encryption)),
-        );
-        let mint_quote_service = Arc::new(CashuMintQuoteService::new(
-            Arc::clone(&mint_quote_storage),
-            Arc::clone(&cashu_provider),
-        ));
-
         // Send-swap service wiring mirrors the CLI's `build_send_swap_deps`
         // (composition.rs). Same `send_swap_storage` slot we already
         // own; same CDK provider.
@@ -334,8 +282,6 @@ impl AgicashWallet {
             cashu_provider,
             receive_swap_service,
             send_swap_storage,
-            mint_quote_service,
-            mint_quote_storage,
             send_swap_service,
             melt_quote_service,
             melt_quote_storage,
@@ -344,7 +290,6 @@ impl AgicashWallet {
             realtime_task: Arc::new(RwLock::new(None)),
             realtime_service: Arc::new(RwLock::new(None)),
             facade,
-            facade_auth,
         }))
     }
 
@@ -1631,127 +1576,6 @@ impl AgicashWallet {
     }
 }
 
-/// Find a `Cashu` account whose `(mint_url, currency)` pair matches the
-/// supplied parsed token. Mirrors the CLI's private `pick_account`
-/// (`crates/agicash-cli/src/receive.rs`) — duplicated here so the FFI
-/// stays decoupled from the CLI binary.
-// TODO(12b-1 Task 12): token-account pick now lives in the facade
-// `receive_cashu_token`; this shell copy is dead. Allow until the
-// deletion pass.
-#[allow(dead_code)]
-fn pick_cashu_account_for_token<'a>(
-    accounts: &'a [Account],
-    mint_url: &str,
-    unit: &cdk::nuts::CurrencyUnit,
-) -> Option<&'a Account> {
-    accounts.iter().find(|a| {
-        a.account_type == AccountType::Cashu
-            && a.details
-                .get("mint_url")
-                .and_then(|v| v.as_str())
-                .is_some_and(|u| mint_urls_equal(u, mint_url))
-            && unit_matches_currency(unit, a.currency)
-    })
-}
-
-// TODO(12b-1 Task 12): dead with the facade-delegated receive path.
-#[allow(dead_code)]
-fn mint_urls_equal(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
-}
-
-// TODO(12b-1 Task 12): dead with the facade-delegated receive path.
-#[allow(dead_code)]
-fn unit_matches_currency(unit: &cdk::nuts::CurrencyUnit, currency: Currency) -> bool {
-    use cdk::nuts::CurrencyUnit;
-    matches!(
-        (unit, currency),
-        (CurrencyUnit::Sat, Currency::Btc) | (CurrencyUnit::Usd, Currency::Usd)
-    )
-}
-
-/// Sum the UNSPENT proofs for a single account.
-///
-/// Cashu accounts route through `CashuSendSwapStorage::list_unspent_proofs`
-/// which internally decrypts each proof's encrypted amount. Spark accounts
-/// always return 0 — slice 9 will wire their proof storage and replace this
-/// branch. Storage failures are funneled through `FfiError::Internal`
-/// (matching the `receive_swap_error_to_ffi` shape) since
-/// `SendSwapStorageError` doesn't fit the structured Auth/Storage variants
-/// cleanly.
-// TODO(12b-1 Task 12): balance summing now lives in the facade
-// `list_accounts`; this shell copy is dead once the deletion pass runs.
-// Allow until then so the per-task gate stays green.
-#[allow(dead_code)]
-async fn compute_cashu_balance(
-    storage: &dyn CashuSendSwapStorage,
-    account: &Account,
-) -> Result<u64, FfiError> {
-    match account.account_type {
-        AccountType::Cashu => {
-            tracing::info!(
-                target: "agicash_ffi::wallet",
-                account_id = %account.id,
-                "compute_cashu_balance: calling list_unspent_proofs"
-            );
-            let proofs = storage
-                .list_unspent_proofs(account.id)
-                .await
-                .map_err(|e| FfiError::internal(format!("list unspent proofs: {e}")))?;
-            let total: u64 = proofs.iter().map(|p| p.proof.amount).sum();
-            tracing::info!(
-                target: "agicash_ffi::wallet",
-                account_id = %account.id,
-                proof_count = proofs.len(),
-                total_amount = total,
-                "compute_cashu_balance: list_unspent_proofs returned"
-            );
-            Ok(total)
-        }
-        AccountType::Spark => Ok(0),
-    }
-}
-
-/// Map the rich `ReceiveSwapError` family down to `FfiError`. The trait
-/// crate already has `From<AuthError>` / `From<StorageError>` impls for
-/// FFI; the cashu-specific cases (token parse, mint-mismatch,
-/// amount-too-small) don't fit either family cleanly so they funnel
-/// through `Internal` with a discriminator-bearing message.
-// TODO(12b-1 Task 12): the facade's `WalletError` path
-// (`convert::wallet_error_to_ffi`) replaces this; dead until deletion.
-#[allow(dead_code)]
-fn receive_swap_error_to_ffi(e: ReceiveSwapError) -> FfiError {
-    match e {
-        ReceiveSwapError::TokenParse(msg) => FfiError::internal(format!("invalid token: {msg}")),
-        ReceiveSwapError::MintMismatch { token, account } => FfiError::internal(format!(
-            "mint mismatch: token mint {token} differs from account mint {account}",
-        )),
-        ReceiveSwapError::CurrencyMismatch { token, account } => FfiError::internal(format!(
-            "currency mismatch: token currency {token} differs from account currency {account}",
-        )),
-        ReceiveSwapError::AmountTooSmall => FfiError::internal("amount too small after mint fees"),
-        ReceiveSwapError::InvalidTransition { from, event } => {
-            FfiError::internal(format!("invalid state transition from {from} on {event}"))
-        }
-        // Mint-protocol failures (network, NUT errors) — surface the
-        // `CashuProviderError`'s display so the UI gets something
-        // meaningful without a new FFI variant.
-        ReceiveSwapError::Mint(inner) => FfiError::internal(format!("mint error: {inner}")),
-        // Storage is the one branch where we DO have a structured FFI
-        // shape. Map the inner storage failure through the existing
-        // `From<StorageError>` impl when possible; otherwise fall back
-        // to Internal so the caller still sees the failure reason.
-        ReceiveSwapError::Storage(s) => FfiError::internal(format!("storage error: {s}")),
-        // NUT-12 DLEQ verification failed on a mint-returned blind signature
-        // or peer-token proof. A mint that fails DLEQ is malicious or
-        // compromised — surface with a distinct prefix so the UI can render
-        // a security-flavoured error rather than a generic network blip.
-        ReceiveSwapError::DleqVerificationFailed(inner) => {
-            FfiError::internal(format!("DLEQ verification failed: {inner}"))
-        }
-    }
-}
-
 /// Map the rich `CashuProviderError` family down to `FfiError`. The mint-
 /// provider failures (invalid URL, network, NUT protocol) are funneled
 /// through `Internal` with a discriminator-bearing message, same shape as
@@ -1764,56 +1588,6 @@ fn cashu_provider_error_to_ffi(e: CashuProviderError) -> FfiError {
         }
         CashuProviderError::Network(msg) => FfiError::internal(format!("mint unreachable: {msg}")),
         CashuProviderError::Protocol(msg) => FfiError::internal(format!("mint error: {msg}")),
-    }
-}
-
-// TODO(12b-1 Task 12): the facade's `ReceiveReceipt` →
-// `convert::receive_result_from_receipt` replaces this; dead until
-// deletion.
-#[allow(dead_code)]
-fn receive_result_from_outcome(
-    outcome: CompleteOutcome,
-    fallback_account: &Account,
-    parsed: &ParsedToken,
-) -> ReceiveResult {
-    match outcome {
-        CompleteOutcome::Completed { swap, account, .. } => ReceiveResult {
-            status: ReceiveStatus::Received,
-            amount: swap.amount_received.amount().to_string(),
-            fee: swap.fee_amount.amount().to_string(),
-            unit: swap.amount_received.unit().to_string(),
-            currency: swap.amount_received.currency().to_string(),
-            account_id: account.id.to_string(),
-            mint_url: parsed.mint_url.clone(),
-            token_hash: parsed.hash.clone(),
-        },
-        CompleteOutcome::AlreadyTerminal(swap) => {
-            let status = match &swap.state {
-                CashuReceiveSwapState::Completed => ReceiveStatus::Received,
-                CashuReceiveSwapState::Failed { .. } => ReceiveStatus::AlreadyFailed,
-                CashuReceiveSwapState::Pending => ReceiveStatus::Pending,
-            };
-            ReceiveResult {
-                status,
-                amount: swap.amount_received.amount().to_string(),
-                fee: swap.fee_amount.amount().to_string(),
-                unit: swap.amount_received.unit().to_string(),
-                currency: swap.amount_received.currency().to_string(),
-                account_id: fallback_account.id.to_string(),
-                mint_url: parsed.mint_url.clone(),
-                token_hash: parsed.hash.clone(),
-            }
-        }
-        CompleteOutcome::Failed(swap) => ReceiveResult {
-            status: ReceiveStatus::AlreadyFailed,
-            amount: swap.amount_received.amount().to_string(),
-            fee: swap.fee_amount.amount().to_string(),
-            unit: swap.amount_received.unit().to_string(),
-            currency: swap.amount_received.currency().to_string(),
-            account_id: fallback_account.id.to_string(),
-            mint_url: parsed.mint_url.clone(),
-            token_hash: parsed.hash.clone(),
-        },
     }
 }
 
@@ -1860,38 +1634,6 @@ fn pick_cashu_account_for_lightning<'a>(
     }
 }
 
-/// Map `MintQuoteError` down to `FfiError`. Same funneling pattern as
-/// `receive_swap_error_to_ffi`: storage/network/protocol failures land
-/// in `Internal` with a discriminator-bearing message; validation
-/// failures (amount-too-small, currency mismatch) stay as their own
-/// strings so the iOS UI can pattern-match the prefix.
-// TODO(12b-1 Task 12): facade `WalletError` path replaces this; only
-// referenced by its own unit tests now. Allow until the deletion pass.
-#[allow(dead_code)]
-fn mint_quote_error_to_ffi(e: MintQuoteError) -> FfiError {
-    match e {
-        MintQuoteError::AmountTooSmall => FfiError::internal("amount too small"),
-        MintQuoteError::CurrencyMismatch { account, request } => FfiError::internal(format!(
-            "currency mismatch: account {account} differs from request {request}",
-        )),
-        MintQuoteError::QuoteNotPaid => FfiError::internal("quote not yet paid"),
-        MintQuoteError::QuoteExpired => FfiError::internal("quote expired before payment"),
-        MintQuoteError::InvalidTransition { from, event } => {
-            FfiError::internal(format!("invalid state transition from {from} on {event}"))
-        }
-        MintQuoteError::Unrecoverable(msg) => {
-            FfiError::internal(format!("mint quote unrecoverable: {msg}"))
-        }
-        MintQuoteError::Mint(inner) => cashu_provider_error_to_ffi(inner),
-        MintQuoteError::Storage(s) => FfiError::internal(format!("storage error: {s}")),
-        // NUT-12 DLEQ verification failed on the mint-returned blind
-        // signature. Treat as a distinct, security-flavoured error.
-        MintQuoteError::DleqVerificationFailed(inner) => {
-            FfiError::internal(format!("DLEQ verification failed: {inner}"))
-        }
-    }
-}
-
 /// Map `SendSwapError` down to `FfiError`. Same funneling pattern as
 /// `receive_swap_error_to_ffi` and `mint_quote_error_to_ffi`.
 fn send_swap_error_to_ffi(e: agicash_cashu::SendSwapError) -> FfiError {
@@ -1923,140 +1665,6 @@ fn unit_for_currency(currency: Currency) -> Unit {
         Currency::Btc => Unit::Sat,
         Currency::Usd | Currency::Usdb => Unit::Cent,
     }
-}
-
-/// Build the `MintQuoteHandle` returned by `start_mint_quote`. The
-/// amount + fee are decimal-stringified to match the
-/// `ReceiveResult` convention.
-// TODO(12b-1 Task 12): replaced by `convert::mint_quote_handle_from_facade`.
-#[allow(dead_code)]
-fn mint_quote_handle_from(quote: &CashuMintQuote, account: &Account) -> MintQuoteHandle {
-    MintQuoteHandle {
-        quote_id: quote.id.to_string(),
-        mint_quote_id: quote.quote_id.clone(),
-        invoice: quote.payment_request.clone(),
-        payment_hash: quote.payment_hash.clone(),
-        amount: quote.amount.amount().to_string(),
-        fee: quote.total_fee.amount().to_string(),
-        unit: quote.amount.unit().to_string(),
-        currency: quote.amount.currency().to_string(),
-        account_id: account.id.to_string(),
-        expires_at: quote.expires_at.to_rfc3339(),
-    }
-}
-
-/// Convert a persisted `CashuMintQuote` into the FFI snapshot. Maps
-/// the per-state Rust enum down to the flat FFI discriminator.
-// TODO(12b-1 Task 12): replaced by `convert::mint_quote_snapshot_from_facade`.
-#[allow(dead_code)]
-fn mint_quote_snapshot_from(quote: &CashuMintQuote) -> MintQuoteSnapshot {
-    match &quote.state {
-        CashuMintQuoteState::Unpaid => MintQuoteSnapshot {
-            state: MintQuoteFfiState::Unpaid,
-            failure_reason: None,
-        },
-        CashuMintQuoteState::Paid { .. } => MintQuoteSnapshot {
-            state: MintQuoteFfiState::Paid,
-            failure_reason: None,
-        },
-        CashuMintQuoteState::Completed { .. } => MintQuoteSnapshot {
-            state: MintQuoteFfiState::Completed,
-            failure_reason: None,
-        },
-        CashuMintQuoteState::Expired => MintQuoteSnapshot {
-            state: MintQuoteFfiState::Expired,
-            failure_reason: None,
-        },
-        CashuMintQuoteState::Failed { failure_reason } => MintQuoteSnapshot {
-            state: MintQuoteFfiState::Failed,
-            failure_reason: Some(failure_reason.clone()),
-        },
-    }
-}
-
-/// Build the `ReceiveResult` returned by `complete_mint_quote`. The shape
-/// is identical to what `receive_token` returns so the iOS success card
-/// can render uniformly across both flows. Mirrors
-/// `receive_result_from_outcome` (which handles the Cashu-token swap
-/// outcome) but for the `CompleteMintQuoteOutcome` enum.
-// TODO(12b-1 Task 12): replaced by the facade `ReceiveReceipt` →
-// `convert::receive_result_from_receipt` path.
-#[allow(dead_code)]
-fn receive_result_from_mint_quote_outcome(
-    outcome: CompleteMintQuoteOutcome,
-    fallback_account: &Account,
-    fallback_quote: &CashuMintQuote,
-) -> ReceiveResult {
-    // Lightning quotes don't carry a token hash; we synthesize one from
-    // the BOLT-11 payment hash so the receipt has a stable identifier.
-    let token_hash = fallback_quote.payment_hash.clone();
-    let mint_url = mint_url_from_account(fallback_account);
-
-    match outcome {
-        CompleteMintQuoteOutcome::Completed {
-            quote,
-            account,
-            added_proofs: _,
-        } => ReceiveResult {
-            status: ReceiveStatus::Received,
-            amount: quote.amount.amount().to_string(),
-            fee: quote.total_fee.amount().to_string(),
-            unit: quote.amount.unit().to_string(),
-            currency: quote.amount.currency().to_string(),
-            account_id: account.id.to_string(),
-            mint_url: mint_url_from_account(&account),
-            token_hash,
-        },
-        CompleteMintQuoteOutcome::AlreadyTerminal(quote) => {
-            let status = match &quote.state {
-                CashuMintQuoteState::Completed { .. } => ReceiveStatus::Received,
-                CashuMintQuoteState::Failed { .. } | CashuMintQuoteState::Expired => {
-                    ReceiveStatus::AlreadyFailed
-                }
-                // PAID without a follow-up complete is "still pending" from the
-                // UI's perspective; treat as `Pending` so the user can retry.
-                CashuMintQuoteState::Paid { .. } | CashuMintQuoteState::Unpaid => {
-                    ReceiveStatus::Pending
-                }
-            };
-            ReceiveResult {
-                status,
-                amount: quote.amount.amount().to_string(),
-                fee: quote.total_fee.amount().to_string(),
-                unit: quote.amount.unit().to_string(),
-                currency: quote.amount.currency().to_string(),
-                account_id: fallback_account.id.to_string(),
-                mint_url,
-                token_hash,
-            }
-        }
-        CompleteMintQuoteOutcome::Failed(quote) => ReceiveResult {
-            status: ReceiveStatus::AlreadyFailed,
-            amount: quote.amount.amount().to_string(),
-            fee: quote.total_fee.amount().to_string(),
-            unit: quote.amount.unit().to_string(),
-            currency: quote.amount.currency().to_string(),
-            account_id: fallback_account.id.to_string(),
-            mint_url,
-            token_hash,
-        },
-    }
-}
-
-/// Pull the canonical `mint_url` string out of a Cashu account's
-/// `details` blob. Defaults to empty string if the column is missing or
-/// malformed — the iOS UI tolerates empty mint URLs in its success card
-/// rendering (drops the line) so we don't need to error here.
-// TODO(12b-1 Task 12): only the now-dead `receive_result_from_mint_quote_outcome`
-// used this; dead until the deletion pass.
-#[allow(dead_code)]
-fn mint_url_from_account(account: &Account) -> String {
-    account
-        .details
-        .get("mint_url")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_default()
 }
 
 // ---- melt-quote (Lightning send) helpers ----
@@ -2264,56 +1872,6 @@ fn exchange_rate_snapshot_from(
 }
 
 // ---- cashu send-swap helpers ----
-
-/// Encode a slice of `TokenProof` into a V4 (`cashuB…`) wire token.
-/// Mirrors `encode_token` in `crates/agicash-cli/src/send.rs` with
-/// `token_version = 4` (the default `.to_string()` path on
-/// `cdk::nuts::Token`).
-// TODO(12b-1 Task 12): V4 token encode now lives in the facade
-// `send_token`; this shell copy is dead until the deletion pass.
-#[allow(dead_code)]
-fn encode_v4_token(
-    mint_url: &str,
-    proofs: &[TokenProof],
-    currency: Currency,
-) -> Result<String, String> {
-    let mint = MintUrl::from_str(mint_url).map_err(|e| format!("mint url: {e}"))?;
-    let cdk_proofs: Vec<Proof> = proofs
-        .iter()
-        .map(token_proof_to_cdk_proof)
-        .collect::<Result<Vec<_>, _>>()?;
-    let unit = cashu_unit_for_currency(currency);
-    let token = Token::new(mint, cdk_proofs, None, unit);
-    Ok(token.to_string())
-}
-
-// TODO(12b-1 Task 12): only the now-dead `encode_v4_token` used this.
-#[allow(dead_code)]
-fn cashu_unit_for_currency(currency: Currency) -> CurrencyUnit {
-    match currency {
-        Currency::Btc => CurrencyUnit::Sat,
-        Currency::Usd | Currency::Usdb => CurrencyUnit::Usd,
-    }
-}
-
-// TODO(12b-1 Task 12): only the now-dead `encode_v4_token` used this.
-#[allow(dead_code)]
-fn token_proof_to_cdk_proof(proof: &TokenProof) -> Result<Proof, String> {
-    use cdk::nuts::PublicKey;
-    use cdk::secret::Secret;
-    let keyset_id =
-        KeysetId::from_str(&proof.id).map_err(|e| format!("keyset id {}: {e}", proof.id))?;
-    let secret = Secret::from_str(&proof.secret).map_err(|e| format!("secret: {e}"))?;
-    let c = PublicKey::from_hex(&proof.c).map_err(|e| format!("C: {e}"))?;
-    Ok(Proof {
-        amount: Amount::from(proof.amount),
-        keyset_id,
-        secret,
-        c,
-        witness: None,
-        dleq: None,
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -2645,20 +2203,6 @@ mod tests {
             .expect_err("bad uuid");
         assert!(
             matches!(err, FfiError::Internal { ref message } if message.contains("invalid account_id"))
-        );
-    }
-
-    #[test]
-    fn mint_quote_error_to_ffi_maps_amount_too_small() {
-        let e = mint_quote_error_to_ffi(MintQuoteError::AmountTooSmall);
-        assert!(matches!(e, FfiError::Internal { ref message } if message.contains("too small")));
-    }
-
-    #[test]
-    fn mint_quote_error_to_ffi_maps_quote_not_paid() {
-        let e = mint_quote_error_to_ffi(MintQuoteError::QuoteNotPaid);
-        assert!(
-            matches!(e, FfiError::Internal { ref message } if message.contains("not yet paid"))
         );
     }
 
