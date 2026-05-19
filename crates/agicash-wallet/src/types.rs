@@ -394,3 +394,56 @@ mod tests {
         }
     }
 }
+
+/// Claim state of a previously-created send token. Matches the FFI
+/// `SendSwapClaimState` (`agicash-ffi/src/send.rs:73-84` @ `241e8194`) so the
+/// FFI conversion is a trivial 1:1 `From`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendTokenClaimState {
+    /// At least one proof still UNSPENT — receiver hasn't claimed; poll again.
+    Pending,
+    /// All proofs SPENT (or the row was already COMPLETED) — receiver
+    /// claimed. The consumer's poll loop stops here.
+    Completed,
+    /// Swap row is FAILED. Shouldn't happen post-PENDING; surfaced so UIs
+    /// can render a terminal error.
+    Failed,
+}
+
+/// Snapshot returned by [`crate::WalletClient::check_send_token_claimed`].
+/// `failure_reason` is populated only when `state == Failed`. Mirrors the
+/// FFI `SendSwapClaimSnapshot` (`agicash-ffi/src/send.rs:86-93` @ `241e8194`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendTokenClaimStatus {
+    pub state: SendTokenClaimState,
+    pub failure_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod claim_status_tests {
+    use super::*;
+
+    #[test]
+    fn claim_status_roundtrips_through_json() {
+        let s = SendTokenClaimStatus {
+            state: SendTokenClaimState::Completed,
+            failure_reason: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: SendTokenClaimStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+        // snake_case discriminator on the wire.
+        assert!(json.contains("\"completed\""));
+    }
+
+    #[test]
+    fn failed_status_carries_reason() {
+        let s = SendTokenClaimStatus {
+            state: SendTokenClaimState::Failed,
+            failure_reason: Some("mint rejected".into()),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("mint rejected"));
+    }
+}

@@ -67,7 +67,7 @@ pub use session::SessionContract;
 pub use types::{
     AccountSummary, AuthStatus, BalanceSummary, ExchangeRateSnapshot, MintSummary,
     ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState, ReceiveReceipt,
-    ReceiveStatus, SendLightningHandle, SendLightningQuote, SendLightningReceipt, SendTokenQuote,
-    SendTokenReceipt, TokenVersion, Transaction, TransactionDirection, TransactionFilter,
-    TransactionPage,
+    ReceiveStatus, SendLightningHandle, SendLightningQuote, SendLightningReceipt,
+    SendTokenClaimState, SendTokenClaimStatus, SendTokenQuote, SendTokenReceipt, TokenVersion,
+    Transaction, TransactionDirection, TransactionFilter, TransactionPage,
 };
