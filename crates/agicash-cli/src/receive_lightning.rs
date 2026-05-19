@@ -92,9 +92,7 @@ fn map_err(e: WalletError) -> ReceiveLightningCmdError {
     match e {
         WalletError::Unauthenticated => ReceiveLightningCmdError::NotLoggedIn,
         WalletError::Validation { code, message } => match code.as_str() {
-            "no_account" | "no_matching_account" => {
-                ReceiveLightningCmdError::NoMatchingAccount
-            }
+            "no_account" | "no_matching_account" => ReceiveLightningCmdError::NoMatchingAccount,
             "ambiguous_account" => ReceiveLightningCmdError::AccountAmbiguous,
             "amount_too_small" => ReceiveLightningCmdError::AmountTooSmall,
             _ => ReceiveLightningCmdError::Quote(message),
@@ -103,9 +101,7 @@ fn map_err(e: WalletError) -> ReceiveLightningCmdError {
         WalletError::Cashu(m) | WalletError::CashuTyped { message: m, .. } => {
             ReceiveLightningCmdError::Quote(m)
         }
-        WalletError::Storage(m) => {
-            ReceiveLightningCmdError::Storage(StorageError::Internal(m))
-        }
+        WalletError::Storage(m) => ReceiveLightningCmdError::Storage(StorageError::Internal(m)),
         other => ReceiveLightningCmdError::Quote(other.to_string()),
     }
 }
@@ -256,70 +252,33 @@ fn print_quote_issued(handle: &ReceiveLightningHandle, _currency: Currency) {
 }
 
 fn print_receipt(receipt: &ReceiveReceipt, fallback_quote_id: Uuid) {
-    match receipt.status {
-        ReceiveStatus::Received => {
-            let body = ReceivedOutput {
-                status: "received",
-                amount: receipt.amount.amount().to_string(),
-                fee: receipt.fee.amount().to_string(),
-                unit: receipt.amount.unit().to_string(),
-                currency: receipt.amount.currency().to_string(),
-                account_id: receipt.account_id.to_string(),
-                quote_id: fallback_quote_id.to_string(),
-                payment_hash: receipt.token_hash.clone(),
-            };
-            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
-        }
-        ReceiveStatus::Pending => {
-            let body = ReceivedOutput {
-                status: "pending",
-                amount: receipt.amount.amount().to_string(),
-                fee: receipt.fee.amount().to_string(),
-                unit: receipt.amount.unit().to_string(),
-                currency: receipt.amount.currency().to_string(),
-                account_id: receipt.account_id.to_string(),
-                quote_id: fallback_quote_id.to_string(),
-                payment_hash: receipt.token_hash.clone(),
-            };
-            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
-        }
-        // Behavior delta (flagged): the pre-migration CLI distinguished
-        // `already-failed` (terminal Failed) from `already-expired`
-        // (terminal Expired); the facade collapses Failed+Expired into
-        // `AlreadyFailed`. We render `already-failed`. The required smoke
-        // path (mint quote → paid → received) is byte-identical.
-        ReceiveStatus::AlreadyFailed => {
-            let body = ReceivedOutput {
-                status: "already-failed",
-                amount: receipt.amount.amount().to_string(),
-                fee: receipt.fee.amount().to_string(),
-                unit: receipt.amount.unit().to_string(),
-                currency: receipt.amount.currency().to_string(),
-                account_id: receipt.account_id.to_string(),
-                quote_id: fallback_quote_id.to_string(),
-                payment_hash: receipt.token_hash.clone(),
-            };
-            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
-        }
-        ReceiveStatus::AlreadyClaimed => {
-            let body = ReceivedOutput {
-                status: "received",
-                amount: receipt.amount.amount().to_string(),
-                fee: receipt.fee.amount().to_string(),
-                unit: receipt.amount.unit().to_string(),
-                currency: receipt.amount.currency().to_string(),
-                account_id: receipt.account_id.to_string(),
-                quote_id: fallback_quote_id.to_string(),
-                payment_hash: receipt.token_hash.clone(),
-            };
-            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
-        }
-    }
+    // Status string per facade `ReceiveStatus`. `Received` /
+    // `AlreadyClaimed` both render `received` (idempotent re-complete is
+    // a success). Behavior delta (flagged): the pre-migration CLI
+    // distinguished `already-failed` (terminal Failed) from
+    // `already-expired` (terminal Expired); the facade collapses
+    // Failed+Expired into `AlreadyFailed`, so both render
+    // `already-failed`. The required smoke path (mint quote → paid →
+    // received) is byte-identical.
+    let status = match receipt.status {
+        ReceiveStatus::Received | ReceiveStatus::AlreadyClaimed => "received",
+        ReceiveStatus::Pending => "pending",
+        ReceiveStatus::AlreadyFailed => "already-failed",
+    };
+    let body = ReceivedOutput {
+        status,
+        amount: receipt.amount.amount().to_string(),
+        fee: receipt.fee.amount().to_string(),
+        unit: receipt.amount.unit().to_string(),
+        currency: receipt.amount.currency().to_string(),
+        account_id: receipt.account_id.to_string(),
+        quote_id: fallback_quote_id.to_string(),
+        payment_hash: receipt.token_hash.clone(),
+    };
+    println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
 }
 
-fn parse_account(
-    requested: Option<&str>,
-) -> Result<Option<AccountId>, ReceiveLightningCmdError> {
+fn parse_account(requested: Option<&str>) -> Result<Option<AccountId>, ReceiveLightningCmdError> {
     match requested {
         None => Ok(None),
         Some(s) => {

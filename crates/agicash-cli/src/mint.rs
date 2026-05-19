@@ -42,14 +42,10 @@ fn map_mint_err(e: WalletError) -> MintCmdError {
         WalletError::Validation { code, message } if code == "bad_url" => {
             MintCmdError::InvalidUrl(message)
         }
-        WalletError::Validation { message, .. } => {
-            MintCmdError::UnsupportedCurrency(message)
-        }
+        WalletError::Validation { message, .. } => MintCmdError::UnsupportedCurrency(message),
         WalletError::Network(m) => MintCmdError::MintUnreachable(m),
         WalletError::Cashu(m) => MintCmdError::MintError(m),
-        WalletError::Storage(m) => {
-            MintCmdError::Storage(StorageError::Internal(m))
-        }
+        WalletError::Storage(m) => MintCmdError::Storage(StorageError::Internal(m)),
         WalletError::NotFound(m) => MintCmdError::Storage(StorageError::Internal(m)),
         other => MintCmdError::Storage(StorageError::Internal(other.to_string())),
     }

@@ -1,6 +1,6 @@
 //! `auth` subcommands — now composed over the `WalletClient` facade.
 //!
-//! The facade owns the OpenSecret handshake/refresh + the in-memory
+//! The facade owns the `OpenSecret` handshake/refresh + the in-memory
 //! session slot (`OpenSecretAuthClient`, byte-identical to the prior
 //! `deps.client` bodies). The CLI shell owns keyring persistence the way
 //! the iOS shell owns Keychain: after a successful `auth_*` the returned

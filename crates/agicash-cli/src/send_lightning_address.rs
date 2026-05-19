@@ -2,9 +2,9 @@
 //!
 //! LUD-16/LUD-06 resolution stays shell-side (it's a thin
 //! `agicash-lightning-address` crate call, not part of the
-//! OpenSecret/Supabase/CDK composition) and prints the same `resolved`
-//! + `invoice-fetched` lines as before; it then delegates to the
-//! facade-composed [`send_lightning::cmd_send_lightning`].
+//! `OpenSecret`/`Supabase`/CDK composition) and prints the same
+//! `resolved` then `invoice-fetched` lines as before; it then delegates
+//! to the facade-composed [`send_lightning::cmd_send_lightning`].
 
 use crate::composition::CliDeps;
 use crate::send_lightning::{cmd_send_lightning, SendLightningCmdError};
@@ -83,9 +83,6 @@ pub async fn cmd_send_lightning_address(
     );
 
     // Step 3: delegate to the facade-composed NUT-05 melt flow.
-    cmd_send_lightning(
-        deps, invoice, account, dry_run, no_wait, poll_ms, timeout_s,
-    )
-    .await?;
+    cmd_send_lightning(deps, invoice, account, dry_run, no_wait, poll_ms, timeout_s).await?;
     Ok(())
 }

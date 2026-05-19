@@ -1,7 +1,7 @@
 //! `agicash receive token <token>` subcommand — composed over
 //! `WalletClient::receive_cashu_token`.
 //!
-//! The facade owns parse → account-pick → create → complete_swap (the
+//! The facade owns parse → account-pick → create → `complete_swap` (the
 //! same `ReceiveSwapService` path the CLI drove inline). This shell
 //! reshapes the facade's `ReceiveReceipt` back into the exact prior
 //! stdout JSON: the full `received`/`pending`/`already-failed` body and

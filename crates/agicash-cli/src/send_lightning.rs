@@ -107,9 +107,7 @@ fn map_err(e: WalletError) -> SendLightningCmdError {
         | WalletError::CashuTyped { message: m, .. }
         | WalletError::Concurrency(m)
         | WalletError::Network(m) => SendLightningCmdError::Quote(m),
-        WalletError::Storage(m) => {
-            SendLightningCmdError::Storage(StorageError::Internal(m))
-        }
+        WalletError::Storage(m) => SendLightningCmdError::Storage(StorageError::Internal(m)),
         other => SendLightningCmdError::Quote(other.to_string()),
     }
 }
@@ -161,11 +159,7 @@ pub async fn cmd_send_lightning_complete(
         .map_err(|_| SendLightningCmdError::InvalidQuoteId(quote_id.clone()))?;
     // Resume an in-flight melt by its quote id (the facade poll is
     // keyed by quote_id and is reconcile-aware).
-    let status = deps
-        .wallet
-        .poll_send_lightning(id)
-        .await
-        .map_err(map_err)?;
+    let status = deps.wallet.poll_send_lightning(id).await.map_err(map_err)?;
     drive_to_terminal(deps, status, poll_ms, timeout_s).await
 }
 
@@ -245,9 +239,7 @@ fn print_dry_run(quote: &SendLightningQuote) {
     println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
 }
 
-fn parse_account(
-    requested: Option<&str>,
-) -> Result<Option<AccountId>, SendLightningCmdError> {
+fn parse_account(requested: Option<&str>) -> Result<Option<AccountId>, SendLightningCmdError> {
     match requested {
         None => Ok(None),
         Some(s) => {
