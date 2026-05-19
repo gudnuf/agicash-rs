@@ -22,6 +22,28 @@ aclippy        # cargo clippy --workspace --all-targets -- -D warnings
 
 Run both before committing. CI rejects non-conforming code on `master`.
 
+### Git hooks (prek)
+
+A fast [`prek`](https://github.com/j178/prek) hook chain (config:
+`.pre-commit-config.yaml`, tracked) stops trivial formatting/lint
+failures before they reach CI:
+
+- **pre-commit** (fast, no compile): text hygiene + `rustfmt --check`
+  on the staged `.rs` files.
+- **pre-push** (warm-cache fast): `cargo clippy -D warnings` across the
+  workspace — the same gate CI runs, caught before the push.
+
+One-time setup per machine + per checkout/worktree:
+
+```sh
+nix profile install nixpkgs#prek          # once per machine, puts prek on PATH
+prek install --hook-type pre-commit --hook-type pre-push   # once per checkout/worktree
+```
+
+Run commits inside the nix dev shell (direnv auto-loads it on
+`cd` into the repo) so `rustfmt`/`cargo` are on PATH. `PREK_ALLOW_NO_CONFIG=1`
+is **no longer needed** — the config above is real, not a no-op.
+
 ## Comments and doc
 
 Default to no comments. The bar for adding one: a future reader couldn't
