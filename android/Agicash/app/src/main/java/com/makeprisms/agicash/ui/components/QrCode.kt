@@ -74,10 +74,19 @@ object QrCode {
 
     // ---- QR construction ----
 
-    // EC level M data capacities (bytes) by version, byte mode.
+    // EC level M *data* codeword capacities by version (ISO/IEC 18004
+    // Table 9). MUST equal `g1Blocks*g1Cw + g2Blocks*g2Cw` from ECB_M
+    // for the same version — buildModules pads `dataCw` to CAPACITY_M[v]
+    // and then re-splits it into ECB_M blocks, so any shortfall makes
+    // the block-split index past the end of `dataCw`
+    // (ArrayIndexOutOfBoundsException). The previous table held the
+    // pre-EC byte budget (a few codewords short of the true data
+    // capacity at every version), which crashed QR rendering for any
+    // payload long enough to reach the affected version — i.e. every
+    // BOLT-11 invoice / Cashu token the receive & send flows draw.
     private val CAPACITY_M = intArrayOf(
-        0, 14, 26, 42, 62, 84, 106, 122, 152, 180, 213,
-        251, 287, 331, 362, 412, 450, 504, 560, 624, 666,
+        0, 16, 28, 44, 64, 86, 108, 124, 154, 182, 216,
+        254, 290, 334, 365, 415, 453, 507, 563, 627, 669,
     )
 
     // (ecCodewordsPerBlock, numBlocksGroup1, dataCwGroup1,
