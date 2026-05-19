@@ -19,16 +19,25 @@ use crate::melt_quote::{
 use crate::mint::MintAddResult;
 use crate::mint_quote::{MintQuoteHandle, MintQuoteSnapshot};
 use crate::receive::ReceiveResult;
-use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
+use crate::receive_flow::ReceiveFlow;
+// TODO(12c Task 7): pruned with OpenSecretSeedProvider removal — the
+// pre-12c receive_flow body was its sole user; Task 6 re-pointed onto
+// the facade accessor, leaving these dead until Task 7 deletes the type.
+#[allow(unused_imports)]
+use crate::receive_flow::OpenSecretSeedProvider;
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
-    CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSeedProvider, CashuSendSwapService,
-    CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError, MeltQuotePreview,
-    ReceiveFlowService,
+    CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSendSwapService, CashuSendSwapStorage,
+    CdkCashuProvider, MeltOutcome, MeltQuoteError, MeltQuotePreview,
 };
+// TODO(12c Task 7): pruned with OpenSecretSeedProvider removal — only
+// the pre-12c self-constructing receive_flow body used these; Task 6
+// re-pointed onto the facade accessor, so they are dead until Task 7.
+#[allow(unused_imports)]
+use agicash_cashu::{CashuSeedProvider, ReceiveFlowService};
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
 use agicash_money::{Money, Unit};
@@ -59,6 +68,12 @@ pub struct AgicashWallet {
     /// `PassthroughProofEncryption` stub matching the CLI composition root.
     /// Once the encryption seam ships, this slot swaps to a real impl
     /// without the FFI surface changing.
+    // TODO(12c Task 7): dead since Task 6 re-pointed `receive_flow` onto
+    // the facade accessor — the facade now owns `ReceiveFlowService`
+    // construction (incl. its own `receive_swap_service`), so this FFI-
+    // held copy has no remaining reader. Task 7 removes the field + its
+    // constructor wiring together with the dead `OpenSecretSeedProvider`.
+    #[allow(dead_code)]
     receive_swap_service: Arc<CashuReceiveSwapService>,
     /// Send-swap storage handle, reused here purely to call
     /// `list_unspent_proofs` from `list_accounts` so the per-account
@@ -788,20 +803,17 @@ impl AgicashWallet {
     /// Requires an active session; returns `FfiError::Auth { UNAUTHENTICATED }`
     /// otherwise.
     pub async fn receive_flow(&self) -> Result<Arc<ReceiveFlow>, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-        let seed_provider: Arc<dyn CashuSeedProvider> =
-            Arc::new(OpenSecretSeedProvider::new(self.client.clone()));
-        let service = ReceiveFlowService::new(
-            user_id,
-            Arc::clone(&self.storage) as Arc<dyn UserStorage>,
-            Arc::clone(&self.cashu_provider),
-            Arc::clone(&self.receive_swap_service),
-            seed_provider,
-        );
+        // 12c §3: the orchestrator is constructed by the facade from the
+        // deps it already holds; the shell only wraps the returned
+        // service in the long-lived Mutex handle the UI drives. The
+        // facade enforces the session requirement and returns
+        // WalletError::Unauthenticated when logged out, mapped 1:1 to
+        // FfiError::Auth { UNAUTHENTICATED } by convert::wallet_error_to_ffi.
+        let service = self
+            .facade
+            .receive_flow()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
         Ok(Arc::new(ReceiveFlow::new(service)))
     }
 
@@ -2609,5 +2621,27 @@ mod tests {
         )
         .expect("construct");
         assert!(wallet.auth_logout().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn receive_flow_handle_built_via_facade_accessor_unauthenticated() {
+        // No session loaded → the facade accessor returns
+        // WalletError::Unauthenticated, which the FFI maps to
+        // FfiError::Auth { UNAUTHENTICATED } (post-12b-1 convert).
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        let err = wallet.receive_flow().await.expect_err("no session");
+        match err {
+            FfiError::Auth { code, .. } => {
+                assert_eq!(code, crate::error::auth_code::UNAUTHENTICATED);
+            }
+            other => panic!("expected Auth UNAUTHENTICATED, got {other:?}"),
+        }
     }
 }
