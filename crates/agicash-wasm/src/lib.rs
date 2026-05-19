@@ -81,6 +81,33 @@ mod wasm_impl {
             Ok(crate::convert::session_from_facade(&s))
         }
 
+        /// Email + password login. Pure delegate to
+        /// `WalletClient::auth_login` (mirrors FFI 6.2). Reuses
+        /// `session_from_facade`.
+        #[wasm_bindgen(js_name = authLogin)]
+        pub async fn auth_login(
+            &self,
+            email: String,
+            password: String,
+        ) -> Result<crate::types::SessionWasm, JsValue> {
+            let s = self
+                .client
+                .auth_login(&email, &password)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::session_from_facade(&s))
+        }
+
+        /// Best-effort server logout (always clears local state). Pure
+        /// delegate to `WalletClient::auth_logout` (mirrors FFI 6.4).
+        #[wasm_bindgen(js_name = authLogout)]
+        pub async fn auth_logout(&self) -> Result<(), JsValue> {
+            self.client
+                .auth_logout()
+                .await
+                .map_err(crate::convert::wallet_error_to_js)
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]
