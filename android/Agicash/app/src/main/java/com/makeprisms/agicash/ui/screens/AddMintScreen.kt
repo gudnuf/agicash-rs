@@ -343,14 +343,8 @@ private fun AddMintSuccessCard(result: MintAddResult, onDone: () -> Unit) {
     }
 }
 
-@Composable
-private fun Modifier.clickableNoIndication(enabled: Boolean = true, onClick: () -> Unit): Modifier {
-    val interactionSource = remember { MutableInteractionSource() }
-    return this.clickable(
-        interactionSource = interactionSource,
-        indication = null,
-        enabled = enabled,
-        onClick = onClick,
-    )
-}
+// `clickableNoIndication` now lives once (package-`internal`) in
+// ReceiveCarouselScreen.kt so the receive/send carousels share it; the
+// duplicate `private` copy that used to live here was removed to avoid
+// a conflicting-overload error.
 

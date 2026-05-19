@@ -34,6 +34,8 @@ import com.makeprisms.agicash.ui.screens.AccountsScreen
 import com.makeprisms.agicash.ui.screens.AddMintScreen
 import com.makeprisms.agicash.ui.screens.HomeScreen
 import com.makeprisms.agicash.ui.screens.LoginScreen
+import com.makeprisms.agicash.ui.screens.ReceiveCarouselScreen
+import com.makeprisms.agicash.ui.screens.SendCarouselScreen
 import com.makeprisms.agicash.ui.screens.SettingsScreen
 import com.makeprisms.agicash.wallet.WalletViewModel
 
@@ -73,7 +75,28 @@ private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
  */
 @Composable
 private fun SignedInShell(viewModel: WalletViewModel) {
+    // Receive / Send are presented as full-screen overlays over the
+    // bottom-tab shell. iOS presents them as `.sheet`s from HomeView;
+    // this app already established full-screen-route-over-sheet as the
+    // closer-to-iOS-push feel (see AddMintScreen's doc note), so the
+    // carousels follow the same convention. A nullable overlay state
+    // is simpler than a top-level NavHost here and keeps the existing
+    // per-tab Settings NavHost untouched.
+    var overlay by remember { mutableStateOf(Overlay.NONE) }
     var selected by remember { mutableStateOf(Tab.HOME) }
+
+    when (overlay) {
+        Overlay.RECEIVE -> {
+            ReceiveCarouselScreen(viewModel = viewModel, onClose = { overlay = Overlay.NONE })
+            return
+        }
+        Overlay.SEND -> {
+            SendCarouselScreen(viewModel = viewModel, onClose = { overlay = Overlay.NONE })
+            return
+        }
+        Overlay.NONE -> Unit
+    }
+
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -94,12 +117,18 @@ private fun SignedInShell(viewModel: WalletViewModel) {
     ) { inner ->
         Box(Modifier.padding(inner)) {
             when (selected) {
-                Tab.HOME -> HomeScreen(viewModel)
+                Tab.HOME -> HomeScreen(
+                    viewModel = viewModel,
+                    onReceive = { overlay = Overlay.RECEIVE },
+                    onSend = { overlay = Overlay.SEND },
+                )
                 Tab.SETTINGS -> SettingsTabHost(viewModel)
             }
         }
     }
 }
+
+private enum class Overlay { NONE, RECEIVE, SEND }
 
 /**
  * Per-tab NavHost for the Settings flow. Routes:
