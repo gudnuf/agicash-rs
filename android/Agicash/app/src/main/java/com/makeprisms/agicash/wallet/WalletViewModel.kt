@@ -12,11 +12,24 @@ import kotlinx.coroutines.withContext
 import uniffi.agicash_ffi.AccountFfi
 import uniffi.agicash_ffi.AgicashWallet
 import uniffi.agicash_ffi.FfiException
+import uniffi.agicash_ffi.LightningAddressException
+import uniffi.agicash_ffi.MeltQuoteFfiState
+import uniffi.agicash_ffi.MeltQuoteHandle
+import uniffi.agicash_ffi.MeltQuotePreview
+import uniffi.agicash_ffi.MeltQuoteSnapshot
 import uniffi.agicash_ffi.MintAddResult
+import uniffi.agicash_ffi.MintQuoteFfiState
+import uniffi.agicash_ffi.MintQuoteHandle
 import uniffi.agicash_ffi.RealtimeStatusFfi
+import uniffi.agicash_ffi.ReceiveResult
+import uniffi.agicash_ffi.SendQuotePreview
+import uniffi.agicash_ffi.SendSwapClaimState
+import uniffi.agicash_ffi.SendSwapHandle
 import uniffi.agicash_ffi.Session
 import uniffi.agicash_ffi.UserFfi
 import uniffi.agicash_ffi.WalletEventListener
+import uniffi.agicash_ffi.requestLightningInvoice
+import uniffi.agicash_ffi.resolveLightningAddress
 
 /**
  * Mirrors `ios/Agicash/Agicash/WalletViewModel.swift` in Android idiom.
@@ -585,6 +598,379 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
                 else -> 0
             }
         })
+    }
+
+    // ---- Receive: Cashu token redeem (NUT-03) ----
+
+    /**
+     * Outcome shape returned to the receive screens. Mirrors iOS
+     * `WalletViewModel.ReceiveOutcome`: success carries the FFI
+     * `ReceiveResult` so the view renders amount/mint/status directly;
+     * failure carries a presentation-ready string already mapped
+     * through [ffiErrorMessage]. Shared by the Cashu-token paste flow
+     * and the Lightning-receive `complete` step (same as iOS).
+     */
+    sealed interface ReceiveOutcome {
+        data class Success(val result: ReceiveResult) : ReceiveOutcome
+        data class Failure(val message: String) : ReceiveOutcome
+    }
+
+    /**
+     * Redeem a Cashu token. Mirrors iOS `receive(token:)`: trims +
+     * validates, calls the FFI on `Dispatchers.IO`, refreshes the
+     * accounts list on success so Home's balance reflects the new
+     * proofs without a pull-to-refresh. Intentionally does NOT mutate
+     * the boot phase on failure — receive failures stay inside the
+     * receive sheet and are rendered inline by the caller.
+     */
+    suspend fun receive(token: String): ReceiveOutcome {
+        val trimmed = token.trim()
+        if (trimmed.isEmpty()) return ReceiveOutcome.Failure("Paste a Cashu token first.")
+        val w = wallet ?: return ReceiveOutcome.Failure("Wallet not ready.")
+        _isWorking.value = true
+        try {
+            val result = withContext(Dispatchers.IO) { w.receiveToken(trimmed) }
+            refreshAccounts()
+            return ReceiveOutcome.Success(result)
+        } catch (e: FfiException) {
+            return ReceiveOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            return ReceiveOutcome.Failure("unexpected: ${e.message}")
+        } finally {
+            _isWorking.value = false
+        }
+    }
+
+    // ---- Receive: Lightning (NUT-04 mint quote) ----
+
+    /** Mirrors iOS `LightningQuoteOutcome`. */
+    sealed interface LightningQuoteOutcome {
+        data class Success(val handle: MintQuoteHandle) : LightningQuoteOutcome
+        data class Failure(val message: String) : LightningQuoteOutcome
+    }
+
+    /** Mirrors iOS `LightningPollOutcome`. */
+    sealed interface LightningPollOutcome {
+        data class State(
+            val state: MintQuoteFfiState,
+            val failureReason: String?,
+        ) : LightningPollOutcome
+        data class Failure(val message: String) : LightningPollOutcome
+    }
+
+    /**
+     * Request a BOLT-11 invoice from the user's default Cashu mint.
+     * Mirrors iOS `startLightningQuote`. Does NOT flip [isWorking] —
+     * the receive view owns a richer entry→generating→invoice→done
+     * state machine and renders its own localized spinner.
+     */
+    suspend fun startLightningQuote(
+        amount: ULong,
+        accountId: String? = null,
+        currency: String? = null,
+    ): LightningQuoteOutcome {
+        val w = wallet ?: return LightningQuoteOutcome.Failure("Wallet not ready.")
+        return try {
+            val handle = withContext(Dispatchers.IO) {
+                w.startMintQuote(amount, accountId, currency)
+            }
+            LightningQuoteOutcome.Success(handle)
+        } catch (e: FfiException) {
+            LightningQuoteOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            LightningQuoteOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Single-shot poll for the mint-quote state. Mirrors iOS
+     * `pollLightningQuote` — the view owns the cadence and cancels the
+     * loop on disappear / terminal transition.
+     */
+    suspend fun pollLightningQuote(quoteId: String): LightningPollOutcome {
+        val w = wallet ?: return LightningPollOutcome.Failure("Wallet not ready.")
+        return try {
+            val snap = withContext(Dispatchers.IO) { w.pollMintQuote(quoteId) }
+            LightningPollOutcome.State(snap.state, snap.failureReason)
+        } catch (e: FfiException) {
+            LightningPollOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            LightningPollOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Drive a PAID quote to COMPLETED — mints proofs + credits the
+     * account, then refreshes accounts so Home reflects the credit.
+     * Mirrors iOS `completeLightningQuote`; returns the shared
+     * [ReceiveOutcome] so the success card can reuse the Cashu-token
+     * receive primitives.
+     */
+    suspend fun completeLightningQuote(quoteId: String): ReceiveOutcome {
+        val w = wallet ?: return ReceiveOutcome.Failure("Wallet not ready.")
+        return try {
+            val result = withContext(Dispatchers.IO) { w.completeMintQuote(quoteId) }
+            refreshAccounts()
+            ReceiveOutcome.Success(result)
+        } catch (e: FfiException) {
+            ReceiveOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            ReceiveOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    // ---- Send: Cashu send-swap (NUT-03) ----
+
+    /** Mirrors iOS `SendQuoteOutcome`. */
+    sealed interface SendQuoteOutcome {
+        data class Success(val quote: SendQuotePreview) : SendQuoteOutcome
+        data class Failure(val message: String) : SendQuoteOutcome
+    }
+
+    /** Mirrors iOS `SendOutcome`. */
+    sealed interface SendOutcome {
+        data class Success(val handle: SendSwapHandle) : SendOutcome
+        data class Failure(val message: String) : SendOutcome
+    }
+
+    /** Mirrors iOS `SendClaimOutcome`. */
+    sealed interface SendClaimOutcome {
+        data class State(
+            val state: SendSwapClaimState,
+            val failureReason: String?,
+        ) : SendClaimOutcome
+        data class Failure(val message: String) : SendClaimOutcome
+    }
+
+    /**
+     * Preview the fee + total for a send. Mirrors iOS `prepareSend`;
+     * does NOT flip [isWorking] — the send view owns its phase machine
+     * and renders a localized spinner for the brief quote round-trip.
+     */
+    suspend fun prepareSend(
+        amount: ULong,
+        accountId: String? = null,
+        currency: String? = null,
+    ): SendQuoteOutcome {
+        val w = wallet ?: return SendQuoteOutcome.Failure("Wallet not ready.")
+        return try {
+            val quote = withContext(Dispatchers.IO) {
+                w.prepareSendQuote(amount, accountId, currency)
+            }
+            SendQuoteOutcome.Success(quote)
+        } catch (e: FfiException) {
+            SendQuoteOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            SendQuoteOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Commit a send — runs the input swap and produces a wire-form V4
+     * token. Refreshes accounts on success so Home reflects the debit.
+     * Mirrors iOS `createSend`.
+     */
+    suspend fun createSend(
+        amount: ULong,
+        accountId: String? = null,
+        currency: String? = null,
+    ): SendOutcome {
+        val w = wallet ?: return SendOutcome.Failure("Wallet not ready.")
+        return try {
+            val handle = withContext(Dispatchers.IO) {
+                w.createSendSwap(amount, accountId, currency)
+            }
+            refreshAccounts()
+            SendOutcome.Success(handle)
+        } catch (e: FfiException) {
+            SendOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            SendOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Single-shot "has the receiver claimed?" poll. Mirrors iOS
+     * `pollSendClaim` — the share view owns the ~3s cadence and the
+     * cancel-on-disappear lifecycle.
+     */
+    suspend fun pollSendClaim(swapId: String): SendClaimOutcome {
+        val w = wallet ?: return SendClaimOutcome.Failure("Wallet not ready.")
+        return try {
+            val snap = withContext(Dispatchers.IO) { w.checkSendSwapClaimed(swapId) }
+            SendClaimOutcome.State(snap.state, snap.failureReason)
+        } catch (e: FfiException) {
+            SendClaimOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            SendClaimOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    // ---- Send: Lightning (NUT-05 melt quote) ----
+
+    /** Mirrors iOS `MeltQuoteOutcome`. */
+    sealed interface MeltQuoteOutcome {
+        data class Success(val preview: MeltQuotePreview) : MeltQuoteOutcome
+        data class Failure(val message: String) : MeltQuoteOutcome
+    }
+
+    /** Mirrors iOS `MeltCreateOutcome`. */
+    sealed interface MeltCreateOutcome {
+        data class Success(val handle: MeltQuoteHandle) : MeltCreateOutcome
+        data class Failure(val message: String) : MeltCreateOutcome
+    }
+
+    /** Mirrors iOS `MeltStatusOutcome`. */
+    sealed interface MeltStatusOutcome {
+        data class State(
+            val state: MeltQuoteFfiState,
+            val snapshot: MeltQuoteSnapshot,
+        ) : MeltStatusOutcome
+        data class Failure(val message: String) : MeltStatusOutcome
+    }
+
+    /**
+     * Preview the fee + total for a Lightning send. Mirrors iOS
+     * `prepareMeltQuote`; does NOT flip [isWorking].
+     */
+    suspend fun prepareMeltQuote(
+        bolt11: String,
+        accountId: String? = null,
+        currency: String? = null,
+    ): MeltQuoteOutcome {
+        val w = wallet ?: return MeltQuoteOutcome.Failure("Wallet not ready.")
+        return try {
+            val preview = withContext(Dispatchers.IO) {
+                w.prepareMeltQuote(bolt11, accountId, currency)
+            }
+            MeltQuoteOutcome.Success(preview)
+        } catch (e: FfiException) {
+            MeltQuoteOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            MeltQuoteOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Persist the UNPAID melt quote + reserve proofs. Mirrors iOS
+     * `createMeltQuote`. Does NOT refresh accounts — the debit isn't
+     * final until the melt settles (PAID); the poll refreshes on the
+     * terminal transition.
+     */
+    suspend fun createMeltQuote(
+        bolt11: String,
+        accountId: String? = null,
+        currency: String? = null,
+    ): MeltCreateOutcome {
+        val w = wallet ?: return MeltCreateOutcome.Failure("Wallet not ready.")
+        return try {
+            val handle = withContext(Dispatchers.IO) {
+                w.createMeltQuote(bolt11, accountId, currency)
+            }
+            MeltCreateOutcome.Success(handle)
+        } catch (e: FfiException) {
+            MeltCreateOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            MeltCreateOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Fire NUT-05 `post_melt` (UNPAID → PENDING/terminal). Refreshes
+     * accounts on the PAID transition so Home reflects the debit.
+     * Mirrors iOS `executeMeltQuote`.
+     */
+    suspend fun executeMeltQuote(quoteId: String): MeltStatusOutcome {
+        val w = wallet ?: return MeltStatusOutcome.Failure("Wallet not ready.")
+        return try {
+            val snap = withContext(Dispatchers.IO) { w.executeMeltQuote(quoteId) }
+            if (snap.state == MeltQuoteFfiState.PAID) refreshAccounts()
+            MeltStatusOutcome.State(snap.state, snap)
+        } catch (e: FfiException) {
+            MeltStatusOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            MeltStatusOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Single-shot poll for a PENDING melt quote. Refreshes accounts on
+     * the PAID transition. Mirrors iOS `pollMeltQuote` — the view owns
+     * the ~2s cadence + cancel-on-disappear.
+     */
+    suspend fun pollMeltQuote(quoteId: String): MeltStatusOutcome {
+        val w = wallet ?: return MeltStatusOutcome.Failure("Wallet not ready.")
+        return try {
+            val snap = withContext(Dispatchers.IO) { w.pollMeltQuote(quoteId) }
+            if (snap.state == MeltQuoteFfiState.PAID) refreshAccounts()
+            MeltStatusOutcome.State(snap.state, snap)
+        } catch (e: FfiException) {
+            MeltStatusOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            MeltStatusOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    // ---- Send: Lightning Address (LUD-16) resolution ----
+
+    /** Mirrors iOS `LnAddressInvoiceOutcome`. */
+    sealed interface LnAddressInvoiceOutcome {
+        data class Success(
+            val invoice: String,
+            val amountSats: ULong,
+        ) : LnAddressInvoiceOutcome
+        data class Failure(val message: String) : LnAddressInvoiceOutcome
+    }
+
+    /**
+     * Resolve a Lightning Address and request a BOLT-11 invoice for
+     * `amountSats`. Two network round-trips (well-known lookup + the
+     * LUD-06 callback) wrapped behind one call so the view's state
+     * machine stays simple. Mirrors iOS `resolveLnAddressInvoice`. The
+     * LUD-16 FFI is wallet-agnostic (module-level free functions); this
+     * adapts its `LightningAddressException` shape to the same string
+     * convention the rest of the VM uses (per-variant guidance mirrors
+     * the iOS `lnAddressErrorMessage`).
+     */
+    suspend fun resolveLnAddressInvoice(
+        address: String,
+        amountSats: ULong,
+        comment: String? = null,
+    ): LnAddressInvoiceOutcome {
+        val trimmed = address.trim().lowercase()
+        if (trimmed.isEmpty()) {
+            return LnAddressInvoiceOutcome.Failure("Enter a Lightning Address first.")
+        }
+        return try {
+            val info = withContext(Dispatchers.IO) { resolveLightningAddress(trimmed) }
+            val invoice = withContext(Dispatchers.IO) {
+                requestLightningInvoice(info, amountSats * 1000u, comment)
+            }
+            LnAddressInvoiceOutcome.Success(invoice, amountSats)
+        } catch (e: LightningAddressException) {
+            LnAddressInvoiceOutcome.Failure(lnAddressErrorMessage(e))
+        } catch (e: Throwable) {
+            LnAddressInvoiceOutcome.Failure("unexpected: ${e.message}")
+        }
+    }
+
+    /**
+     * Map the LUD-16 FFI error to a user-readable string. Mirrors the
+     * per-variant guidance documented on the Rust `LightningAddressError`
+     * (kept consistent with iOS `lnAddressErrorMessage`).
+     * `AmountOutOfRange` renders the sat bounds (msat / 1000) inline.
+     */
+    private fun lnAddressErrorMessage(e: LightningAddressException): String = when (e) {
+        is LightningAddressException.InvalidAddress ->
+            "That doesn't look like a Lightning Address."
+        is LightningAddressException.Network ->
+            "Couldn't reach the recipient's server. Try again."
+        is LightningAddressException.InvalidResponse ->
+            "The recipient's server returned an unexpected response."
+        is LightningAddressException.AmountOutOfRange ->
+            "Amount must be between ${e.min / 1000u} and ${e.max / 1000u} sats."
+        is LightningAddressException.ServerException -> e.message ?: "Server error."
+        else -> e.message ?: "Lightning Address error."
     }
 
     private fun ffiErrorMessage(e: FfiException): String = when (e) {
