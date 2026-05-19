@@ -15,6 +15,7 @@
 pub mod account;
 #[cfg(target_os = "android")]
 pub mod android_tls;
+pub mod convert;
 pub mod error;
 pub mod exchange_rate;
 pub mod lightning_address;
