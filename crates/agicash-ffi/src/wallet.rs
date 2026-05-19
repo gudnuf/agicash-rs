@@ -34,7 +34,7 @@ use agicash_cashu::{
     MintQuoteError, ParsedToken, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError,
     TokenProof,
 };
-use agicash_domain::{Account, AccountId, AccountPurpose, AccountType, Currency, UserId};
+use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
 use agicash_money::{Money, Unit};
 use agicash_storage_supabase::{
@@ -42,9 +42,8 @@ use agicash_storage_supabase::{
     SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
 };
 use agicash_traits::{
-    AccountInput, CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
-    ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UpsertUserInput,
-    UserStorage,
+    CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
+    ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UserStorage,
 };
 use agicash_wallet::{OpenSecretAuthClient, SessionStorageChoice, WalletClient, WalletConfig};
 use cdk::mint_url::MintUrl;
@@ -52,7 +51,6 @@ use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::{CurrencyUnit, Proof, Token};
 use cdk::Amount;
 use rust_decimal::Decimal;
-use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -753,132 +751,18 @@ impl AgicashWallet {
     ///   Auth/Storage cleanly — same shape as `receive_token` funnels
     ///   `ReceiveSwapError` through Internal).
     /// - `FfiError::Storage` for raw Supabase failures (network, etc.).
-    // Single canonical mint-add path; mirrors `cmd_mint_add` which also
-    // carries this allow for the same reason (one conceptual unit).
-    #[allow(clippy::too_many_lines)]
     pub async fn mint_add(&self, url: String) -> Result<MintAddResult, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
-        let mint_url = MintUrl::from_str(url.trim())
-            .map_err(|e| FfiError::internal(format!("invalid mint URL: {e}")))?;
-
-        let info = self
-            .cashu_provider
-            .mint_info(&mint_url)
+        // Hard-codes BTC (verbatim — the iOS UI + web `add-mint-form`
+        // both hard-code BTC). The facade `add_mint` performs the
+        // identical NUT-06 discovery + user-row-preservation + upsert +
+        // account-match the bespoke body did; it `require_session()`s
+        // the shared slot.
+        let summary = self
+            .facade
+            .add_mint(url, Currency::Btc)
             .await
-            .map_err(cashu_provider_error_to_ffi)?;
-
-        let mint_url_string = mint_url.to_string();
-        let mint_name = info.name.clone().unwrap_or_else(|| mint_url_string.clone());
-
-        // Mirror the CLI's user-row preservation. The `wallet.users` table
-        // has UNIQUE indexes on the three xpub/pubkey columns; for a
-        // brand-new guest we synthesize per-user placeholders so two
-        // guests can't collide before slice 5+ wires real key init.
-        let existing = self.storage.get_user(user_id).await?;
-        let (
-            email,
-            email_verified,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        ) = if let Some(u) = existing.as_ref() {
-            (
-                u.email.clone(),
-                u.email_verified,
-                u.cashu_locking_xpub.clone(),
-                u.encryption_public_key.clone(),
-                u.spark_identity_public_key.clone(),
-                u.terms_accepted_at,
-                u.gift_card_mint_terms_accepted_at,
-            )
-        } else {
-            let placeholder_prefix = format!("uninitialized-{user_id}-");
-            (
-                None,
-                false,
-                format!("{placeholder_prefix}cashu"),
-                format!("{placeholder_prefix}encryption"),
-                format!("{placeholder_prefix}spark"),
-                None,
-                None,
-            )
-        };
-
-        let currency = Currency::Btc;
-        let mut accounts = vec![AccountInput {
-            account_type: AccountType::Cashu,
-            purpose: AccountPurpose::Transactional,
-            currency,
-            name: mint_name.clone(),
-            details: json!({
-                "mint_url": mint_url_string,
-                "keyset_counters": {},
-            }),
-            is_default: false,
-        }];
-        if existing.is_none() {
-            // Same CLI-side workaround as `cmd_mint_add`:
-            // `wallet.upsert_user_with_accounts` requires at least one BTC
-            // Spark account for brand-new users. The `cli_placeholder`
-            // marker (kept verbatim so slice 9 can detect rows seeded
-            // through either entry point) flags this row as a stub.
-            accounts.push(AccountInput {
-                account_type: AccountType::Spark,
-                purpose: AccountPurpose::Transactional,
-                currency: Currency::Btc,
-                name: "Lightning".into(),
-                details: json!({
-                    "network": "MAINNET",
-                    "cli_placeholder": true,
-                }),
-                is_default: true,
-            });
-        }
-
-        let input = UpsertUserInput {
-            user_id,
-            email,
-            email_verified,
-            accounts,
-            cashu_locking_xpub,
-            encryption_public_key,
-            spark_identity_public_key,
-            terms_accepted_at,
-            gift_card_mint_terms_accepted_at,
-        };
-
-        let result = self.storage.upsert_user_with_accounts(input).await?;
-
-        // Upsert returns all of the user's accounts; pick the one matching
-        // the new mint URL.
-        let new_account = result
-            .accounts
-            .iter()
-            .find(|a| {
-                a.account_type == AccountType::Cashu
-                    && a.details
-                        .get("mint_url")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| mint_urls_equal(s, &mint_url_string))
-            })
-            .ok_or_else(|| FfiError::Storage {
-                code: crate::error::storage_code::INTERNAL,
-                message: "upsert returned no account matching the new mint URL".into(),
-            })?;
-
-        Ok(MintAddResult {
-            account_id: new_account.id.to_string(),
-            mint_name,
-            mint_url: mint_url_string,
-            currency: currency.to_string(),
-        })
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::mint_add_result_from_summary(&summary))
     }
 
     // ---- receive surface ----
@@ -2859,6 +2743,7 @@ mod tests {
     fn stub_account(currency: Currency) -> Account {
         use agicash_domain::{AccountId, AccountPurpose, AccountState};
         use chrono::Utc;
+        use serde_json::json;
         Account {
             id: AccountId::new(),
             created_at: Utc::now(),

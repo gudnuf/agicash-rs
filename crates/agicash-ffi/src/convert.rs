@@ -118,6 +118,24 @@ pub fn account_ffi_from_summary(s: &agicash_wallet::AccountSummary) -> crate::ac
     }
 }
 
+/// Facade `AccountSummary` (the row `add_mint` returns) → FFI
+/// `MintAddResult`. Verbatim the old `mint_add` tail mapping:
+/// stringified id, `name` as `mint_name`, `mint_url` (empty when the
+/// row carries none — unreachable in practice since the row was just
+/// created against a mint URL, but defaulted for total-ness exactly as
+/// `unwrap_or_default`), currency Display label.
+#[must_use]
+pub fn mint_add_result_from_summary(
+    s: &agicash_wallet::AccountSummary,
+) -> crate::mint::MintAddResult {
+    crate::mint::MintAddResult {
+        account_id: s.id.to_string(),
+        mint_name: s.name.clone(),
+        mint_url: s.mint_url.clone().unwrap_or_default(),
+        currency: s.currency.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +228,38 @@ mod tests {
             ..summary
         };
         assert_eq!(account_ffi_from_summary(&usd).unit, "cent");
+    }
+
+    #[test]
+    fn mint_add_result_from_summary_maps_fields() {
+        let id = Uuid::new_v4();
+        let summary = agicash_wallet::AccountSummary {
+            id: AccountId::from(id),
+            user_id: agicash_domain::UserId::from(Uuid::new_v4()),
+            name: "Coinos".into(),
+            account_type: agicash_domain::AccountType::Cashu,
+            currency: Currency::Btc,
+            mint_url: Some("https://mint.coinos.io".into()),
+            balance: "0".into(),
+        };
+        let r = mint_add_result_from_summary(&summary);
+        assert_eq!(r.account_id, id.to_string());
+        assert_eq!(r.mint_name, "Coinos");
+        assert_eq!(r.mint_url, "https://mint.coinos.io");
+        assert_eq!(r.currency, "BTC");
+    }
+
+    #[test]
+    fn mint_add_result_missing_mint_url_defaults_empty() {
+        let summary = agicash_wallet::AccountSummary {
+            id: AccountId::from(Uuid::new_v4()),
+            user_id: agicash_domain::UserId::from(Uuid::new_v4()),
+            name: "x".into(),
+            account_type: agicash_domain::AccountType::Cashu,
+            currency: Currency::Btc,
+            mint_url: None,
+            balance: "0".into(),
+        };
+        assert_eq!(mint_add_result_from_summary(&summary).mint_url, "");
     }
 }
