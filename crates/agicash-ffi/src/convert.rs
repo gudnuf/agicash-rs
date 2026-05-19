@@ -91,6 +91,33 @@ pub fn session_from_facade(s: agicash_wallet::Session) -> crate::session::Sessio
     }
 }
 
+/// Minor-unit label for a currency. `"sat"` for BTC, `"cent"` for
+/// USD/USDB — verbatim the old `AccountFfi` `unit_label` mapping.
+#[must_use]
+fn unit_label(c: Currency) -> &'static str {
+    match c {
+        Currency::Btc => "sat",
+        Currency::Usd | Currency::Usdb => "cent",
+    }
+}
+
+/// Facade `AccountSummary` → FFI `AccountFfi` record. Verbatim the old
+/// `AccountFfi::from_account_with_balance` field shape: stringified id,
+/// `account_type`/`currency` Display labels, `mint_url` passthrough,
+/// decimal balance, currency-derived unit label.
+#[must_use]
+pub fn account_ffi_from_summary(s: &agicash_wallet::AccountSummary) -> crate::account::AccountFfi {
+    crate::account::AccountFfi {
+        id: s.id.to_string(),
+        name: s.name.clone(),
+        account_type: s.account_type.to_string(),
+        currency: s.currency.to_string(),
+        mint_url: s.mint_url.clone(),
+        balance: s.balance.clone(),
+        unit: unit_label(s.currency).to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +182,33 @@ mod tests {
         let ffi = session_from_facade(fs);
         assert_eq!(ffi.user_id, uid.to_string());
         assert_eq!(ffi.refresh_token, "rt.x");
+    }
+
+    #[test]
+    fn account_ffi_from_summary_maps_all_fields_and_derives_unit() {
+        let id = Uuid::new_v4();
+        let summary = agicash_wallet::AccountSummary {
+            id: AccountId::from(id),
+            user_id: agicash_domain::UserId::from(Uuid::new_v4()),
+            name: "My Mint".into(),
+            account_type: agicash_domain::AccountType::Cashu,
+            currency: Currency::Btc,
+            mint_url: Some("https://mint.example".into()),
+            balance: "1234".into(),
+        };
+        let ffi = account_ffi_from_summary(&summary);
+        assert_eq!(ffi.id, id.to_string());
+        assert_eq!(ffi.name, "My Mint");
+        assert_eq!(ffi.account_type, "cashu");
+        assert_eq!(ffi.currency, "BTC");
+        assert_eq!(ffi.mint_url, Some("https://mint.example".to_string()));
+        assert_eq!(ffi.balance, "1234");
+        assert_eq!(ffi.unit, "sat");
+
+        let usd = agicash_wallet::AccountSummary {
+            currency: Currency::Usd,
+            ..summary
+        };
+        assert_eq!(account_ffi_from_summary(&usd).unit, "cent");
     }
 }

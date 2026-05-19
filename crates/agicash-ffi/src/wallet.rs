@@ -610,38 +610,23 @@ impl AgicashWallet {
     /// MVP scale but could grow to N+1 latency once users hold many
     /// proofs. A grouped query is the natural follow-up.
     pub async fn list_accounts(&self) -> Result<Vec<AccountFfi>, FfiError> {
+        // Shell-resident observability (spec §6) — kept verbatim. The
+        // session check + balance summing now live in the facade
+        // `list_accounts` (it `require_session()`s the shared slot and
+        // sums via the same Supabase storage + cashu provider). The
+        // post-session-loaded per-account log lines depended on the
+        // now-removed inline loop; dropping them is a log-only change.
         crate::observability::init();
         tracing::info!(target: "agicash_ffi::wallet", "list_accounts: enter");
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-        tracing::info!(
-            target: "agicash_ffi::wallet",
-            user_id = %user_id.as_uuid(),
-            "list_accounts: session loaded"
-        );
-        let accounts = self.storage.list_accounts(user_id).await?;
-        tracing::info!(
-            target: "agicash_ffi::wallet",
-            account_count = accounts.len(),
-            "list_accounts: storage returned accounts"
-        );
-
-        let mut out = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            let balance = compute_cashu_balance(self.send_swap_storage.as_ref(), &account).await?;
-            tracing::info!(
-                target: "agicash_ffi::wallet",
-                account_id = %account.id,
-                account_type = ?account.account_type,
-                currency = ?account.currency,
-                balance = balance,
-                "list_accounts: account balance computed"
-            );
-            out.push(AccountFfi::from_account_with_balance(account, balance));
-        }
+        let summaries = self
+            .facade
+            .list_accounts()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        let out: Vec<AccountFfi> = summaries
+            .iter()
+            .map(crate::convert::account_ffi_from_summary)
+            .collect();
         tracing::info!(
             target: "agicash_ffi::wallet",
             returned = out.len(),
@@ -1984,6 +1969,10 @@ fn unit_matches_currency(unit: &cdk::nuts::CurrencyUnit, currency: Currency) -> 
 /// (matching the `receive_swap_error_to_ffi` shape) since
 /// `SendSwapStorageError` doesn't fit the structured Auth/Storage variants
 /// cleanly.
+// TODO(12b-1 Task 12): balance summing now lives in the facade
+// `list_accounts`; this shell copy is dead once the deletion pass runs.
+// Allow until then so the per-task gate stays green.
+#[allow(dead_code)]
 async fn compute_cashu_balance(
     storage: &dyn CashuSendSwapStorage,
     account: &Account,
