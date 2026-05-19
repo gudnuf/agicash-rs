@@ -300,10 +300,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                send_lightning::cmd_send_lightning_complete(
-                    &deps, quote_id, poll_ms, timeout_s,
-                )
-                .await?;
+                send_lightning::cmd_send_lightning_complete(&deps, quote_id, poll_ms, timeout_s)
+                    .await?;
             }
             SendCommand::LightningAddress {
                 address,
@@ -316,8 +314,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 timeout_s,
             } => {
                 send_lightning_address::cmd_send_lightning_address(
-                    &deps, address, amount, account, comment, dry_run, no_wait, poll_ms,
-                    timeout_s,
+                    &deps, address, amount, account, comment, dry_run, no_wait, poll_ms, timeout_s,
                 )
                 .await?;
             }

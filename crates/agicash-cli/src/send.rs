@@ -91,10 +91,7 @@ fn map_err(e: WalletError) -> SendCmdError {
     }
 }
 
-async fn mint_url_for(
-    deps: &CliDeps,
-    account_id: AccountId,
-) -> Result<String, SendCmdError> {
+async fn mint_url_for(deps: &CliDeps, account_id: AccountId) -> Result<String, SendCmdError> {
     let accounts = deps.wallet.list_accounts().await.map_err(map_err)?;
     accounts
         .into_iter()
@@ -181,8 +178,8 @@ fn parse_account(requested: Option<&str>) -> Result<Option<AccountId>, SendCmdEr
     match requested {
         None => Ok(None),
         Some(s) => {
-            let id = Uuid::parse_str(s)
-                .map_err(|_| SendCmdError::InvalidAccountId(s.to_string()))?;
+            let id =
+                Uuid::parse_str(s).map_err(|_| SendCmdError::InvalidAccountId(s.to_string()))?;
             Ok(Some(AccountId::from(id)))
         }
     }

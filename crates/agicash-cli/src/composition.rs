@@ -22,7 +22,7 @@
 //!    `update_user_defaults` — neither is on the facade surface (the
 //!    facade's `set_default_account` is `Unsupported` in slice 12).
 //!    Built from the SAME endpoint config so there is exactly one
-//!    wiring of OpenSecret + Supabase, no duplicate.
+//!    wiring of `OpenSecret` + `Supabase`, no duplicate.
 
 #[cfg(feature = "keyring-storage")]
 use agicash_auth_opensecret::KeyringSessionStorage;
@@ -94,9 +94,8 @@ pub async fn build_deps() -> Result<CliDeps, CompositionError> {
     // operations the facade doesn't surface (raw account list +
     // update_user_defaults). Same endpoint config — no duplicate
     // composition of the network stack.
-    let token_provider: Arc<dyn TokenProvider + Send + Sync> = Arc::new(
-        OpenSecretTokenProvider::new(OpenSecretClient::new(os_cfg)?),
-    );
+    let token_provider: Arc<dyn TokenProvider + Send + Sync> =
+        Arc::new(OpenSecretTokenProvider::new(OpenSecretClient::new(os_cfg)?));
     let user_storage = Arc::new(SupabaseStorage::new(sb_cfg, token_provider)?);
 
     let keyring = build_session_storage().await;
@@ -165,7 +164,7 @@ async fn probe_keyring(storage: &KeyringSessionStorage) -> Result<(), String> {
 /// facade so subsequent token-provider calls succeed.
 ///
 /// Verbatim-equivalent to the pre-migration `auth::rehydrate_session`:
-/// the facade's `WalletClient::set_session` performs the OpenSecret
+/// the facade's `WalletClient::set_session` performs the `OpenSecret`
 /// handshake → `set_tokens` → `refresh_token` internally (see
 /// `agicash_wallet::OpenSecretAuthClient::set_session`, byte-identical
 /// to the old `deps.client` body) and clears its own slot on refresh
@@ -219,4 +218,3 @@ pub fn wallet_err_to_auth(e: WalletError) -> AuthError {
         other => AuthError::Internal(other.to_string()),
     }
 }
-
