@@ -173,6 +173,24 @@ mod wasm_impl {
             Ok(crate::convert::send_swap_handle_from_facade(&receipt))
         }
 
+        /// Redeem a Cashu token. Pure delegate to
+        /// `WalletClient::receive_cashu_token` (mirrors FFI 9.1). The
+        /// facade handles unknown mints per its one-shot semantics — no
+        /// pre-check here (the mocked `KNOWN_MINTS` preview was a UX
+        /// stub; interactive add-mint confirmation is 12c receive-flow).
+        #[wasm_bindgen(js_name = receiveToken)]
+        pub async fn receive_token(
+            &self,
+            token: String,
+        ) -> Result<crate::types::ReceiveResultWasm, JsValue> {
+            let receipt = self
+                .client
+                .receive_cashu_token(&token)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::receive_result_from_receipt(&receipt))
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]

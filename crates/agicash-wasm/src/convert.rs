@@ -135,6 +135,42 @@ pub fn send_swap_handle_from_facade(
     }
 }
 
+/// Facade `ReceiveStatus` → `ReceiveStatusWasm`. 1:1 variant map,
+/// verbatim `ffi::convert::receive_status_from_facade`.
+#[must_use]
+fn receive_status_from_facade(s: agicash_wallet::ReceiveStatus) -> crate::types::ReceiveStatusWasm {
+    match s {
+        agicash_wallet::ReceiveStatus::Received => crate::types::ReceiveStatusWasm::Received,
+        agicash_wallet::ReceiveStatus::AlreadyClaimed => {
+            crate::types::ReceiveStatusWasm::AlreadyClaimed
+        }
+        agicash_wallet::ReceiveStatus::AlreadyFailed => {
+            crate::types::ReceiveStatusWasm::AlreadyFailed
+        }
+        agicash_wallet::ReceiveStatus::Pending => crate::types::ReceiveStatusWasm::Pending,
+    }
+}
+
+/// Facade `ReceiveReceipt` → `ReceiveResultWasm`. Verbatim
+/// `ffi::convert::receive_result_from_receipt`: decimal `amount`/`fee`
+/// strings, `Money`-derived `unit`/`currency`, stringified
+/// `account_id`, 1:1 status.
+#[must_use]
+pub fn receive_result_from_receipt(
+    r: &agicash_wallet::ReceiveReceipt,
+) -> crate::types::ReceiveResultWasm {
+    crate::types::ReceiveResultWasm {
+        status: receive_status_from_facade(r.status),
+        amount: r.amount.amount().to_string(),
+        fee: r.fee.amount().to_string(),
+        unit: r.amount.unit().to_string(),
+        currency: r.amount.currency().to_string(),
+        account_id: r.account_id.to_string(),
+        mint_url: r.mint_url.clone(),
+        token_hash: r.token_hash.clone(),
+    }
+}
+
 /// Facade `Session` → `SessionWasm`. Mirror of
 /// `ffi::convert::session_from_facade`.
 #[must_use]
@@ -218,6 +254,52 @@ mod tests {
             ..summary
         };
         assert_eq!(account_wasm_from_summary(&usd).unit, "cent");
+    }
+
+    #[wasm_bindgen_test]
+    fn receive_result_from_receipt_maps_money_and_status() {
+        let acct = Uuid::new_v4();
+        let receipt = agicash_wallet::ReceiveReceipt {
+            status: agicash_wallet::ReceiveStatus::Received,
+            amount: amount_to_money(900, Currency::Btc),
+            fee: amount_to_money(3, Currency::Btc),
+            account_id: AccountId::from(acct),
+            mint_url: "https://m.example".into(),
+            token_hash: "deadbeef".into(),
+        };
+        let r = receive_result_from_receipt(&receipt);
+        assert_eq!(r.status, crate::types::ReceiveStatusWasm::Received);
+        assert_eq!(r.amount, "900");
+        assert_eq!(r.fee, "3");
+        assert_eq!(r.unit, "sat");
+        assert_eq!(r.currency, "BTC");
+        assert_eq!(r.account_id, acct.to_string());
+        assert_eq!(r.mint_url, "https://m.example");
+        assert_eq!(r.token_hash, "deadbeef");
+    }
+
+    #[wasm_bindgen_test]
+    fn receive_result_status_variants_map_one_to_one() {
+        let mk = |s| agicash_wallet::ReceiveReceipt {
+            status: s,
+            amount: amount_to_money(0, Currency::Btc),
+            fee: amount_to_money(0, Currency::Btc),
+            account_id: AccountId::from(Uuid::new_v4()),
+            mint_url: String::new(),
+            token_hash: String::new(),
+        };
+        assert_eq!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::AlreadyClaimed)).status,
+            crate::types::ReceiveStatusWasm::AlreadyClaimed
+        );
+        assert_eq!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::AlreadyFailed)).status,
+            crate::types::ReceiveStatusWasm::AlreadyFailed
+        );
+        assert_eq!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::Pending)).status,
+            crate::types::ReceiveStatusWasm::Pending
+        );
     }
 
     #[wasm_bindgen_test]

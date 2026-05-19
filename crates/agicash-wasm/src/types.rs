@@ -110,6 +110,41 @@ pub struct SendSwapHandleWasm {
     pub mint_url: String,
 }
 
+/// Mirror of FFI `receive::ReceiveStatus`. 1:1 variant set.
+/// `#[wasm_bindgen]` C-like enum (JS sees integer discriminants);
+/// `Serialize` for the `serde_wasm_bindgen` path / JSON parity with the
+/// FFI's snake_case wire value the UI branches on.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ReceiveStatusWasm {
+    Received,
+    AlreadyClaimed,
+    AlreadyFailed,
+    Pending,
+}
+
+/// Mirror of FFI `receive::ReceiveResult`. Field set + types verbatim
+/// the FFI record. `Money` fields decimal-stringified.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Serialize)]
+pub struct ReceiveResultWasm {
+    pub status: ReceiveStatusWasm,
+    #[wasm_bindgen(getter_with_clone)]
+    pub amount: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub fee: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub unit: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub currency: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub account_id: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub mint_url: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub token_hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
