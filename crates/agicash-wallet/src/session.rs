@@ -35,7 +35,10 @@ impl SessionContract {
     /// Swift Keychain; CLI in-memory fallback; tests).
     #[must_use]
     pub fn new(auth: Arc<dyn AuthClient>) -> Self {
-        Self { auth, storage: None }
+        Self {
+            auth,
+            storage: None,
+        }
     }
 
     /// Wrap an auth client with a shell-injected persistent storage backend
@@ -190,7 +193,10 @@ mod tests {
     #[async_trait]
     impl AuthClient for ErroringLogoutAuth {
         async fn register_guest(&self) -> Result<Session, WalletError> {
-            let s = Session { user_id: UserId::new(), refresh_token: "rt".into() };
+            let s = Session {
+                user_id: UserId::new(),
+                refresh_token: "rt".into(),
+            };
             *self.session.lock().unwrap() = Some(s.clone());
             Ok(s)
         }
@@ -240,7 +246,9 @@ mod tests {
             Ok(None)
         }
         async fn clear(&self) -> Result<(), agicash_traits::AuthError> {
-            Err(agicash_traits::AuthError::Internal("disk full on clear".into()))
+            Err(agicash_traits::AuthError::Internal(
+                "disk full on clear".into(),
+            ))
         }
     }
 
@@ -251,7 +259,10 @@ mod tests {
     #[async_trait]
     impl AuthClient for OkLogoutAuth {
         async fn register_guest(&self) -> Result<Session, WalletError> {
-            Ok(Session { user_id: UserId::new(), refresh_token: "rt".into() })
+            Ok(Session {
+                user_id: UserId::new(),
+                refresh_token: "rt".into(),
+            })
         }
         async fn login_email(&self, _e: &str, _p: &str) -> Result<Session, WalletError> {
             unimplemented!()
@@ -280,10 +291,8 @@ mod tests {
 
     #[tokio::test]
     async fn logout_returns_ok_even_when_storage_clear_errors() {
-        let contract = SessionContract::with_storage(
-            Arc::new(OkLogoutAuth),
-            Arc::new(ErroringClearStorage),
-        );
+        let contract =
+            SessionContract::with_storage(Arc::new(OkLogoutAuth), Arc::new(ErroringClearStorage));
         // INV-1: a disk-clear failure must NOT fail logout.
         assert!(contract.logout().await.is_ok());
     }
@@ -334,7 +343,10 @@ mod tests {
     async fn set_session_clears_slot_and_returns_err_on_refresh_failure() {
         let auth = Arc::new(StaleRefreshAuth::default());
         let contract = SessionContract::new(auth.clone());
-        let s = Session { user_id: UserId::new(), refresh_token: "stale".into() };
+        let s = Session {
+            user_id: UserId::new(),
+            refresh_token: "stale".into(),
+        };
 
         let res = contract.set_session(s).await;
 
@@ -392,7 +404,9 @@ mod tests {
     impl SessionStorage for ErroringStoreStorage {
         async fn store(&self, _s: &PersistedSession) -> Result<(), agicash_traits::AuthError> {
             *self.store_called.lock().unwrap() = true;
-            Err(agicash_traits::AuthError::Internal("keystore write failed".into()))
+            Err(agicash_traits::AuthError::Internal(
+                "keystore write failed".into(),
+            ))
         }
         async fn load(&self) -> Result<Option<PersistedSession>, agicash_traits::AuthError> {
             Ok(None)
@@ -405,11 +419,12 @@ mod tests {
     #[tokio::test]
     async fn set_session_success_persists_through_and_swallows_store_error() {
         let storage = Arc::new(ErroringStoreStorage::default());
-        let contract = SessionContract::with_storage(
-            Arc::new(OkSetSessionAuth::default()),
-            storage.clone(),
-        );
-        let s = Session { user_id: UserId::new(), refresh_token: "fresh".into() };
+        let contract =
+            SessionContract::with_storage(Arc::new(OkSetSessionAuth::default()), storage.clone());
+        let s = Session {
+            user_id: UserId::new(),
+            refresh_token: "fresh".into(),
+        };
 
         let res = contract.set_session(s).await;
 
@@ -463,10 +478,8 @@ mod tests {
     async fn restore_session_stale_token_clears_blob_and_returns_ok_none() {
         // StaleRefreshAuth (Task 3) makes the inner set_session error.
         let storage = Arc::new(LoadableStorage::with_blob());
-        let contract = SessionContract::with_storage(
-            Arc::new(StaleRefreshAuth::default()),
-            storage.clone(),
-        );
+        let contract =
+            SessionContract::with_storage(Arc::new(StaleRefreshAuth::default()), storage.clone());
 
         let res = contract.restore_session().await;
 
@@ -479,10 +492,8 @@ mod tests {
     #[tokio::test]
     async fn restore_session_success_returns_some() {
         let storage = Arc::new(LoadableStorage::with_blob());
-        let contract = SessionContract::with_storage(
-            Arc::new(OkSetSessionAuth::default()),
-            storage.clone(),
-        );
+        let contract =
+            SessionContract::with_storage(Arc::new(OkSetSessionAuth::default()), storage.clone());
         let restored = contract.restore_session().await.unwrap();
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().refresh_token, "stored-rt");

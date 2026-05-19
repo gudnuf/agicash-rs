@@ -315,8 +315,8 @@ pub fn send_swap_handle_from_facade(
 /// the re-pointed `check_send_swap_claimed` body is a one-liner `.into()`.
 impl From<agicash_wallet::SendTokenClaimStatus> for crate::send::SendSwapClaimSnapshot {
     fn from(s: agicash_wallet::SendTokenClaimStatus) -> Self {
-        use agicash_wallet::SendTokenClaimState as F;
         use crate::send::SendSwapClaimState as T;
+        use agicash_wallet::SendTokenClaimState as F;
         Self {
             state: match s.state {
                 F::Pending => T::Pending,

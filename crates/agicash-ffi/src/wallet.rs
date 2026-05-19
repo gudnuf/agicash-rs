@@ -22,14 +22,12 @@ use crate::receive::ReceiveResult;
 use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
-use agicash_auth_opensecret::{
-    OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
-};
+use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSeedProvider, CashuSendSwapService,
-    CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
-    MeltQuotePreview, ReceiveFlowService,
+    CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError, MeltQuotePreview,
+    ReceiveFlowService,
 };
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
@@ -112,7 +110,7 @@ pub struct AgicashWallet {
     facade_auth: Arc<agicash_wallet::OpenSecretAuthClient>,
     /// Enforced session-invariant contract (12b-3). Wraps the same
     /// `Arc<OpenSecretAuthClient>` `from_config` returns so set/restore/
-    /// logout honor INV-1..4 at the trait boundary for EVERY AuthClient
+    /// logout honor INV-1..4 at the trait boundary for EVERY `AuthClient`
     /// impl — not just this one. `RwLock` so `set_session_storage_dir`
     /// can re-wrap with the Android backend post-construction. See
     /// `agicash_wallet::SessionContract`.
@@ -399,11 +397,10 @@ impl AgicashWallet {
             *self.session_storage.write().await = Some(storage.clone());
             // 12b-3: re-wrap the contract WITH the backend, from the SAME
             // auth Arc the struct retains for slot-mirroring (Hard Rule 7 ‡).
-            *self.session_contract.write().await =
-                agicash_wallet::SessionContract::with_storage(
-                    self.facade_auth.clone() as Arc<dyn agicash_wallet::AuthClient>,
-                    storage,
-                );
+            *self.session_contract.write().await = agicash_wallet::SessionContract::with_storage(
+                self.facade_auth.clone() as Arc<dyn agicash_wallet::AuthClient>,
+                storage,
+            );
             tracing::info!(
                 target: "agicash_ffi::wallet",
                 "set_session_storage_dir: AndroidFileSessionStorage installed (contract re-wrapped)"

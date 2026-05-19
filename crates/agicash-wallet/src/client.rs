@@ -585,17 +585,10 @@ impl WalletClient {
         let accounts = self.user_storage.list_accounts(session.user_id).await?;
         let account = accounts
             .iter()
-            .find(|a| {
-                a.id == swap.account_id && a.account_type == AccountType::Cashu
-            })
-            .ok_or_else(|| {
-                WalletError::Internal("no matching account for swap".into())
-            })?;
+            .find(|a| a.id == swap.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| WalletError::Internal("no matching account for swap".into()))?;
 
-        let wallet = self
-            .cashu_provider
-            .wallet_for_account(account)
-            .await?;
+        let wallet = self.cashu_provider.wallet_for_account(account).await?;
 
         // Hash each proof's secret to the curve point NUT-07 looks state up
         // by (mirrors FFI `wallet.rs:1374-1386`).
@@ -615,14 +608,11 @@ impl WalletClient {
             .await
             .map_err(|e| WalletError::Internal(format!("mint check_state: {e}")))?;
 
-        let states: Vec<cdk::nuts::State> =
-            resp.states.iter().map(|s| s.state).collect();
+        let states: Vec<cdk::nuts::State> = resp.states.iter().map(|s| s.state).collect();
 
         if all_proofs_spent(&states) {
             // PENDING → COMPLETED (FFI parity `wallet.rs:1407-1414`).
-            self.send_swap_service
-                .complete(&swap)
-                .await?;
+            self.send_swap_service.complete(&swap).await?;
             Ok(SendTokenClaimStatus {
                 state: SendTokenClaimState::Completed,
                 failure_reason: None,
