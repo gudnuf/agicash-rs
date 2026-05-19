@@ -7,9 +7,9 @@
 //! has to *exist and compose* — it never has to talk to a mint.
 
 use agicash_domain::{Account, Currency};
-use agicash_traits::{CashuProvider, CashuMintWallet, CashuProviderError};
-use async_trait::async_trait;
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider};
+use agicash_traits::{CashuMintWallet, CashuProvider, CashuProviderError};
+use async_trait::async_trait;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::MintInfo;
 use rust_decimal::Decimal;
@@ -23,11 +23,7 @@ pub struct FixedExchangeRate;
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl ExchangeRateProvider for FixedExchangeRate {
-    async fn get_rate(
-        &self,
-        from: Currency,
-        to: Currency,
-    ) -> Result<Decimal, ExchangeRateError> {
+    async fn get_rate(&self, from: Currency, to: Currency) -> Result<Decimal, ExchangeRateError> {
         match (from, to) {
             (Currency::Btc, Currency::Usd) => Ok(Decimal::from(50_000)),
             (Currency::Usd, Currency::Btc) => Ok(Decimal::ONE / Decimal::from(50_000)),

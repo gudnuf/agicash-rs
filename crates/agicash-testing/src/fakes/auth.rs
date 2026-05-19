@@ -8,9 +8,9 @@
 //! `new()` (logged-out) / `logged_in()` (pre-sessioned) constructors and a
 //! `user_id()` accessor for ownership-mismatch tests.
 
+use agicash_domain::UserId;
 use agicash_wallet::{AuthClient, Session, WalletError};
 use async_trait::async_trait;
-use agicash_domain::UserId;
 use parking_lot::Mutex;
 
 /// In-memory auth backend. No network. Hands out a usable [`Session`] and a

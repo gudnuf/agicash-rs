@@ -80,9 +80,7 @@ impl InMemoryUserStorage {
             .lock()
             .entry(account.user_id.as_uuid())
             .or_insert_with(|| bare_user(account.user_id));
-        self.accounts
-            .lock()
-            .insert(account.id.as_uuid(), account);
+        self.accounts.lock().insert(account.id.as_uuid(), account);
     }
 
     /// Test helper: seed a user row directly.
@@ -152,10 +150,7 @@ impl UserStorage for InMemoryUserStorage {
             .collect())
     }
 
-    async fn get_account(
-        &self,
-        account_id: AccountId,
-    ) -> Result<Option<Account>, StorageError> {
+    async fn get_account(&self, account_id: AccountId) -> Result<Option<Account>, StorageError> {
         Ok(self.accounts.lock().get(&account_id.as_uuid()).cloned())
     }
 

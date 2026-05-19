@@ -13,5 +13,9 @@
 pub mod fakes;
 
 pub use fakes::auth::FakeAuthClient;
+pub use fakes::cashu_storage::{
+    InMemoryMeltQuoteStorage, InMemoryMintQuoteStorage, InMemoryReceiveSwapStorage,
+    InMemorySendSwapStorage,
+};
 pub use fakes::misc::{FixedExchangeRate, StubCashuProvider};
 pub use fakes::user_storage::{cashu_account, InMemoryUserStorage};

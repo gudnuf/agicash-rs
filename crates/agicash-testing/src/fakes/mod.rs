@@ -7,5 +7,6 @@
 //! exercised without any backend.
 
 pub mod auth;
+pub mod cashu_storage;
 pub mod misc;
 pub mod user_storage;
