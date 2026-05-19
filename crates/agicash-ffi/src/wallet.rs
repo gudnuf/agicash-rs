@@ -23,7 +23,7 @@ use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{
-    auth_error_from_opensecret, logout, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
+    auth_error_from_opensecret, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
@@ -545,19 +545,18 @@ impl AgicashWallet {
     /// if the server-side call fails (e.g. expired token, network error).
     /// The Swift consumer should also drop its Keychain entry on success.
     pub async fn auth_logout(&self) -> Result<(), FfiError> {
-        let was_loaded = self.session.read().await.is_some();
-        if was_loaded {
-            if let Err(e) = logout(&self.client).await {
-                // Server logout failures are non-fatal; swallow them so the
-                // local state is still cleared. We surface the original
-                // status only when there was something to log out.
-                let _ = e;
-            }
-        }
+        // Facade logout = best-effort server logout + always-Ok local
+        // clear (verbatim the prior FFI semantics, moved into
+        // `OpenSecretAuthClient::logout`).
+        self.facade
+            .auth_logout()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // §6 carve-out (note ‡): mirror the clear into the shell-resident
+        // slot + persistence so realtime / try_restore_session keep
+        // working UNCHANGED. Order matters: clear in-memory first so a
+        // crash mid-clear still logs the user out at the in-memory layer.
         *self.session.write().await = None;
-        // Drop the persisted blob too (no-op if storage isn't installed).
-        // Order matters: clear in-memory first so a crash mid-clear still
-        // logs the user out at the in-memory layer.
         self.clear_persisted_session().await;
         Ok(())
     }
