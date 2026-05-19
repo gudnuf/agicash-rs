@@ -44,7 +44,9 @@ use agicash_traits::{
     CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
     ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UserStorage,
 };
-use agicash_wallet::{OpenSecretAuthClient, SessionStorageChoice, WalletClient, WalletConfig};
+use agicash_wallet::{
+    OpenSecretAuthClient, SessionStorageChoice, TokenVersion, WalletClient, WalletConfig,
+};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::{CurrencyUnit, Proof, Token};
@@ -1039,84 +1041,20 @@ impl AgicashWallet {
         account_id: Option<String>,
         currency: Option<String>,
     ) -> Result<crate::send::SendSwapHandle, FfiError> {
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
-        if amount == 0 {
-            return Err(FfiError::internal("amount too small"));
-        }
-
-        let currency_str = currency.unwrap_or_else(|| "BTC".to_string());
-        let currency_enum = Currency::from_str(&currency_str)
-            .map_err(|_| FfiError::internal(format!("unsupported currency: {currency_str}")))?;
-        let unit = unit_for_currency(currency_enum);
-        let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account =
-            pick_cashu_account_for_lightning(&accounts, account_id.as_deref(), currency_enum)?
-                .clone();
-        let mint_url_str = account
-            .details
-            .get("mint_url")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string)
-            .ok_or_else(|| FfiError::internal("account.details missing mint_url"))?;
-
-        let proofs = self
-            .send_swap_storage
-            .list_unspent_proofs(account.id)
+        // The facade `send_token` does the same `require_session()` +
+        // account-pick + unspent-proof load + create + Draft→swap /
+        // Pending + V4 token-encode the bespoke body did, on the shared
+        // session slot. FFI always V4 (verbatim). Arg parsing routes
+        // through `convert::*`.
+        let currency_enum = crate::convert::parse_currency(currency.as_deref())?;
+        let account_id = crate::convert::parse_opt_account_id(account_id.as_deref())?;
+        let amount_money = crate::convert::amount_to_money(amount, currency_enum);
+        let receipt = self
+            .facade
+            .send_token(account_id, amount_money, TokenVersion::V4)
             .await
-            .map_err(|e| FfiError::internal(format!("list unspent proofs: {e}")))?;
-
-        let create_result = self
-            .send_swap_service
-            .create(&account, &proofs, amount_money)
-            .await
-            .map_err(send_swap_error_to_ffi)?;
-
-        let swap = match &create_result.swap.state {
-            CashuSendSwapState::Draft => {
-                let seed = self.client.get_cashu_seed().await?;
-                self.send_swap_service
-                    .swap_for_proofs_to_send(&account, create_result.swap.clone(), &seed)
-                    .await
-                    .map_err(send_swap_error_to_ffi)?
-            }
-            CashuSendSwapState::Pending { .. } => create_result.swap.clone(),
-            other => {
-                return Err(FfiError::internal(format!(
-                    "unexpected post-create state: {other:?}"
-                )));
-            }
-        };
-
-        let proofs_to_send = match &swap.state {
-            CashuSendSwapState::Pending { proofs_to_send, .. }
-            | CashuSendSwapState::Completed { proofs_to_send, .. } => proofs_to_send.clone(),
-            other => {
-                return Err(FfiError::internal(format!(
-                    "swap not ready to encode: {other:?}"
-                )));
-            }
-        };
-
-        let token_str = encode_v4_token(&mint_url_str, &proofs_to_send, currency_enum)
-            .map_err(|e| FfiError::internal(format!("token encode error: {e}")))?;
-
-        Ok(crate::send::SendSwapHandle {
-            swap_id: swap.id.to_string(),
-            token: token_str,
-            amount: swap.amount_received.amount().to_string(),
-            fee: swap.total_fee.amount().to_string(),
-            unit: swap.amount_received.unit().to_string(),
-            currency: account.currency.to_string(),
-            account_id: account.id.to_string(),
-            mint_url: mint_url_str,
-        })
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::send_swap_handle_from_facade(&receipt))
     }
 
     /// Check whether the receiver has claimed a previously-created
@@ -2331,6 +2269,9 @@ fn exchange_rate_snapshot_from(
 /// Mirrors `encode_token` in `crates/agicash-cli/src/send.rs` with
 /// `token_version = 4` (the default `.to_string()` path on
 /// `cdk::nuts::Token`).
+// TODO(12b-1 Task 12): V4 token encode now lives in the facade
+// `send_token`; this shell copy is dead until the deletion pass.
+#[allow(dead_code)]
 fn encode_v4_token(
     mint_url: &str,
     proofs: &[TokenProof],
@@ -2346,6 +2287,8 @@ fn encode_v4_token(
     Ok(token.to_string())
 }
 
+// TODO(12b-1 Task 12): only the now-dead `encode_v4_token` used this.
+#[allow(dead_code)]
 fn cashu_unit_for_currency(currency: Currency) -> CurrencyUnit {
     match currency {
         Currency::Btc => CurrencyUnit::Sat,
@@ -2353,6 +2296,8 @@ fn cashu_unit_for_currency(currency: Currency) -> CurrencyUnit {
     }
 }
 
+// TODO(12b-1 Task 12): only the now-dead `encode_v4_token` used this.
+#[allow(dead_code)]
 fn token_proof_to_cdk_proof(proof: &TokenProof) -> Result<Proof, String> {
     use cdk::nuts::PublicKey;
     use cdk::secret::Secret;
