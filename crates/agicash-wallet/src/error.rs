@@ -47,7 +47,10 @@ pub enum WalletError {
     /// from a genuine expiry (`WalletError::Unauthenticated`) and an
     /// auth-network drop (`WalletError::Network`, retry-able). P0-2.
     #[error("auth error [{code:?}]: {message}")]
-    Auth { code: AuthErrorCode, message: String },
+    Auth {
+        code: AuthErrorCode,
+        message: String,
+    },
 
     /// Storage backend (Supabase) failure: network, RLS, missing row.
     #[error("storage error: {0}")]

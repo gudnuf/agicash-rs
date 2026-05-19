@@ -630,7 +630,13 @@ impl WalletClient {
 
         let outcome = self
             .melt_quote_service
-            .poll_until_complete(&account, quote.clone(), &seed, Duration::ZERO, Duration::ZERO)
+            .poll_until_complete(
+                &account,
+                quote.clone(),
+                &seed,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
             .await?;
 
         Ok(meltoutcome_to_status(outcome))
@@ -685,14 +691,14 @@ impl WalletClient {
                             "lightning send {quote_id} still in flight — poll, do not re-send"
                         )))
                     }
-                    SendLightningStatus::Failed { reason, .. } => {
-                        Err(WalletError::Cashu(format!("lightning send failed: {reason}")))
-                    }
+                    SendLightningStatus::Failed { reason, .. } => Err(WalletError::Cashu(format!(
+                        "lightning send failed: {reason}"
+                    ))),
                 }
             }
-            SendLightningStatus::Failed { reason, .. } => {
-                Err(WalletError::Cashu(format!("lightning send failed: {reason}")))
-            }
+            SendLightningStatus::Failed { reason, .. } => Err(WalletError::Cashu(format!(
+                "lightning send failed: {reason}"
+            ))),
         }
     }
 }
