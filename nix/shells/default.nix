@@ -53,6 +53,13 @@ let
     (mkAgicashBin "aclippy"      ''exec cargo clippy --manifest-path "$manifest" --workspace --all-targets "$@" -- -D warnings'')
     (mkAgicashBin "afmt"         ''exec cargo fmt   --manifest-path "$manifest" --all "$@"'')
     (mkAgicashBin "awasm"        ''exec cargo build --manifest-path "$manifest" --target wasm32-unknown-unknown -p agicash-wasm "$@"'')
+    # `dev-sim` brings a booted iOS simulator to a testable state in one
+    # idempotent invocation: boot, mkcert CA install (only if missing),
+    # incremental xcframework + .app build, surgical Keychain session
+    # clear. Replaces the manual reinstall + re-trust dance after every
+    # sim reboot. See docs/dev-sim.md for flags + the design rationale.
+    # Darwin-only.
+    (mkAgicashBin "dev-sim"      ''exec bash "$root/tools/dev/dev-sim.sh" "$@"'')
   ];
 in
 pkgs.mkShell {
@@ -131,7 +138,7 @@ pkgs.mkShell {
       echo "  OPENSECRET:      $OPENSECRET_BASE_URL"
       echo "  SUPABASE:        $SUPABASE_URL"
       echo ""
-      echo "  binaries: acli, acli_keyring, aweb, acodegen, atest, abuild, aclippy, afmt, awasm"
+      echo "  binaries: acli, acli_keyring, aweb, acodegen, atest, abuild, aclippy, afmt, awasm, dev-sim"
       echo "  platform shells: nix develop .#{ios,android,wasm}"
     fi
   '';
