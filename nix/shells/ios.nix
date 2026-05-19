@@ -34,6 +34,9 @@ else
       export AGICASH_DEV_SHELL="ios"
       export RUST_BACKTRACE=1
 
+      # ---- isolate CARGO_HOME from host rustup shims --------------------
+      ${common.cargoHomeHook}
+
       # Use the host's xcode-select choice for DEVELOPER_DIR. We don't pin
       # an Xcode version (would require team-wide agreement via
       # xcodeenv.composeXcodeWrapper). Contributors manage Xcode via the

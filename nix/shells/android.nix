@@ -59,6 +59,9 @@ else
       export AGICASH_DEV_SHELL="android"
       export RUST_BACKTRACE=1
 
+      # ---- isolate CARGO_HOME from host rustup shims --------------------
+      ${common.cargoHomeHook}
+
       export ANDROID_HOME="${androidSdk}/share/android-sdk"
       export ANDROID_SDK_ROOT="$ANDROID_HOME"
       export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"

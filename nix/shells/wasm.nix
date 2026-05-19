@@ -39,6 +39,9 @@ pkgs.mkShell {
     export AGICASH_DEV_SHELL="wasm"
     export RUST_BACKTRACE=1
 
+    # ---- isolate CARGO_HOME from host rustup shims ------------------------
+    ${common.cargoHomeHook}
+
     # secp256k1-sys (transitive from `cashu`) wraps a C library. Even with
     # `CC_wasm32_unknown_unknown` pointing at the UNWRAPPED clang, the nix
     # cc-wrapper for the host clang still leaks `NIX_HARDENING_ENABLE=...`

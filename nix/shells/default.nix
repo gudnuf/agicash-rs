@@ -66,6 +66,9 @@ pkgs.mkShell {
     export AGICASH_DEV_SHELL="default"
     export RUST_BACKTRACE=1
 
+    # ---- isolate CARGO_HOME from host rustup shims ------------------------
+    ${common.cargoHomeHook}
+
     # ---- sccache + shared CARGO_TARGET_DIR ---------------------------------
     # Cross-worktree build cache (per memory feedback_dev_loop_cache.md).
     # Use a HOME-rooted path so it survives container restarts and is
