@@ -4,7 +4,11 @@ result
 result-*
 
 # pre-commit
-.pre-commit-config.yaml
+# NOTE: .pre-commit-config.yaml is now TRACKED (chore/fast-precommit-hooks).
+# It was gitignored during the React->Rust migration when the old devenv
+# prek config was deleted; that left every checkout with a no-op prek hook
+# bypassed via PREK_ALLOW_NO_CONFIG=1, so unformatted code reached CI. The
+# tracked config below restores a fast fmt + hygiene gate. Do NOT re-ignore.
 
 # IDEs and editors
 /.idea
@@ -33,7 +37,7 @@ result-*
 # `cd crates` (mkcert ends up rooted at the workspace root, not repo root).
 /crates/certs/
 
-# Breez Spark SDK cache data 
+# Breez Spark SDK cache data
 .spark-data/
 
 # Rust
