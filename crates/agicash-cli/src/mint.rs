@@ -45,9 +45,18 @@ fn map_mint_err(e: WalletError) -> MintCmdError {
         WalletError::Validation { message, .. } => MintCmdError::UnsupportedCurrency(message),
         WalletError::Network(m) => MintCmdError::MintUnreachable(m),
         WalletError::Cashu(m) => MintCmdError::MintError(m),
-        WalletError::Storage(m) => MintCmdError::Storage(StorageError::Internal(m)),
-        WalletError::NotFound(m) => MintCmdError::Storage(StorageError::Internal(m)),
-        other => MintCmdError::Storage(StorageError::Internal(other.to_string())),
+        // Preserve the pre-migration storage error codes: a storage
+        // `NotFound` classified as `not-found`; other storage errors as
+        // `storage-backend-error` (`classify_storage`, main.rs). NOTE
+        // (flagged delta): the facade flattens `StorageError` to
+        // `WalletError::Storage(String)`, erasing the
+        // Backend/Internal/Network distinction, so a storage `Internal`
+        // or `Network` now classifies as `storage-backend-error` instead
+        // of `internal-error`/`network-error`. The dominant real storage
+        // failure is `Backend`; this preserves that + the not-found case.
+        WalletError::NotFound(_) => MintCmdError::Storage(StorageError::NotFound),
+        WalletError::Storage(m) => MintCmdError::Storage(StorageError::Backend(m)),
+        other => MintCmdError::Storage(StorageError::Backend(other.to_string())),
     }
 }
 
