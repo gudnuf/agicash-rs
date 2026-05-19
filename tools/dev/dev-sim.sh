@@ -190,7 +190,7 @@ xcfw_input_hash() {
     find "$ROOT/crates/agicash-ffi" -type f \
       -not -path '*/target/*' 2>/dev/null
     echo "$ROOT/bindings/swift/generate-bindings.sh"
-  } | sort | xargs /usr/bin/shasum -a 256 2>/dev/null | /usr/bin/shasum -a 256 | awk '{print $1}'
+  } | LC_ALL=C sort | xargs /usr/bin/shasum -a 256 2>/dev/null | /usr/bin/shasum -a 256 | awk '{print $1}'
 }
 
 # Inputs that affect the Xcode project layout.
@@ -207,7 +207,7 @@ app_input_hash() {
     find "$ROOT/ios/Agicash/Agicash" -type f \
       \( -name '*.swift' -o -name '*.plist' -o -name '*.entitlements' \
          -o -name '*.ttf' -o -name '*.otf' \) 2>/dev/null \
-      | sort | xargs /usr/bin/shasum -a 256 2>/dev/null \
+      | LC_ALL=C sort | xargs /usr/bin/shasum -a 256 2>/dev/null \
       | /usr/bin/shasum -a 256 | awk '{print $1}'
   } | /usr/bin/shasum -a 256 | awk '{print $1}'
 }
