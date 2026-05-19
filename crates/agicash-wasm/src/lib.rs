@@ -19,7 +19,7 @@ mod types;
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use crate::types::AuthStatusWasm;
-    use agicash_wallet::{SessionStorageChoice, WalletClient, WalletConfig};
+    use agicash_wallet::{SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
     use std::sync::Arc;
     use uuid::Uuid;
     use wasm_bindgen::prelude::*;
@@ -149,6 +149,28 @@ mod wasm_impl {
                 .await
                 .map_err(crate::convert::wallet_error_to_js)?;
             Ok(crate::convert::send_quote_preview_from_facade(&quote))
+        }
+
+        /// Commit a Cashu send swap (persists PENDING + returns the
+        /// wire-form V4 token to share + swap id). Delegates to
+        /// `WalletClient::send_token(.., TokenVersion::V4)` — FFI always
+        /// V4, verbatim (mirrors FFI 11.2). Receipt is field-complete.
+        #[wasm_bindgen(js_name = createSendSwap)]
+        pub async fn create_send_swap(
+            &self,
+            amount: u64,
+            account_id: Option<String>,
+            currency: Option<String>,
+        ) -> Result<crate::types::SendSwapHandleWasm, JsValue> {
+            let currency_enum = crate::convert::parse_currency(currency)?;
+            let account_id = crate::convert::parse_opt_account_id(account_id)?;
+            let amount_money = crate::convert::amount_to_money(amount, currency_enum);
+            let receipt = self
+                .client
+                .send_token(account_id, amount_money, TokenVersion::V4)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::send_swap_handle_from_facade(&receipt))
         }
 
         /// Logged-in snapshot, no network. Proves the handle is wired +

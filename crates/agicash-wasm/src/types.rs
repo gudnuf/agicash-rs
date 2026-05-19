@@ -86,6 +86,30 @@ pub struct SendQuotePreviewWasm {
     pub account_id: String,
 }
 
+/// Mirror of FFI `send::SendSwapHandle`. Facade `SendTokenReceipt` IS
+/// field-complete (`mint_url` is on the receipt) — full mapping, no
+/// gap. `Money` fields decimal-stringified; ids stringified.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Serialize)]
+pub struct SendSwapHandleWasm {
+    #[wasm_bindgen(getter_with_clone)]
+    pub swap_id: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub token: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub amount: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub fee: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub unit: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub currency: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub account_id: String,
+    #[wasm_bindgen(getter_with_clone)]
+    pub mint_url: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -114,6 +114,27 @@ pub fn send_quote_preview_from_facade(
     }
 }
 
+/// Facade `SendTokenReceipt` → `SendSwapHandleWasm`. Verbatim
+/// `ffi::convert::send_swap_handle_from_facade`: stringified
+/// `swap_id`/`account_id`, decimal `amount`/`fee`, `Money`-derived
+/// `unit`/`currency`, token + `mint_url` passthrough (receipt is
+/// field-complete — no gap).
+#[must_use]
+pub fn send_swap_handle_from_facade(
+    r: &agicash_wallet::SendTokenReceipt,
+) -> crate::types::SendSwapHandleWasm {
+    crate::types::SendSwapHandleWasm {
+        swap_id: r.swap_id.to_string(),
+        token: r.token.clone(),
+        amount: r.amount.amount().to_string(),
+        fee: r.fee.amount().to_string(),
+        unit: r.amount.unit().to_string(),
+        currency: r.amount.currency().to_string(),
+        account_id: r.account_id.to_string(),
+        mint_url: r.mint_url.clone(),
+    }
+}
+
 /// Facade `Session` → `SessionWasm`. Mirror of
 /// `ffi::convert::session_from_facade`.
 #[must_use]
@@ -197,6 +218,30 @@ mod tests {
             ..summary
         };
         assert_eq!(account_wasm_from_summary(&usd).unit, "cent");
+    }
+
+    #[wasm_bindgen_test]
+    fn send_swap_handle_from_facade_maps_money_and_ids() {
+        let swap = Uuid::new_v4();
+        let acct = Uuid::new_v4();
+        let receipt = agicash_wallet::SendTokenReceipt {
+            token: "cashuB...".into(),
+            amount: amount_to_money(2500, Currency::Btc),
+            fee: amount_to_money(5, Currency::Btc),
+            account_id: AccountId::from(acct),
+            mint_url: "https://m.example".into(),
+            swap_id: swap,
+            token_hash: "th".into(),
+        };
+        let h = send_swap_handle_from_facade(&receipt);
+        assert_eq!(h.swap_id, swap.to_string());
+        assert_eq!(h.token, "cashuB...");
+        assert_eq!(h.amount, "2500");
+        assert_eq!(h.fee, "5");
+        assert_eq!(h.unit, "sat");
+        assert_eq!(h.currency, "BTC");
+        assert_eq!(h.account_id, acct.to_string());
+        assert_eq!(h.mint_url, "https://m.example");
     }
 
     #[wasm_bindgen_test]
