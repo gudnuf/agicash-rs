@@ -81,6 +81,10 @@ agicash-realtime = { path = "../agicash-realtime" }
 # `rlib` build (for unit tests) from trying to pull these in.
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
+# Reads the JSON array `AgicashWasmWallet::list_accounts()` returns
+# (the real account-list lookup behind the receive flow's "Add mint
+# first?" hint — replaces the old hard-coded mint allowlist).
+serde-wasm-bindgen = { workspace = true }
 console_error_panic_hook = "0.1"
 # `gloo-timers` gives us a wasm-safe Future-based sleep. Used by the
 # mocked Cashu redeem path to simulate the WalletClient round-trip
