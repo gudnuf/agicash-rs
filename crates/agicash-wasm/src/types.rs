@@ -145,6 +145,31 @@ pub struct ReceiveResultWasm {
     pub token_hash: String,
 }
 
+/// Mirror of FFI `send::SendSwapClaimState`
+/// (`agicash-ffi/src/send.rs:74-84`). 1:1 variant set.
+/// `#[wasm_bindgen]` C-like enum (JS sees integer discriminants);
+/// `Serialize` for the `serde_wasm_bindgen` path / JSON parity with the
+/// FFI's snake_case wire value the UI branches on.
+#[wasm_bindgen]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum SendClaimStateWasm {
+    Pending,
+    Completed,
+    Failed,
+}
+
+/// Mirror of FFI `send::SendSwapClaimSnapshot`
+/// (`agicash-ffi/src/send.rs:86-93`). `failure_reason` is populated
+/// only when `state == Failed`. Field set + types verbatim the FFI
+/// record.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Serialize)]
+pub struct SendClaimStatusWasm {
+    pub state: SendClaimStateWasm,
+    #[wasm_bindgen(getter_with_clone)]
+    pub failure_reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

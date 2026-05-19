@@ -192,6 +192,26 @@ pub fn auth_status_from_facade(s: &agicash_wallet::AuthStatus) -> AuthStatusWasm
     }
 }
 
+/// Facade `SendTokenClaimStatus` → `SendClaimStatusWasm`. Verbatim the
+/// FFI's `From<SendTokenClaimStatus> for SendSwapClaimSnapshot`
+/// (`agicash-ffi/src/convert.rs:316`) — trivial 1:1; the facade type
+/// was shaped to match the shell record so this is a straight map.
+#[must_use]
+pub fn send_claim_status_from_facade(
+    s: &agicash_wallet::SendTokenClaimStatus,
+) -> crate::types::SendClaimStatusWasm {
+    use crate::types::SendClaimStateWasm as T;
+    use agicash_wallet::SendTokenClaimState as F;
+    crate::types::SendClaimStatusWasm {
+        state: match s.state {
+            F::Pending => T::Pending,
+            F::Completed => T::Completed,
+            F::Failed => T::Failed,
+        },
+        failure_reason: s.failure_reason.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

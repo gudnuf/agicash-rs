@@ -192,6 +192,29 @@ mod wasm_impl {
             Ok(crate::convert::receive_result_from_receipt(&receipt))
         }
 
+        /// Single-shot NUT-07 send-claim poll. Pure delegate to
+        /// `WalletClient::check_send_token_claimed` (mirrors FFI
+        /// `check_send_swap_claimed`, `agicash-ffi/src/wallet.rs:1031`).
+        /// Single-shot by design — the consumer drives cadence (iOS 3 s
+        /// timer, Leptos interval); the shell carries zero loop logic.
+        /// `swap_id` is the `SendSwapHandleWasm.swap_id` string from
+        /// `create_send_swap`; an invalid UUID is a JS error exactly as
+        /// the FFI returns `FfiError::Internal`.
+        #[wasm_bindgen(js_name = checkSendSwapClaimed)]
+        pub async fn check_send_swap_claimed(
+            &self,
+            swap_id: String,
+        ) -> Result<crate::types::SendClaimStatusWasm, JsValue> {
+            let id = Uuid::parse_str(swap_id.trim())
+                .map_err(|e| JsValue::from_str(&format!("invalid swap_id: {e}")))?;
+            let status = self
+                .client
+                .check_send_token_claimed(id)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::send_claim_status_from_facade(&status))
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]
@@ -214,8 +237,8 @@ pub use wasm_impl::AgicashWasmWallet;
 // Mirrors how the FFI crate re-exports its `*Ffi` records.
 #[cfg(target_arch = "wasm32")]
 pub use types::{
-    AccountWasm, AuthStatusWasm, ReceiveResultWasm, ReceiveStatusWasm, SendQuotePreviewWasm,
-    SendSwapHandleWasm, SessionWasm,
+    AccountWasm, AuthStatusWasm, ReceiveResultWasm, ReceiveStatusWasm, SendClaimStateWasm,
+    SendClaimStatusWasm, SendQuotePreviewWasm, SendSwapHandleWasm, SessionWasm,
 };
 
 use wasm_bindgen::prelude::*;
