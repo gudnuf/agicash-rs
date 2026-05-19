@@ -303,6 +303,27 @@ impl AgicashWallet {
         })
         .map_err(|e| FfiError::internal(format!("from_config: {e}")))?;
 
+        // Load-bearing no-op invariant (spec §6 / note ‡): the shell's
+        // `self.session` slot IS the facade's `OpenSecretAuthClient`
+        // slot (one shared `Arc`). This is the whole point of
+        // `OpenSecretAuthClient::session_slot()`. With it shared:
+        //  - the kept, byte-for-byte-unchanged shell-resident
+        //    `set_session` / `try_restore_session` (Hard Rule 7) write
+        //    `*self.session.write()` and the facade's
+        //    `require_session()` immediately sees it — so the delegated
+        //    business methods (list_accounts, mint_add, receive_token,
+        //    …) keep working on the iOS Keychain-rehydrate launch path
+        //    with ZERO behavior change;
+        //  - the delegated `auth_*` populate it through the facade and
+        //    the note-‡ mirror writes the same value (idempotent);
+        //  - `auth_status` + realtime, which read `self.session`,
+        //    observe one consistent source of truth.
+        // Without sharing, `set_session` would leave the facade slot
+        // empty and every delegated method would regress to
+        // Unauthenticated — a catastrophic non-no-op. So we adopt the
+        // facade slot as `self.session` here.
+        let session = facade_auth.session_slot();
+
         Ok(Arc::new(Self {
             client,
             storage,
@@ -314,7 +335,7 @@ impl AgicashWallet {
             send_swap_service,
             melt_quote_service,
             melt_quote_storage,
-            session: Arc::new(RwLock::new(None)),
+            session,
             session_storage: Arc::new(RwLock::new(None)),
             realtime_task: Arc::new(RwLock::new(None)),
             realtime_service: Arc::new(RwLock::new(None)),
