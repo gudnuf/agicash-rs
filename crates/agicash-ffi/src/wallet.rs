@@ -50,9 +50,6 @@ use uuid::Uuid;
 pub struct AgicashWallet {
     client: OpenSecretClient,
     storage: Arc<SupabaseStorage>,
-    /// Cashu provider (CDK-backed). Created once at construction; cheap to
-    /// share across receive/send swaps.
-    cashu_provider: Arc<dyn CashuProvider>,
     // 12c Task 7: the `receive_swap_service` field was removed — Task 6
     // re-pointed `receive_flow` onto `WalletClient::receive_flow()`,
     // which constructs its own `ReceiveFlowService` (incl. receive-swap)
@@ -297,7 +294,6 @@ impl AgicashWallet {
         Ok(Arc::new(Self {
             client,
             storage,
-            cashu_provider,
             send_swap_storage,
             send_swap_service,
             melt_quote_service,
