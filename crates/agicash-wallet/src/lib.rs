@@ -47,11 +47,13 @@
 
 pub mod auth;
 pub mod builder;
+pub mod claim_check;
 pub mod client;
 pub mod config;
 pub mod discriminator;
 pub mod error;
 pub mod opensecret_auth;
+pub mod session;
 pub mod types;
 
 pub use auth::{AuthClient, Session};
