@@ -419,6 +419,7 @@ pub async fn add_mint_account(
         .into_iter()
         .find(|a| {
             a.account_type == AccountType::Cashu
+                && a.currency == currency
                 && a.details
                     .get("mint_url")
                     .and_then(|v| v.as_str())
@@ -973,5 +974,78 @@ mod tests {
             got.details.get("mint_url").and_then(|v| v.as_str()),
             Some("https://mint.example")
         );
+    }
+
+    /// Defect-2 δ1 (RED before the currency-filter fix): a user with
+    /// same-mint BTC + USD Cashu accounts. `upsert_user_with_accounts`
+    /// returns the FULL account set; the BTC account is listed FIRST.
+    /// `add_mint_account(.., Currency::Usd)` must return the USD account.
+    /// Without `&& a.currency == currency` in the find, the unfiltered
+    /// predicate returns the FIRST mint-URL match (the BTC account) — a
+    /// real regression once `WalletClient::add_mint` routes through here.
+    #[tokio::test]
+    async fn add_mint_account_same_mint_multi_currency_picks_requested_currency() {
+        let uid = UserId::new();
+        let btc_acct = Account {
+            id: AccountId::new(),
+            created_at: Utc::now(),
+            user_id: uid,
+            name: "Mint BTC".into(),
+            account_type: AccountType::Cashu,
+            purpose: AccountPurpose::Transactional,
+            currency: Currency::Btc,
+            details: serde_json::json!({
+                "mint_url": "https://mint.example",
+                "keyset_counters": {},
+            }),
+            version: 0,
+            state: AccountState::Active,
+            expires_at: None,
+        };
+        let usd_acct = Account {
+            currency: Currency::Usd,
+            name: "Mint USD".into(),
+            ..btc_acct.clone()
+        };
+        let upsert_user = User {
+            id: uid,
+            created_at: Utc::now(),
+            email: None,
+            email_verified: false,
+            username: "u".into(),
+            default_btc_account_id: None,
+            default_usd_account_id: None,
+            default_currency: Currency::Btc,
+            cashu_locking_xpub: "x".into(),
+            encryption_public_key: "e".into(),
+            spark_identity_public_key: "s".into(),
+            terms_accepted_at: None,
+            gift_card_mint_terms_accepted_at: None,
+        };
+        let storage: Arc<dyn UserStorage> = Arc::new(StubStorage {
+            accounts: vec![],
+            user: None,
+            // BTC listed FIRST so an unfiltered find returns the wrong one.
+            upsert_response: std::sync::Mutex::new(Some(UpsertUserResult {
+                user: upsert_user,
+                accounts: vec![btc_acct.clone(), usd_acct.clone()],
+            })),
+        });
+        let got = add_mint_account(
+            uid,
+            &storage,
+            "https://mint.example",
+            "Mint USD",
+            Currency::Usd,
+        )
+        .await
+        .expect("add_mint_account");
+        assert_eq!(
+            got.currency,
+            Currency::Usd,
+            "add_mint_account(Usd) must return the USD account, not the \
+             first same-mint Cashu account (Defect-2 δ1)"
+        );
+        assert_eq!(got.id, usd_acct.id);
     }
 }
