@@ -8,9 +8,26 @@ use agicash_domain::Currency;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
+/// Marker bound alias — `Send + Sync` on native, empty on wasm. Lets
+/// `ExchangeRateProvider` carry the right bound for each target without
+/// duplicating every trait method behind `cfg`. Mirrors
+/// `KeyProviderBounds` (`agicash-traits/src/key_provider.rs`) — required
+/// because `agicash-wallet` (which deps this crate) must wasm-build, and
+/// wasm `reqwest`'s `Response` future is not `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ExchangeRateProviderBounds: Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> ExchangeRateProviderBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait ExchangeRateProviderBounds {}
+#[cfg(target_arch = "wasm32")]
+impl<T> ExchangeRateProviderBounds for T {}
+
 /// Provides current exchange rates between currency pairs.
-#[async_trait]
-pub trait ExchangeRateProvider: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait ExchangeRateProvider: ExchangeRateProviderBounds {
     /// Returns the rate as: `1 unit of `from` major-currency` =
     /// `<result> units of `to` major-currency`.
     ///

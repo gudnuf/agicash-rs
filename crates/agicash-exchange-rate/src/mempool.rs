@@ -17,16 +17,35 @@ const MEMPOOL_PRICES_URL: &str = "https://mempool.space/api/v1/prices";
 /// TCP-handshake timeout. Fails fast when the endpoint is unreachable
 /// (DNS hole, NAT route, dev-host down) rather than hanging the
 /// caller's UI thread. See the supabase client for the parent rationale.
+/// Native-only: wasm `reqwest` (browser `fetch`) owns the connection
+/// lifecycle and exposes no `connect_timeout`.
+#[cfg(not(target_arch = "wasm32"))]
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Overall per-request timeout. Bounds a single HTTP exchange so a
 /// stalled mempool.space response can't wedge the wallet's rate-refresh
-/// loop indefinitely.
+/// loop indefinitely. Native-only (see `CONNECT_TIMEOUT`).
+#[cfg(not(target_arch = "wasm32"))]
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_http_client() -> Client {
     Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client constructible")
+}
+
+// wasm `reqwest` builds on the browser `fetch` API: `connect_timeout`
+// is unavailable (the browser owns the connection lifecycle) and
+// `timeout` is honored differently. Construct the minimal client; the
+// per-request timeout semantics are the browser's. This is HTTP-client
+// config target-gating (legitimate per Hard Rule 7) — NOT a facade
+// `Unsupported` fork; the trait method body is identical on both
+// targets.
+#[cfg(target_arch = "wasm32")]
+fn build_http_client() -> Client {
+    Client::builder()
         .build()
         .expect("reqwest client constructible")
 }
@@ -73,7 +92,8 @@ struct MempoolPricesResponse {
     // Add more currencies as needed in future slices (EUR, GBP, etc.).
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl ExchangeRateProvider for MempoolSpaceProvider {
     async fn get_rate(&self, from: Currency, to: Currency) -> Result<Decimal, ExchangeRateError> {
         // Mempool gives BTC-denominated prices. Supported pairs:

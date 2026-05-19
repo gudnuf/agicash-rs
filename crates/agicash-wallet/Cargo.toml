@@ -24,9 +24,18 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+# tokio: only sync primitives are used in the facade (RwLock in
+# OpenSecretAuthClient). Native takes the workspace tokio; wasm takes a
+# minimal default-features=false set (no rt-multi-thread/signal/mio).
+# Mirrors agicash-cashu's already-shipped target gate.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.42", default-features = false, features = ["sync", "macros", "time"] }
 
 [features]
 default = []

@@ -7,10 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+# Native: full reqwest (workspace pin = rustls-tls). wasm32: browser
+# `fetch` handles TLS — drop rustls/ring entirely. Mirrors
+# agicash-storage-supabase's already-shipped target gate.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
