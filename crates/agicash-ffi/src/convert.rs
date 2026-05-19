@@ -310,6 +310,24 @@ pub fn send_swap_handle_from_facade(
     }
 }
 
+/// 12b-3: facade send-claim snapshot → FFI `SendSwapClaimSnapshot`. Trivial
+/// 1:1 — the facade type was deliberately shaped to match the FFI record so
+/// the re-pointed `check_send_swap_claimed` body is a one-liner `.into()`.
+impl From<agicash_wallet::SendTokenClaimStatus> for crate::send::SendSwapClaimSnapshot {
+    fn from(s: agicash_wallet::SendTokenClaimStatus) -> Self {
+        use agicash_wallet::SendTokenClaimState as F;
+        use crate::send::SendSwapClaimState as T;
+        Self {
+            state: match s.state {
+                F::Pending => T::Pending,
+                F::Completed => T::Completed,
+                F::Failed => T::Failed,
+            },
+            failure_reason: s.failure_reason,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

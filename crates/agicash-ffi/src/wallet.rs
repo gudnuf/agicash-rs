@@ -23,12 +23,12 @@ use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{
-    auth_error_from_opensecret, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
+    OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuReceiveSwapService, CashuReceiveSwapStorage, CashuSeedProvider, CashuSendSwapService,
-    CashuSendSwapState, CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
+    CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
     MeltQuotePreview, ReceiveFlowService,
 };
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
@@ -98,6 +98,25 @@ pub struct AgicashWallet {
     /// data dir); iOS keeps using its `SessionStore` keychain wrapper on
     /// the Swift side and leaves this slot empty.
     session_storage: Arc<RwLock<Option<Arc<dyn SessionStorage + Send + Sync>>>>,
+    /// The production `OpenSecretAuthClient` `from_config` returns. 12b-1
+    /// kept it only as a `new()` local (to share `session_slot()`); 12b-3
+    /// retains it as a field so `set_session_storage_dir` can rebuild the
+    /// `SessionContract` WITH the Android storage backend from the SAME
+    /// auth `Arc` post-construction. `Send + Sync`, cheap to hold. Only
+    /// read in the android-file-storage branch of `set_session_storage_dir`
+    /// (the only target where a storage backend is installed at runtime).
+    #[cfg_attr(
+        not(all(feature = "android-file-storage", target_os = "android")),
+        allow(dead_code)
+    )]
+    facade_auth: Arc<agicash_wallet::OpenSecretAuthClient>,
+    /// Enforced session-invariant contract (12b-3). Wraps the same
+    /// `Arc<OpenSecretAuthClient>` `from_config` returns so set/restore/
+    /// logout honor INV-1..4 at the trait boundary for EVERY AuthClient
+    /// impl — not just this one. `RwLock` so `set_session_storage_dir`
+    /// can re-wrap with the Android backend post-construction. See
+    /// `agicash_wallet::SessionContract`.
+    session_contract: RwLock<agicash_wallet::SessionContract>,
     /// Realtime subscription supervisor task. Populated by
     /// `start_wallet_events`; aborted by `stop_wallet_events`. The
     /// supervisor runs the connect→join→serve→reconnect loop on a
@@ -276,6 +295,14 @@ impl AgicashWallet {
         // facade slot as `self.session` here.
         let session = facade_auth.session_slot();
 
+        // 12b-3: wrap the production auth client in the enforced
+        // session-invariant contract. `Arc<OpenSecretAuthClient>` coerces
+        // to `Arc<dyn AuthClient>`. No storage backend at construction —
+        // `set_session_storage_dir` installs the Android one later.
+        let session_contract = RwLock::new(agicash_wallet::SessionContract::new(
+            facade_auth.clone() as Arc<dyn agicash_wallet::AuthClient>,
+        ));
+
         Ok(Arc::new(Self {
             client,
             storage,
@@ -287,6 +314,8 @@ impl AgicashWallet {
             melt_quote_storage,
             session,
             session_storage: Arc::new(RwLock::new(None)),
+            facade_auth,
+            session_contract,
             realtime_task: Arc::new(RwLock::new(None)),
             realtime_service: Arc::new(RwLock::new(None)),
             facade,
@@ -308,18 +337,22 @@ impl AgicashWallet {
     ) -> Result<(), FfiError> {
         let user_id = Uuid::parse_str(&user_id_uuid)
             .map_err(|e| FfiError::internal(format!("invalid user_id_uuid: {e}")))?;
-
-        self.client.ensure_handshake().await?;
-        self.client
-            .inner()
-            .set_tokens(String::new(), Some(refresh_token.clone()))
-            .map_err(auth_error_from_opensecret)?;
-
-        if let Err(e) = self.client.inner().refresh_token().await {
-            *self.session.write().await = None;
-            return Err(auth_error_from_opensecret(e).into());
-        }
-
+        // 12b-3: delegate the handshake+refresh + clear-on-fail (INV-2) to
+        // the enforced contract. The inner `OpenSecretAuthClient::set_session`
+        // performs the OpenSecret handshake → set_tokens → refresh; the
+        // contract guarantees the slot is cleared if that fails (for ANY
+        // AuthClient impl) and the original error is surfaced.
+        self.session_contract
+            .read()
+            .await
+            .set_session(agicash_wallet::Session {
+                user_id: agicash_domain::UserId::from(user_id),
+                refresh_token: refresh_token.clone(),
+            })
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // Hard Rule 7 ‡: mirror into the shell-resident slot so realtime /
+        // auth_status keep working unchanged (same write the old body did).
         *self.session.write().await = Some(PersistedSession {
             user_id,
             refresh_token,
@@ -361,10 +394,19 @@ impl AgicashWallet {
             use agicash_auth_opensecret::AndroidFileSessionStorage;
             let storage: Arc<dyn SessionStorage + Send + Sync> =
                 Arc::new(AndroidFileSessionStorage::new(dir));
-            *self.session_storage.write().await = Some(storage);
+            // Existing shell-resident slot (kept verbatim — try_restore /
+            // persist_session still read it; Hard Rule 7).
+            *self.session_storage.write().await = Some(storage.clone());
+            // 12b-3: re-wrap the contract WITH the backend, from the SAME
+            // auth Arc the struct retains for slot-mirroring (Hard Rule 7 ‡).
+            *self.session_contract.write().await =
+                agicash_wallet::SessionContract::with_storage(
+                    self.facade_auth.clone() as Arc<dyn agicash_wallet::AuthClient>,
+                    storage,
+                );
             tracing::info!(
                 target: "agicash_ffi::wallet",
-                "set_session_storage_dir: AndroidFileSessionStorage installed"
+                "set_session_storage_dir: AndroidFileSessionStorage installed (contract re-wrapped)"
             );
             return Ok(());
         }
@@ -389,50 +431,33 @@ impl AgicashWallet {
     /// once a stored blob is loaded — same OpenSecret handshake + token
     /// refresh chain, same in-memory slot rehydration.
     pub async fn try_restore_session(&self) -> Result<Option<Session>, FfiError> {
-        let storage_opt = self.session_storage.read().await.clone();
-        let Some(storage) = storage_opt else {
-            return Ok(None);
-        };
-
-        let persisted = match storage.load().await {
-            Ok(Some(p)) => p,
-            Ok(None) => return Ok(None),
-            Err(e) => {
-                tracing::warn!(
-                    target: "agicash_ffi::wallet",
-                    error = %e,
-                    "try_restore_session: storage.load() failed"
-                );
-                return Ok(None);
-            }
-        };
-
-        // Run the same handshake + refresh chain as `set_session`. On
-        // failure we drop the on-disk blob so the next launch falls
-        // back to the sign-in screen instead of re-trying a dead token.
-        match self
-            .set_session(
-                persisted.user_id.to_string(),
-                persisted.refresh_token.clone(),
-            )
+        // 12b-3: delegate to the enforced contract (INV-3). It loads the
+        // blob from the injected backend (re-wrapped by
+        // set_session_storage_dir), runs the INV-2 set_session chain, and
+        // on a stale token clears the on-disk blob + returns Ok(None)
+        // (route to sign-in, never fatal) — exact prior FFI behavior.
+        let restored = self
+            .session_contract
+            .read()
             .await
-        {
-            Ok(()) => {
+            .restore_session()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        match restored {
+            Some(s) => {
+                let persisted = PersistedSession {
+                    user_id: s.user_id.as_uuid(),
+                    refresh_token: s.refresh_token.clone(),
+                };
+                // Hard Rule 7 ‡ mirror so realtime / auth_status see it.
+                *self.session.write().await = Some(persisted.clone());
                 tracing::info!(
                     target: "agicash_ffi::wallet",
                     "try_restore_session: rehydrated session from storage"
                 );
                 Ok(Some(persisted.into()))
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "agicash_ffi::wallet",
-                    error = %e,
-                    "try_restore_session: refresh failed, clearing stored blob"
-                );
-                let _ = storage.clear().await;
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
@@ -515,13 +540,11 @@ impl AgicashWallet {
     /// if the server-side call fails (e.g. expired token, network error).
     /// The Swift consumer should also drop its Keychain entry on success.
     pub async fn auth_logout(&self) -> Result<(), FfiError> {
-        // Facade logout = best-effort server logout + always-Ok local
-        // clear (verbatim the prior FFI semantics, moved into
-        // `OpenSecretAuthClient::logout`).
-        self.facade
-            .auth_logout()
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // 12b-3: INV-1 — route through the enforced contract. Its
+        // `logout()` is infallible-by-contract (always Ok even on inner
+        // server error AND on storage-clear error — Tasks 1+2), so the
+        // FFI still returns Ok(()) unconditionally.
+        let _ = self.session_contract.read().await.logout().await;
         // §6 carve-out (note ‡): mirror the clear into the shell-resident
         // slot + persistence so realtime / try_restore_session keep
         // working UNCHANGED. Order matters: clear in-memory first so a
@@ -1027,106 +1050,21 @@ impl AgicashWallet {
         &self,
         swap_id: String,
     ) -> Result<crate::send::SendSwapClaimSnapshot, FfiError> {
-        use cdk::nuts::{CheckStateRequest, State as CdkProofState};
-        // `MintConnector` is brought into scope so the dyn-Arc
-        // returned by `wallet.connector()` exposes `post_check_state`.
-        #[allow(unused_imports)]
-        use cdk::wallet::MintConnector;
-
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-
+        // 12b-3: re-pointed at the facade's single-shot NUT-07 poll
+        // (`WalletClient::check_send_token_claimed`). The uniffi signature
+        // is byte-identical (§6 guardrail — zero binding churn); only the
+        // body delegates. `require_session` ⇒ `WalletError::Unauthenticated`
+        // ⇒ `FfiError::Auth{UNAUTHENTICATED}` via the centralized mapper, so
+        // the existing `*_without_session_returns_unauthenticated` test
+        // still holds.
         let id = Uuid::parse_str(&swap_id)
             .map_err(|e| FfiError::internal(format!("invalid swap_id: {e}")))?;
-        let swap = self
-            .send_swap_storage
-            .get(id)
+        let status = self
+            .facade
+            .check_send_token_claimed(id)
             .await
-            .map_err(|e| FfiError::internal(format!("storage error: {e}")))?;
-        if swap.user_id != user_id {
-            return Err(FfiError::internal("swap belongs to a different user"));
-        }
-
-        // Fast path: already-terminal states short-circuit without a
-        // mint round-trip.
-        let proofs_to_send = match &swap.state {
-            CashuSendSwapState::Completed { .. } => {
-                return Ok(crate::send::SendSwapClaimSnapshot {
-                    state: crate::send::SendSwapClaimState::Completed,
-                    failure_reason: None,
-                });
-            }
-            CashuSendSwapState::Failed { failure_reason } => {
-                return Ok(crate::send::SendSwapClaimSnapshot {
-                    state: crate::send::SendSwapClaimState::Failed,
-                    failure_reason: Some(failure_reason.clone()),
-                });
-            }
-            CashuSendSwapState::Pending { proofs_to_send, .. } => proofs_to_send.clone(),
-            other => {
-                return Err(FfiError::internal(format!(
-                    "swap in unexpected state for claim-check: {other:?}"
-                )));
-            }
-        };
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account = accounts
-            .iter()
-            .find(|a| a.id == swap.account_id && a.account_type == AccountType::Cashu)
-            .ok_or_else(|| FfiError::internal("no matching account for swap"))?;
-
-        let wallet = self
-            .cashu_provider
-            .wallet_for_account(account)
-            .await
-            .map_err(cashu_provider_error_to_ffi)?;
-
-        // Hash each proof's secret to a curve point — this is the `Y`
-        // identifier NUT-07 uses to look up proof state by.
-        let ys: Vec<cdk::nuts::PublicKey> = proofs_to_send
-            .iter()
-            .map(|p| {
-                let secret = cdk::secret::Secret::from_str(&p.secret)
-                    .map_err(|e| FfiError::internal(format!("bad secret: {e}")))?;
-                cdk::dhke::hash_to_curve(secret.as_bytes())
-                    .map_err(|e| FfiError::internal(format!("hash_to_curve: {e}")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let req = CheckStateRequest { ys };
-        let resp = wallet
-            .connector()
-            .post_check_state(req)
-            .await
-            .map_err(|e| FfiError::internal(format!("mint check_state: {e}")))?;
-
-        let all_spent = !resp.states.is_empty()
-            && resp
-                .states
-                .iter()
-                .all(|s| matches!(s.state, CdkProofState::Spent));
-
-        if all_spent {
-            // PENDING → COMPLETED so subsequent polls short-circuit on
-            // the persisted state.
-            self.send_swap_service
-                .complete(&swap)
-                .await
-                .map_err(send_swap_error_to_ffi)?;
-            Ok(crate::send::SendSwapClaimSnapshot {
-                state: crate::send::SendSwapClaimState::Completed,
-                failure_reason: None,
-            })
-        } else {
-            Ok(crate::send::SendSwapClaimSnapshot {
-                state: crate::send::SendSwapClaimState::Pending,
-                failure_reason: None,
-            })
-        }
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(status.into())
     }
 
     // ---- lightning send (melt quote) surface ----
@@ -2658,5 +2596,21 @@ mod tests {
         let status = wallet.auth_status().await.unwrap();
         assert!(!status.logged_in);
         assert!(status.user_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_logout_returns_ok_when_never_logged_in_after_repoint() {
+        // §6 parity: re-pointing auth_logout at SessionContract must NOT
+        // regress the always-Ok invariant. A wallet with no session must
+        // still log out cleanly (FFI wallet.rs:207-223 behavior preserved).
+        let cfg = fake_config();
+        let wallet = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        assert!(wallet.auth_logout().await.is_ok());
     }
 }
