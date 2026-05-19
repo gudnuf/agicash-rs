@@ -12,13 +12,26 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen = { workspace = true }
 
-# Pull agicash-auth-opensecret into the wasm crate graph so cargo
-# `cargo check --target wasm32-unknown-unknown -p agicash-wasm` exercises the
-# opensecret-fork wasm path end-to-end. We only re-export the version function
-# for now; the real Wallet binding lands when the `Send + Sync` trait gap on
-# `KeyProvider`/`TokenProvider` is resolved (see slice 13 followup).
+# The real Wallet binding. agicash-wallet wasm-builds as of slice 12d
+# (AuthClient ?Send + dep target-gates). Pulled on wasm32 only so the
+# native `rlib` build of this crate (used by `cargo test --workspace`)
+# stays minimal; the wasm cdylib is the only shipping artifact.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-agicash-auth-opensecret = { path = "../agicash-auth-opensecret" }
+agicash-wallet = { path = "../agicash-wallet" }
+agicash-domain = { path = "../agicash-domain" }
+agicash-money = { path = "../agicash-money" }
+agicash-traits = { path = "../agicash-traits" }
+wasm-bindgen-futures = { workspace = true }
+serde-wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+rust_decimal = { workspace = true }
+uuid = { workspace = true }
+# Guest-registration RNG path on wasm needs the `js` getrandom backend
+# (same as agicash-web-leptos). Additive feature; safe.
+getrandom = { workspace = true, features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true
