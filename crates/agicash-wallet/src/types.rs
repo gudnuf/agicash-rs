@@ -197,6 +197,34 @@ pub struct SendLightningReceipt {
     pub account_id: AccountId,
 }
 
+/// Reconcile-aware outcome of [`crate::WalletClient::begin_send_lightning`]
+/// and [`crate::WalletClient::poll_send_lightning`] (slice 12b-2 P0-1).
+///
+/// Replaces the old `complete_send_lightning` which bundled a 30s poll
+/// loop and returned `Err(WalletError::Cashu("still pending"))` on
+/// timeout — an ambiguous error a consumer could treat as "failed" and
+/// re-quote, firing a second `post_melt` for an in-flight invoice
+/// (double-pay). Every still-pending melt is the typed, **non-error**
+/// [`SendLightningStatus::InFlight`]; the consumer drives
+/// [`crate::WalletClient::poll_send_lightning`] on its own cadence
+/// (mirrors the proven FFI `poll_melt_quote` single-shot contract +
+/// the iOS `paying`/`verifying` reconcile loop).
+#[derive(Debug, Clone)]
+pub enum SendLightningStatus {
+    /// Mint settled the melt; proofs spent + change persisted
+    /// (terminal). Carries the full receipt.
+    Paid(SendLightningReceipt),
+    /// Lightning payment in flight. The consumer MUST poll
+    /// [`crate::WalletClient::poll_send_lightning`] with this
+    /// `quote_id` on its own cadence and MUST NOT re-quote or
+    /// re-`begin` this invoice (doing so double-pays).
+    InFlight { quote_id: Uuid },
+    /// The mint authoritatively reported the melt UNPAID/FAILED and the
+    /// core persisted the quote row FAILED (terminal). NOT re-quotable
+    /// for the same invoice — the verdict round-tripped the mint.
+    Failed { quote_id: Uuid, reason: String },
+}
+
 /// Handle for an in-flight Lightning receive (NUT-04 mint-quote).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReceiveLightningHandle {
@@ -333,5 +361,34 @@ mod tests {
     fn receive_status_roundtrips_snake_case() {
         let s = serde_json::to_string(&ReceiveStatus::AlreadyClaimed).unwrap();
         assert_eq!(s, "\"already_claimed\"");
+    }
+
+    #[test]
+    fn send_lightning_status_in_flight_carries_quote_id_not_an_error() {
+        let qid = uuid::Uuid::new_v4();
+        let s = SendLightningStatus::InFlight { quote_id: qid };
+        // The whole point of P0-1: a still-pending melt is a typed,
+        // non-error outcome the consumer polls — never an Err the consumer
+        // could mistake for "failed" and re-quote (double-pay).
+        match s {
+            SendLightningStatus::InFlight { quote_id } => assert_eq!(quote_id, qid),
+            other => panic!("expected InFlight, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_lightning_status_failed_is_terminal_not_requotable_signal() {
+        let qid = uuid::Uuid::new_v4();
+        let s = SendLightningStatus::Failed {
+            quote_id: qid,
+            reason: "mint reported UNPAID after melt".into(),
+        };
+        match s {
+            SendLightningStatus::Failed { quote_id, reason } => {
+                assert_eq!(quote_id, qid);
+                assert!(reason.contains("UNPAID"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
