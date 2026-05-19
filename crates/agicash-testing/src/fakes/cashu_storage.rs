@@ -36,6 +36,26 @@ fn unused_account(user_id: UserId) -> Account {
     cashu_account(user_id, "http://unused", agicash_domain::Currency::Btc)
 }
 
+/// Echo back an account that carries the **real** id / owner / `mint_url` /
+/// currency from a `create*` input. The real Supabase `create_*_swap`
+/// RPCs return the genuine account row joined from the input's
+/// `account_id`; the in-memory fake must do the same so the downstream
+/// service (`swap_for_proofs_to_send` / `complete_swap`) routes its mint
+/// connector at the real spawned mint, not a `http://unused` placeholder.
+/// Tier 1 never reaches these paths (the `StubCashuProvider`
+/// short-circuits), so the previous placeholder was inert there; Tier 2
+/// drives them against the real mint and needs the real URL.
+fn echo_account(
+    account_id: AccountId,
+    user_id: UserId,
+    mint_url: &str,
+    currency: agicash_domain::Currency,
+) -> Account {
+    let mut a = cashu_account(user_id, mint_url, currency);
+    a.id = account_id;
+    a
+}
+
 // ---------------------------------------------------------------------------
 // Receive-swap
 // ---------------------------------------------------------------------------
@@ -62,6 +82,15 @@ impl CashuReceiveSwapStorage for InMemoryReceiveSwapStorage {
         input: CreateReceiveSwap,
     ) -> Result<CreateReceiveSwapResult, ReceiveSwapStorageError> {
         let key = (input.token_hash.clone(), input.user_id.as_uuid());
+        // Capture the real routing fields before `input` is consumed, so
+        // the echoed account points the downstream mint connector at the
+        // real spawned mint (not the `http://unused` placeholder).
+        let echoed = echo_account(
+            input.account_id,
+            input.user_id,
+            &input.token_mint_url,
+            input.amount_received.currency(),
+        );
         let mut rows = self.rows.lock();
         if rows.contains_key(&key) {
             return Err(ReceiveSwapStorageError::AlreadyClaimed);
@@ -86,7 +115,7 @@ impl CashuReceiveSwapStorage for InMemoryReceiveSwapStorage {
         rows.insert(key, swap.clone());
         Ok(CreateReceiveSwapResult {
             swap,
-            account: unused_account(input.user_id),
+            account: echoed,
         })
     }
 
@@ -160,6 +189,14 @@ pub struct InMemorySendSwapStorage {
     rows: Mutex<HashMap<Uuid, CashuSendSwap>>,
     /// `account_id` → unspent proofs available to spend as swap inputs.
     unspent: Mutex<HashMap<Uuid, Vec<ProofWithId>>>,
+    /// `account_id` → next NUT-13 keyset counter. The real Supabase
+    /// `create_send_swap` RPC reads + bumps `account.details
+    /// .keyset_counters`; the in-memory fake must model the same
+    /// monotonic counter so a Tier-2 swap-out against a *real* mint never
+    /// reuses blinding factors (the mint rejects a replayed blinded
+    /// message). Tier 1 never reaches the DRAFT swap path (the
+    /// `StubCashuProvider` short-circuits), so this is inert there.
+    keyset_counter: Mutex<HashMap<Uuid, u32>>,
 }
 
 impl InMemorySendSwapStorage {
@@ -189,6 +226,16 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
         &self,
         input: CreateSendSwap,
     ) -> Result<CreateSendSwapResult, SendSwapStorageError> {
+        // Echo the REAL account (real id / owner / mint_url / currency)
+        // so `swap_for_proofs_to_send` routes its connector at the real
+        // spawned mint, not the `http://unused` placeholder. Captured
+        // before `input` is consumed below.
+        let echoed = echo_account(
+            input.account_id,
+            input.user_id,
+            &input.token_mint_url,
+            input.amount_requested.currency(),
+        );
         // Reserve the chosen input proof ids out of the account pool.
         {
             let mut pool = self.unspent.lock();
@@ -198,13 +245,36 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
         }
         // input_amount == amount_to_send → no input swap (PENDING with the
         // input proofs as the proofs-to-send). Otherwise DRAFT.
-        let state = if input.input_amount == input.amount_to_send {
-            CashuSendSwapState::Pending {
-                token_hash: input.token_hash.clone().unwrap_or_default(),
-                proofs_to_send: input.input_proofs.clone(),
-            }
+        let (state, keyset_counter) = if input.input_amount == input.amount_to_send {
+            // Exact-proofs path: no mint swap, no blinded outputs → no
+            // counter needed (matches the real RPC: PENDING straight away).
+            (
+                CashuSendSwapState::Pending {
+                    token_hash: input.token_hash.clone().unwrap_or_default(),
+                    proofs_to_send: input.input_proofs.clone(),
+                },
+                None,
+            )
         } else {
-            CashuSendSwapState::Draft
+            // Swap path (DRAFT): allocate the account's current NUT-13
+            // counter, then advance it past every blinded output this swap
+            // will request (send + change), so a subsequent swap-out on the
+            // same account derives FRESH blinding factors. The real
+            // Supabase `create_send_swap` does the identical read-then-bump
+            // under its row lock; without this, a Tier-2 second send on the
+            // same account replays counter 0 and the real mint rejects the
+            // blinded message ("already signed").
+            let outputs: u32 = input
+                .output_amounts
+                .as_ref()
+                .map_or(0, |o| {
+                    u32::try_from(o.send.len() + o.change.len()).unwrap_or(u32::MAX)
+                });
+            let mut counters = self.keyset_counter.lock();
+            let slot = counters.entry(input.account_id.as_uuid()).or_insert(0);
+            let start = *slot;
+            *slot = slot.saturating_add(outputs.max(1));
+            (CashuSendSwapState::Draft, Some(start))
         };
         let swap = CashuSendSwap {
             id: Uuid::new_v4(),
@@ -219,7 +289,7 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
             amount_spent: input.total_amount,
             total_fee: input.cashu_send_fee,
             keyset_id: input.keyset_id,
-            keyset_counter: None,
+            keyset_counter,
             output_amounts: input.output_amounts,
             transaction_id: Uuid::new_v4(),
             created_at: Utc::now(),
@@ -229,7 +299,7 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
         self.rows.lock().insert(swap.id, swap.clone());
         Ok(CreateSendSwapResult {
             swap,
-            account: unused_account(input.user_id),
+            account: echoed,
         })
     }
 
@@ -558,6 +628,22 @@ impl InMemoryMeltQuoteStorage {
     #[must_use]
     pub fn complete_call_count(&self) -> usize {
         self.complete_calls.load(Ordering::SeqCst)
+    }
+
+    /// Test helper: the id of the single persisted melt quote, if exactly
+    /// one exists. Used by the Tier 2 P0 no-double-pay test to recover the
+    /// `quote_id` after `begin_send_lightning` returns `Err` (the
+    /// post-settle storage-fault path propagates the error before the
+    /// facade surfaces a handle, but the row is already persisted PENDING
+    /// — exactly the reconcile entry point).
+    #[must_use]
+    pub fn single_quote_id(&self) -> Option<Uuid> {
+        let rows = self.rows.lock();
+        if rows.len() == 1 {
+            rows.keys().next().copied()
+        } else {
+            None
+        }
     }
 }
 

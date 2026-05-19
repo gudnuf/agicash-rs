@@ -29,3 +29,10 @@ pub use wallet::TestWallet;
 
 #[cfg(all(feature = "tier2-e2e", not(target_arch = "wasm32")))]
 pub use harness::{EnclaveProcess, MintProcess, RealWallet, ServiceHarness};
+
+/// Re-export of `cdk-fake-wallet` so Tier 2 e2e suites can mint the
+/// externally-signed bolt11 melt-target invoice
+/// (`cdk_fake_wallet::create_fake_invoice`) without each consumer crate
+/// re-declaring the optional dep. Native + `tier2-e2e` only.
+#[cfg(all(feature = "tier2-e2e", not(target_arch = "wasm32")))]
+pub use cdk_fake_wallet;
