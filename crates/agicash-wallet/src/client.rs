@@ -21,9 +21,9 @@ use crate::types::{
 use agicash_cashu::{
     add_mint_account, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuMintQuoteService, CashuMintQuoteState, CashuMintQuoteStorage, CashuReceiveSwapService,
-    CashuReceiveSwapState, CashuSendSwapService, CashuSendSwapStorage, CompleteMintQuoteOutcome,
-    CompleteOutcome, MeltOutcome, MeltQuoteError, ParsedToken, ReceiveFlowError, ReceiveSwapError,
-    ReceiveSwapStorageError, TokenProof,
+    CashuReceiveSwapState, CashuSeedProvider, CashuSendSwapService, CashuSendSwapStorage,
+    CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError, ParsedToken,
+    ReceiveFlowError, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError, TokenProof,
 };
 use agicash_domain::{Account, AccountId, AccountState, AccountType, Currency};
 use agicash_exchange_rate::ExchangeRateProvider;
@@ -803,6 +803,36 @@ impl WalletClient {
         ))
     }
 
+    /// Construct a fresh interactive receive-flow orchestrator.
+    ///
+    /// 12c §3: exposes the already-existing
+    /// [`agicash_cashu::ReceiveFlowService`] (the sans-IO
+    /// Idle→Parsing→NeedsMintConfirmation→AddingMint→Swapping→
+    /// Done/AlreadyClaimed/Failed machine, with its `accepts()`
+    /// event-guard and `AlreadyClaimed`-no-amount invariant) through the
+    /// facade, built from the deps the facade already holds. Each call
+    /// returns a fresh orchestrator — flows are not persisted across
+    /// constructions (the binding shell owns the per-interaction
+    /// handle's interior mutability; the facade stays runtime-agnostic).
+    ///
+    /// Requires an active session; returns
+    /// [`WalletError::Unauthenticated`] otherwise (verbatim the prior
+    /// FFI `receive_flow` `Auth { UNAUTHENTICATED }` behavior — the FFI
+    /// `convert::wallet_error_to_ffi` maps that 1:1).
+    pub async fn receive_flow(&self) -> Result<ReceiveFlowService, WalletError> {
+        let session = self.require_session().await?;
+        let seed_provider: Arc<dyn CashuSeedProvider> = Arc::new(AuthClientSeedProvider {
+            auth: Arc::clone(&self.auth),
+        });
+        Ok(ReceiveFlowService::new(
+            session.user_id,
+            Arc::clone(&self.user_storage),
+            Arc::clone(&self.cashu_provider),
+            Arc::clone(&self.receive_swap_service),
+            seed_provider,
+        ))
+    }
+
     /// Start a NUT-04 mint quote — request a BOLT-11 invoice from the
     /// mint. Caller drives `poll_receive_lightning` + `complete_receive_lightning`
     /// against the returned `quote_id`.
@@ -1066,6 +1096,29 @@ fn map_add_mint_err(e: ReceiveFlowError) -> WalletError {
         // no other RFE variant is reachable from it; fall back to the
         // existing blanket mapping defensively (unreachable in practice).
         other => WalletError::from(other),
+    }
+}
+
+/// 12c D1: bridges the facade's `Arc<dyn AuthClient>` to the cashu
+/// crate's `CashuSeedProvider` so `ReceiveFlowService` can fetch the
+/// 64-byte seed through the SAME source `receive_cashu_token` already
+/// uses (`self.auth.cashu_seed()`), eliminating the FFI's bespoke
+/// `OpenSecretSeedProvider`. The error mapping preserves the FFI's
+/// behavior of surfacing `code::AUTH` on the Failed state (so the UI's
+/// "re-authenticate" branch is unchanged): any seed failure becomes
+/// `ReceiveFlowError::Auth(..)`, whose `.code()` is `code::AUTH`.
+#[derive(Debug)]
+struct AuthClientSeedProvider {
+    auth: Arc<dyn AuthClient>,
+}
+
+#[async_trait::async_trait]
+impl CashuSeedProvider for AuthClientSeedProvider {
+    async fn get_cashu_seed(&self) -> Result<[u8; 64], ReceiveFlowError> {
+        self.auth
+            .cashu_seed()
+            .await
+            .map_err(|e| ReceiveFlowError::Auth(format!("fetch cashu seed: {e}")))
     }
 }
 
@@ -1474,6 +1527,78 @@ mod tests {
             matches!(e, WalletError::Internal(_)),
             "post-upsert not-found must be WalletError::Internal byte-identical to \
              pre-12c (Defect-2 δ2), NOT Storage; got {e:?}"
+        );
+    }
+
+    // 12c D1: AuthClientSeedProvider bridges Arc<dyn AuthClient> to
+    // agicash_cashu::CashuSeedProvider. Tested in isolation against a
+    // tiny inline AuthClient stub (FakeAuth is auth.rs-private). ~30 LOC,
+    // explicitly budgeted (Defect-3 re-architecture) — NOT a WalletClient
+    // harness.
+    #[derive(Debug)]
+    struct SeedStubAuth {
+        seed: Result<[u8; 64], ()>,
+    }
+    #[async_trait::async_trait]
+    impl crate::auth::AuthClient for SeedStubAuth {
+        async fn register_guest(&self) -> Result<crate::auth::Session, WalletError> {
+            unreachable!()
+        }
+        async fn login_email(
+            &self,
+            _e: &str,
+            _p: &str,
+        ) -> Result<crate::auth::Session, WalletError> {
+            unreachable!()
+        }
+        async fn register_email(
+            &self,
+            _e: &str,
+            _p: &str,
+            _n: Option<&str>,
+        ) -> Result<crate::auth::Session, WalletError> {
+            unreachable!()
+        }
+        async fn logout(&self) -> Result<(), WalletError> {
+            unreachable!()
+        }
+        async fn set_session(&self, _s: crate::auth::Session) -> Result<(), WalletError> {
+            unreachable!()
+        }
+        async fn get_session(&self) -> Result<Option<crate::auth::Session>, WalletError> {
+            unreachable!()
+        }
+        async fn cashu_seed(&self) -> Result<[u8; 64], WalletError> {
+            self.seed.map_err(|()| WalletError::Unauthenticated)
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_client_seed_provider_forwards_seed_and_maps_auth_failure() {
+        use agicash_cashu::CashuSeedProvider;
+        // success: forwards the 64-byte seed verbatim.
+        let ok_provider = AuthClientSeedProvider {
+            auth: Arc::new(SeedStubAuth {
+                seed: Ok([7u8; 64]),
+            }) as Arc<dyn crate::auth::AuthClient>,
+        };
+        assert_eq!(ok_provider.get_cashu_seed().await.unwrap(), [7u8; 64]);
+        // failure: any seed error becomes ReceiveFlowError::Auth, whose
+        // .code() is the SAME code a reference ReceiveFlowError::Auth
+        // yields (code::AUTH) — so the UI's re-auth branch is unchanged
+        // (the behavior the FFI's old OpenSecretSeedProvider produced).
+        let err_provider = AuthClientSeedProvider {
+            auth: Arc::new(SeedStubAuth { seed: Err(()) }) as Arc<dyn crate::auth::AuthClient>,
+        };
+        let e = err_provider.get_cashu_seed().await.unwrap_err();
+        assert!(
+            matches!(e, agicash_cashu::ReceiveFlowError::Auth(_)),
+            "seed failure must map to ReceiveFlowError::Auth (preserves code::AUTH), got {e:?}"
+        );
+        assert_eq!(
+            e.code(),
+            agicash_cashu::ReceiveFlowError::Auth("ref".into()).code(),
+            "the mapped error's .code() must equal a reference Auth's .code() (code::AUTH)"
         );
     }
 
