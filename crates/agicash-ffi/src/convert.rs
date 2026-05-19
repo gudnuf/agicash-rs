@@ -136,6 +136,40 @@ pub fn mint_add_result_from_summary(
     }
 }
 
+/// Facade `ReceiveStatus` → FFI `ReceiveStatus`. 1:1 variant map.
+#[must_use]
+fn receive_status_from_facade(s: agicash_wallet::ReceiveStatus) -> crate::receive::ReceiveStatus {
+    match s {
+        agicash_wallet::ReceiveStatus::Received => crate::receive::ReceiveStatus::Received,
+        agicash_wallet::ReceiveStatus::AlreadyClaimed => {
+            crate::receive::ReceiveStatus::AlreadyClaimed
+        }
+        agicash_wallet::ReceiveStatus::AlreadyFailed => {
+            crate::receive::ReceiveStatus::AlreadyFailed
+        }
+        agicash_wallet::ReceiveStatus::Pending => crate::receive::ReceiveStatus::Pending,
+    }
+}
+
+/// Facade `ReceiveReceipt` → FFI `ReceiveResult`. Verbatim the old
+/// `receive_result_from_outcome` shape: decimal `amount`/`fee` strings,
+/// `Money`-derived `unit`/`currency`, stringified `account_id`.
+#[must_use]
+pub fn receive_result_from_receipt(
+    r: &agicash_wallet::ReceiveReceipt,
+) -> crate::receive::ReceiveResult {
+    crate::receive::ReceiveResult {
+        status: receive_status_from_facade(r.status),
+        amount: r.amount.amount().to_string(),
+        fee: r.fee.amount().to_string(),
+        unit: r.amount.unit().to_string(),
+        currency: r.amount.currency().to_string(),
+        account_id: r.account_id.to_string(),
+        mint_url: r.mint_url.clone(),
+        token_hash: r.token_hash.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +295,51 @@ mod tests {
             balance: "0".into(),
         };
         assert_eq!(mint_add_result_from_summary(&summary).mint_url, "");
+    }
+
+    #[test]
+    fn receive_result_from_receipt_maps_money_and_status() {
+        let acct = Uuid::new_v4();
+        let receipt = agicash_wallet::ReceiveReceipt {
+            status: agicash_wallet::ReceiveStatus::Received,
+            amount: amount_to_money(900, Currency::Btc),
+            fee: amount_to_money(3, Currency::Btc),
+            account_id: AccountId::from(acct),
+            mint_url: "https://m.example".into(),
+            token_hash: "deadbeef".into(),
+        };
+        let r = receive_result_from_receipt(&receipt);
+        assert!(matches!(r.status, crate::receive::ReceiveStatus::Received));
+        assert_eq!(r.amount, "900");
+        assert_eq!(r.fee, "3");
+        assert_eq!(r.unit, "sat");
+        assert_eq!(r.currency, "BTC");
+        assert_eq!(r.account_id, acct.to_string());
+        assert_eq!(r.mint_url, "https://m.example");
+        assert_eq!(r.token_hash, "deadbeef");
+    }
+
+    #[test]
+    fn receive_result_status_variants_map_one_to_one() {
+        let mk = |s| agicash_wallet::ReceiveReceipt {
+            status: s,
+            amount: amount_to_money(0, Currency::Btc),
+            fee: amount_to_money(0, Currency::Btc),
+            account_id: AccountId::from(Uuid::new_v4()),
+            mint_url: String::new(),
+            token_hash: String::new(),
+        };
+        assert!(matches!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::AlreadyClaimed)).status,
+            crate::receive::ReceiveStatus::AlreadyClaimed
+        ));
+        assert!(matches!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::AlreadyFailed)).status,
+            crate::receive::ReceiveStatus::AlreadyFailed
+        ));
+        assert!(matches!(
+            receive_result_from_receipt(&mk(agicash_wallet::ReceiveStatus::Pending)).status,
+            crate::receive::ReceiveStatus::Pending
+        ));
     }
 }

@@ -31,8 +31,7 @@ use agicash_cashu::{
     CashuReceiveSwapService, CashuReceiveSwapState, CashuReceiveSwapStorage, CashuSeedProvider,
     CashuSendSwapService, CashuSendSwapState, CashuSendSwapStorage, CdkCashuProvider,
     CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError, MeltQuotePreview,
-    MintQuoteError, ParsedToken, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError,
-    TokenProof,
+    MintQuoteError, ParsedToken, ReceiveFlowService, ReceiveSwapError, TokenProof,
 };
 use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
 use agicash_exchange_rate::{ExchangeRateError, ExchangeRateProvider, MempoolSpaceProvider};
@@ -785,77 +784,25 @@ impl AgicashWallet {
     ///   the discriminator the iOS UI surfaces inline).
     /// - `FfiError::Storage` for raw Supabase failures (network, etc.).
     pub async fn receive_token(&self, token: String) -> Result<ReceiveResult, FfiError> {
+        // Shell-resident observability (spec §6) — kept verbatim. The
+        // parse / account-pick / PENDING-create / AlreadyClaimed
+        // idempotency / seed / complete_swap chain now lives in the
+        // facade `receive_cashu_token` byte-for-byte; it
+        // `require_session()`s the shared slot. The post-session-loaded
+        // log line depended on the now-removed inline check — dropping
+        // it is a log-only change.
         crate::observability::init();
         tracing::info!(
             target: "agicash_ffi::wallet",
             token_len = token.len(),
             "receive_token: enter"
         );
-        let session = self.session.read().await.clone().ok_or(FfiError::Auth {
-            code: crate::error::auth_code::UNAUTHENTICATED,
-            message: "not authenticated".into(),
-        })?;
-        let user_id = UserId::from(session.user_id);
-        tracing::info!(
-            target: "agicash_ffi::wallet",
-            user_id = %user_id.as_uuid(),
-            "receive_token: session loaded"
-        );
-
-        // Parse first so a malformed token surfaces as a clean error
-        // before we touch storage / the mint.
-        let parsed = ParsedToken::parse(&token, &self.cashu_provider)
+        let receipt = self
+            .facade
+            .receive_cashu_token(&token)
             .await
-            .map_err(receive_swap_error_to_ffi)?;
-
-        let accounts = self.storage.list_accounts(user_id).await?;
-        let account = pick_cashu_account_for_token(&accounts, &parsed.mint_url, &parsed.unit)
-            .ok_or_else(|| {
-                FfiError::internal(format!(
-                    "no matching account for mint {} — add the mint first",
-                    parsed.mint_url
-                ))
-            })?;
-
-        // Create the PENDING swap row. AlreadyClaimed is idempotent —
-        // surface the existing terminal state instead of erroring.
-        let create_result = match self
-            .receive_swap_service
-            .create(user_id, &parsed, account, None)
-            .await
-        {
-            Ok(r) => r,
-            Err(ReceiveSwapError::Storage(ReceiveSwapStorageError::AlreadyClaimed)) => {
-                return Ok(ReceiveResult {
-                    status: ReceiveStatus::AlreadyClaimed,
-                    amount: "0".into(),
-                    fee: "0".into(),
-                    unit: parsed.unit.to_string(),
-                    currency: account.currency.to_string(),
-                    account_id: account.id.to_string(),
-                    mint_url: parsed.mint_url.clone(),
-                    token_hash: parsed.hash.clone(),
-                });
-            }
-            Err(e) => return Err(receive_swap_error_to_ffi(e)),
-        };
-
-        // Pull the BIP-39 cashu seed from OpenSecret so the service can
-        // blind the outputs. Requires an active session (the read-lock
-        // above proves we have one).
-        let seed = self.client.get_cashu_seed().await?;
-
-        let outcome = self
-            .receive_swap_service
-            .complete_swap(&create_result.account, create_result.swap, &seed)
-            .await
-            .map_err(receive_swap_error_to_ffi)?;
-
-        Ok(receive_result_from_outcome(
-            outcome,
-            &create_result.account,
-            &parsed,
-        ))
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        Ok(crate::convert::receive_result_from_receipt(&receipt))
     }
 
     /// Construct a fresh [`ReceiveFlow`] handle for an interactive
@@ -1817,6 +1764,10 @@ impl AgicashWallet {
 /// supplied parsed token. Mirrors the CLI's private `pick_account`
 /// (`crates/agicash-cli/src/receive.rs`) — duplicated here so the FFI
 /// stays decoupled from the CLI binary.
+// TODO(12b-1 Task 12): token-account pick now lives in the facade
+// `receive_cashu_token`; this shell copy is dead. Allow until the
+// deletion pass.
+#[allow(dead_code)]
 fn pick_cashu_account_for_token<'a>(
     accounts: &'a [Account],
     mint_url: &str,
@@ -1832,10 +1783,14 @@ fn pick_cashu_account_for_token<'a>(
     })
 }
 
+// TODO(12b-1 Task 12): dead with the facade-delegated receive path.
+#[allow(dead_code)]
 fn mint_urls_equal(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+// TODO(12b-1 Task 12): dead with the facade-delegated receive path.
+#[allow(dead_code)]
 fn unit_matches_currency(unit: &cdk::nuts::CurrencyUnit, currency: Currency) -> bool {
     use cdk::nuts::CurrencyUnit;
     matches!(
@@ -1891,6 +1846,9 @@ async fn compute_cashu_balance(
 /// FFI; the cashu-specific cases (token parse, mint-mismatch,
 /// amount-too-small) don't fit either family cleanly so they funnel
 /// through `Internal` with a discriminator-bearing message.
+// TODO(12b-1 Task 12): the facade's `WalletError` path
+// (`convert::wallet_error_to_ffi`) replaces this; dead until deletion.
+#[allow(dead_code)]
 fn receive_swap_error_to_ffi(e: ReceiveSwapError) -> FfiError {
     match e {
         ReceiveSwapError::TokenParse(msg) => FfiError::internal(format!("invalid token: {msg}")),
@@ -1938,6 +1896,10 @@ fn cashu_provider_error_to_ffi(e: CashuProviderError) -> FfiError {
     }
 }
 
+// TODO(12b-1 Task 12): the facade's `ReceiveReceipt` →
+// `convert::receive_result_from_receipt` replaces this; dead until
+// deletion.
+#[allow(dead_code)]
 fn receive_result_from_outcome(
     outcome: CompleteOutcome,
     fallback_account: &Account,
