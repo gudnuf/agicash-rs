@@ -23,8 +23,8 @@ use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{
-    auth_error_from_opensecret, login_email, logout, register_email, OpenSecretClient,
-    OpenSecretConfig, OpenSecretTokenProvider,
+    auth_error_from_opensecret, logout, register_email, OpenSecretClient, OpenSecretConfig,
+    OpenSecretTokenProvider,
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
@@ -498,14 +498,19 @@ impl AgicashWallet {
 
     /// Email + password login.
     pub async fn auth_login(&self, email: String, password: String) -> Result<Session, FfiError> {
-        let resp = login_email(&self.client, email, password, self.client.client_id()).await?;
+        let s = self
+            .facade
+            .auth_login(&email, &password)
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // §6 carve-out (note ‡): mirror into the shell-resident slot.
         let persisted = PersistedSession {
-            user_id: resp.id,
-            refresh_token: resp.refresh_token.clone(),
+            user_id: s.user_id.as_uuid(),
+            refresh_token: s.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        Ok(persisted.into())
+        Ok(crate::convert::session_from_facade(s))
     }
 
     /// Register a new email + password user against OpenSecret. Mirrors the
