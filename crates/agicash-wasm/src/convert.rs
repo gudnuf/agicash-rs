@@ -62,6 +62,16 @@ pub fn wallet_error_to_js(e: WalletError) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
+/// Facade `Session` → `SessionWasm`. Mirror of
+/// `ffi::convert::session_from_facade`.
+#[must_use]
+pub fn session_from_facade(s: &agicash_wallet::Session) -> crate::types::SessionWasm {
+    crate::types::SessionWasm {
+        user_id: s.user_id.to_string(),
+        refresh_token: s.refresh_token.clone(),
+    }
+}
+
 /// Facade `AuthStatus` → `AuthStatusWasm`. Mirror of the FFI
 /// `auth_status` inline mapping (`agicash-ffi/src/wallet.rs`): `user_id:
 /// Option<UserId>` stringified.
@@ -107,5 +117,17 @@ mod tests {
     fn wallet_error_message_preserved() {
         let js = wallet_error_to_js(WalletError::Cashu("boom".into()));
         assert!(js.as_string().unwrap().contains("boom"));
+    }
+
+    #[wasm_bindgen_test]
+    fn session_from_facade_stringifies_user_id() {
+        let uid = Uuid::new_v4();
+        let fs = agicash_wallet::Session {
+            user_id: agicash_domain::UserId::from(uid),
+            refresh_token: "rt.x".into(),
+        };
+        let w = session_from_facade(&fs);
+        assert_eq!(w.user_id, uid.to_string());
+        assert_eq!(w.refresh_token, "rt.x");
     }
 }

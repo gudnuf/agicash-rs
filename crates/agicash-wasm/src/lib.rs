@@ -63,6 +63,24 @@ mod wasm_impl {
             Ok(AgicashWasmWallet { client })
         }
 
+        /// Register a fresh guest account. Pure delegate to
+        /// `WalletClient::auth_guest` (mirrors FFI 6.1). Browser session
+        /// persistence is handled by `agicash-auth-opensecret`'s
+        /// already-shipped `BrowserSessionStorage` inside `from_config`'s
+        /// `OpenSecretAuthClient` — the wasm shell has no realtime
+        /// supervisor (full realtime cutover is #29, out of 12d scope),
+        /// so no shell-resident session-slot side-effect (unlike the
+        /// FFI's §6 mirror).
+        #[wasm_bindgen(js_name = authGuest)]
+        pub async fn auth_guest(&self) -> Result<crate::types::SessionWasm, JsValue> {
+            let s = self
+                .client
+                .auth_guest()
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::convert::session_from_facade(&s))
+        }
+
         /// Logged-in snapshot, no network. Proves the handle is wired +
         /// the facade delegates (mirrors the FFI `auth_status` smoke).
         #[wasm_bindgen(js_name = authStatus)]
