@@ -124,27 +124,40 @@ CAROOT="$(mkcert -CAROOT)"
 ROOT_CA_PEM="$CAROOT/rootCA.pem"
 [ -f "$ROOT_CA_PEM" ] || die "mkcert rootCA not found at $ROOT_CA_PEM (run 'mkcert -install' once)."
 
-# Compute the SHA-1 fingerprint of the rootCA to use as the
-# already-present marker. The simulator's TrustStore.sqlite3 stores
-# certificates keyed by their SHA-1 hash in the `tsettings.sha1` BLOB
-# column. Match on hex(sha1) for an idempotency check that doesn't
-# depend on internal Apple APIs.
+# Compute the SHA-256 fingerprint of the rootCA. The simulator's
+# TrustStore.sqlite3 keys user-installed root certs by their SHA-256
+# hash in `tsettings.sha256`. Match on hex(sha256) for an idempotency
+# check that doesn't depend on internal Apple APIs.
+#
+# Modern (Xcode 26 / iOS 26 era) sims hold this DB at
+#   .../data/private/var/protected/trustd/private/TrustStore.sqlite3
+# Older layouts used .../data/Library/Keychains/TrustStore.sqlite3 and a
+# `sha1` column. We probe both paths + both columns so this works across
+# sim versions without bumping.
+ROOT_CA_SHA256="$(/usr/bin/openssl x509 -in "$ROOT_CA_PEM" -noout -fingerprint -sha256 \
+                   | sed -e 's/^.*=//' -e 's/://g' \
+                   | tr 'a-z' 'A-Z')"
 ROOT_CA_SHA1="$(/usr/bin/openssl x509 -in "$ROOT_CA_PEM" -noout -fingerprint -sha1 \
                   | sed -e 's/^.*=//' -e 's/://g' \
                   | tr 'a-z' 'A-Z')"
-log "rootCA SHA-1: $ROOT_CA_SHA1"
+log "rootCA SHA-256: $ROOT_CA_SHA256"
 
-TRUSTSTORE="$SIM_KEYCHAIN_DIR/TrustStore.sqlite3"
 CA_PRESENT=0
-if [ -f "$TRUSTSTORE" ]; then
-  # Wrap in a sub-pipe so a missing `tsettings` table doesn't kill the script.
-  if HEX_LIST="$(/usr/bin/sqlite3 "$TRUSTSTORE" \
-                  "SELECT upper(hex(sha1)) FROM tsettings;" 2>/dev/null)"; then
-    if echo "$HEX_LIST" | grep -qx "$ROOT_CA_SHA1"; then
-      CA_PRESENT=1
+for TS_CANDIDATE in \
+  "$SIM_DATA_DIR/private/var/protected/trustd/private/TrustStore.sqlite3" \
+  "$SIM_KEYCHAIN_DIR/TrustStore.sqlite3"; do
+  [ -f "$TS_CANDIDATE" ] || continue
+  for COL_FP_PAIR in "sha256:$ROOT_CA_SHA256" "sha1:$ROOT_CA_SHA1"; do
+    COL="${COL_FP_PAIR%%:*}"; FP="${COL_FP_PAIR#*:}"
+    if HEX_LIST="$(/usr/bin/sqlite3 "$TS_CANDIDATE" \
+                    "SELECT upper(hex($COL)) FROM tsettings;" 2>/dev/null)"; then
+      if echo "$HEX_LIST" | grep -qx "$FP"; then
+        CA_PRESENT=1
+        break 2
+      fi
     fi
-  fi
-fi
+  done
+done
 
 if [ "$CA_PRESENT" = 1 ]; then
   log "mkcert CA already present in sim trust store — no-op."
