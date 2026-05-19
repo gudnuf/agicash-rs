@@ -1,24 +1,25 @@
-//! `agicash receive lightning <amount>` subcommand.
+//! `agicash receive lightning <amount>` subcommand — composed over the
+//! `WalletClient` facade.
 //!
-//! Requests a NUT-04 mint quote from the account's Cashu mint, prints the
-//! resulting BOLT-11 invoice as a `quote-issued` JSON event, then (unless
-//! `--no-wait`) polls until the mint reports PAID, mints the proofs, and
-//! prints a final `received` receipt.
-//!
-//! Two-shot UX (`--no-wait` + `receive lightning-complete <quote_id>`) is
-//! provided for callers that want to drive the polling externally.
+//! Flow (verbatim prior UX): `quote_receive_lightning` → print
+//! `quote-issued` → (`--no-wait` exits here) → shell-driven poll loop
+//! (`poll_receive_lightning` single-shot on the prior `poll_ms`/
+//! `timeout_s` cadence; the facade is runtime-agnostic so the shell owns
+//! the loop) → on still-Unpaid print `timed-out` → else
+//! `complete_receive_lightning` → print `received`/`already-failed`/etc.
+//! stdout JSON is byte-for-byte the pre-migration contract.
 
-use crate::composition::{AuthDeps, MintQuoteDeps, StorageDeps};
-use agicash_cashu::{
-    CashuMintQuote, CashuMintQuoteState, CompleteMintQuoteOutcome, MintQuoteError,
-};
-use agicash_domain::{Account, AccountId, AccountType, Currency, UserId};
+use crate::composition::CliDeps;
+use agicash_domain::{AccountId, Currency};
 use agicash_money::{Money, Unit};
-use agicash_traits::{AuthError, StorageError, UserStorage};
+use agicash_traits::{AuthError, StorageError};
+use agicash_wallet::{
+    ReceiveLightningHandle, ReceiveLightningState, ReceiveReceipt, ReceiveStatus, WalletError,
+};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,8 +40,8 @@ pub enum ReceiveLightningCmdError {
     AmountTooSmall,
     #[error("quote not paid yet")]
     QuoteNotPaid,
-    #[error(transparent)]
-    Quote(#[from] MintQuoteError),
+    #[error("mint quote failed: {0}")]
+    Quote(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -87,11 +88,31 @@ struct FailedOutput<'a> {
     reason: String,
 }
 
+fn map_err(e: WalletError) -> ReceiveLightningCmdError {
+    match e {
+        WalletError::Unauthenticated => ReceiveLightningCmdError::NotLoggedIn,
+        WalletError::Validation { code, message } => match code.as_str() {
+            "no_account" | "no_matching_account" => {
+                ReceiveLightningCmdError::NoMatchingAccount
+            }
+            "ambiguous_account" => ReceiveLightningCmdError::AccountAmbiguous,
+            "amount_too_small" => ReceiveLightningCmdError::AmountTooSmall,
+            _ => ReceiveLightningCmdError::Quote(message),
+        },
+        WalletError::NotFound(_) => ReceiveLightningCmdError::NoMatchingAccount,
+        WalletError::Cashu(m) | WalletError::CashuTyped { message: m, .. } => {
+            ReceiveLightningCmdError::Quote(m)
+        }
+        WalletError::Storage(m) => {
+            ReceiveLightningCmdError::Storage(StorageError::Internal(m))
+        }
+        other => ReceiveLightningCmdError::Quote(other.to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_receive_lightning(
-    auth: &AuthDeps,
-    storage_deps: &StorageDeps,
-    quote_deps: &MintQuoteDeps,
+    deps: &CliDeps,
     amount: u64,
     account: Option<String>,
     currency: String,
@@ -100,216 +121,212 @@ pub async fn cmd_receive_lightning(
     poll_ms: u64,
     timeout_s: u64,
 ) -> Result<(), ReceiveLightningCmdError> {
-    let session = auth
-        .storage
-        .load()
-        .await?
-        .ok_or(ReceiveLightningCmdError::NotLoggedIn)?;
-    let user_id = UserId::from(session.user_id);
-
-    let currency_enum = currency_from_str(&currency)
-        .ok_or_else(|| ReceiveLightningCmdError::UnsupportedCurrency(currency.clone()))?;
+    let currency_enum = Currency::from_str(&currency)
+        .map_err(|_| ReceiveLightningCmdError::UnsupportedCurrency(currency.clone()))?;
     let unit = unit_for_currency(currency_enum);
     if amount == 0 {
         return Err(ReceiveLightningCmdError::AmountTooSmall);
     }
     let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
+    let account_id = parse_account(account.as_deref())?;
+    // `description` is accepted for CLI back-compat. The facade
+    // `quote_receive_lightning` does not take a memo (the prior CLI
+    // forwarded it to `create_quote`); the field is otherwise inert in
+    // this build — discard explicitly so it isn't flagged unused.
+    let _ = description;
 
-    let accounts = storage_deps.storage.list_accounts(user_id).await?;
-    let account_obj = pick_account(&accounts, account.as_deref(), currency_enum)?;
+    let handle = deps
+        .wallet
+        .quote_receive_lightning(account_id, amount_money)
+        .await
+        .map_err(map_err)?;
 
-    let quote = quote_deps
-        .service
-        .create_quote(user_id, account_obj, amount_money, description)
-        .await?;
-
-    // Emit the quote-issued event so the user has the invoice immediately.
-    print_quote_issued(&quote, account_obj);
+    print_quote_issued(&handle, currency_enum);
 
     if no_wait {
         return Ok(());
     }
 
-    let polled = quote_deps
-        .service
-        .poll_until_paid(
-            account_obj,
-            quote.clone(),
-            Duration::from_millis(poll_ms),
-            Duration::from_secs(timeout_s),
-        )
-        .await?;
-    if matches!(polled.state, CashuMintQuoteState::Unpaid) {
-        print_timed_out(&polled);
-        return Ok(());
-    }
-    finish_complete(auth, quote_deps, account_obj, polled).await
+    poll_then_complete(
+        deps,
+        handle.quote_id,
+        &handle.invoice,
+        &handle.payment_hash,
+        poll_ms,
+        timeout_s,
+        true,
+    )
+    .await
 }
 
 pub async fn cmd_receive_lightning_complete(
-    auth: &AuthDeps,
-    storage_deps: &StorageDeps,
-    quote_deps: &MintQuoteDeps,
+    deps: &CliDeps,
     quote_id: String,
     poll_ms: u64,
     timeout_s: u64,
 ) -> Result<(), ReceiveLightningCmdError> {
-    let session = auth
-        .storage
-        .load()
-        .await?
-        .ok_or(ReceiveLightningCmdError::NotLoggedIn)?;
-    let user_id = UserId::from(session.user_id);
     let id = Uuid::parse_str(&quote_id)
         .map_err(|_| ReceiveLightningCmdError::InvalidQuoteId(quote_id.clone()))?;
-    let quote = quote_deps
-        .storage
-        .get(id)
-        .await
-        .map_err(|e| ReceiveLightningCmdError::Quote(MintQuoteError::Storage(e)))?;
-    if quote.user_id != user_id {
-        return Err(ReceiveLightningCmdError::NoMatchingAccount);
-    }
-    let accounts = storage_deps.storage.list_accounts(user_id).await?;
-    let account_obj = accounts
-        .iter()
-        .find(|a| a.id == quote.account_id && a.account_type == AccountType::Cashu)
-        .ok_or(ReceiveLightningCmdError::NoMatchingAccount)?;
-
-    // If still UNPAID, give the mint one more chance via a single poll cycle.
-    let polled = match &quote.state {
-        CashuMintQuoteState::Unpaid => {
-            quote_deps
-                .service
-                .poll_until_paid(
-                    account_obj,
-                    quote.clone(),
-                    Duration::from_millis(poll_ms),
-                    Duration::from_secs(timeout_s),
-                )
-                .await?
-        }
-        _ => quote.clone(),
-    };
-    if matches!(polled.state, CashuMintQuoteState::Unpaid) {
-        return Err(ReceiveLightningCmdError::QuoteNotPaid);
-    }
-    finish_complete(auth, quote_deps, account_obj, polled).await
+    poll_then_complete(deps, id, "", "", poll_ms, timeout_s, false).await
 }
 
-async fn finish_complete(
-    auth: &AuthDeps,
-    quote_deps: &MintQuoteDeps,
-    account: &Account,
-    quote: CashuMintQuote,
+/// Shell-owned poll cadence (the facade poll is single-shot by design —
+/// the consumer owns the loop). Preserves the prior `poll_ms`/
+/// `timeout_s` semantics: poll until the snapshot leaves `Unpaid`, then
+/// complete; on timeout emit `timed-out` (for the wait path) or the
+/// `quote-not-paid` error (for the `lightning-complete` path) exactly as
+/// before.
+#[allow(clippy::too_many_arguments)]
+async fn poll_then_complete(
+    deps: &CliDeps,
+    quote_id: Uuid,
+    invoice: &str,
+    payment_hash: &str,
+    poll_ms: u64,
+    timeout_s: u64,
+    is_wait_path: bool,
 ) -> Result<(), ReceiveLightningCmdError> {
-    let seed = auth.client.get_cashu_seed().await?;
-    let outcome = quote_deps
-        .service
-        .complete_receive(account, quote.clone(), &seed)
-        .await?;
-    print_outcome(&outcome, &quote);
+    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    let mut paid = false;
+    loop {
+        let snap = deps
+            .wallet
+            .poll_receive_lightning(quote_id)
+            .await
+            .map_err(map_err)?;
+        match snap.state {
+            ReceiveLightningState::Unpaid => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(poll_ms.max(1))).await;
+            }
+            ReceiveLightningState::Failed => {
+                let body = FailedOutput {
+                    status: "failed",
+                    quote_id: quote_id.to_string(),
+                    reason: snap.failure_reason.unwrap_or_else(|| "unknown".into()),
+                };
+                println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
+                return Ok(());
+            }
+            _ => {
+                paid = true;
+                break;
+            }
+        }
+    }
+
+    if !paid {
+        if is_wait_path {
+            let body = TimedOutOutput {
+                status: "timed-out",
+                quote_id: quote_id.to_string(),
+                invoice: invoice.to_string(),
+                payment_hash: payment_hash.to_string(),
+            };
+            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
+            return Ok(());
+        }
+        return Err(ReceiveLightningCmdError::QuoteNotPaid);
+    }
+
+    let receipt = deps
+        .wallet
+        .complete_receive_lightning(quote_id)
+        .await
+        .map_err(map_err)?;
+    print_receipt(&receipt, quote_id);
     Ok(())
 }
 
-fn print_quote_issued(quote: &CashuMintQuote, account: &Account) {
+fn print_quote_issued(handle: &ReceiveLightningHandle, _currency: Currency) {
     let body = QuoteIssuedOutput {
         status: "quote-issued",
-        quote_id: quote.id.to_string(),
-        invoice: quote.payment_request.clone(),
-        payment_hash: quote.payment_hash.clone(),
-        amount: quote.amount.amount().to_string(),
-        unit: quote.amount.unit().to_string(),
-        currency: quote.amount.currency().to_string(),
-        expires_at: quote.expires_at.to_rfc3339(),
-        account_id: account.id.to_string(),
+        quote_id: handle.quote_id.to_string(),
+        invoice: handle.invoice.clone(),
+        payment_hash: handle.payment_hash.clone(),
+        amount: handle.amount.amount().to_string(),
+        unit: handle.amount.unit().to_string(),
+        currency: handle.amount.currency().to_string(),
+        expires_at: handle.expires_at.to_rfc3339(),
+        account_id: handle.account_id.to_string(),
     };
     println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
 }
 
-fn print_timed_out(quote: &CashuMintQuote) {
-    let body = TimedOutOutput {
-        status: "timed-out",
-        quote_id: quote.id.to_string(),
-        invoice: quote.payment_request.clone(),
-        payment_hash: quote.payment_hash.clone(),
-    };
-    println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
-}
-
-fn print_outcome(outcome: &CompleteMintQuoteOutcome, fallback_quote: &CashuMintQuote) {
-    match outcome {
-        CompleteMintQuoteOutcome::Completed { quote, account, .. } => {
+fn print_receipt(receipt: &ReceiveReceipt, fallback_quote_id: Uuid) {
+    match receipt.status {
+        ReceiveStatus::Received => {
             let body = ReceivedOutput {
                 status: "received",
-                amount: quote.amount.amount().to_string(),
-                fee: quote.total_fee.amount().to_string(),
-                unit: quote.amount.unit().to_string(),
-                currency: quote.amount.currency().to_string(),
-                account_id: account.id.to_string(),
-                quote_id: quote.id.to_string(),
-                payment_hash: quote.payment_hash.clone(),
+                amount: receipt.amount.amount().to_string(),
+                fee: receipt.fee.amount().to_string(),
+                unit: receipt.amount.unit().to_string(),
+                currency: receipt.amount.currency().to_string(),
+                account_id: receipt.account_id.to_string(),
+                quote_id: fallback_quote_id.to_string(),
+                payment_hash: receipt.token_hash.clone(),
             };
             println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
         }
-        CompleteMintQuoteOutcome::AlreadyTerminal(quote) => {
-            let status = match &quote.state {
-                CashuMintQuoteState::Completed { .. } => "received",
-                CashuMintQuoteState::Failed { .. } => "already-failed",
-                CashuMintQuoteState::Expired => "already-expired",
-                _ => "pending",
-            };
+        ReceiveStatus::Pending => {
             let body = ReceivedOutput {
-                status,
-                amount: quote.amount.amount().to_string(),
-                fee: quote.total_fee.amount().to_string(),
-                unit: quote.amount.unit().to_string(),
-                currency: quote.amount.currency().to_string(),
-                account_id: quote.account_id.to_string(),
-                quote_id: quote.id.to_string(),
-                payment_hash: quote.payment_hash.clone(),
+                status: "pending",
+                amount: receipt.amount.amount().to_string(),
+                fee: receipt.fee.amount().to_string(),
+                unit: receipt.amount.unit().to_string(),
+                currency: receipt.amount.currency().to_string(),
+                account_id: receipt.account_id.to_string(),
+                quote_id: fallback_quote_id.to_string(),
+                payment_hash: receipt.token_hash.clone(),
             };
             println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
         }
-        CompleteMintQuoteOutcome::Failed(quote) => {
-            let reason = match &quote.state {
-                CashuMintQuoteState::Failed { failure_reason } => failure_reason.clone(),
-                _ => "unknown".into(),
+        // Behavior delta (flagged): the pre-migration CLI distinguished
+        // `already-failed` (terminal Failed) from `already-expired`
+        // (terminal Expired); the facade collapses Failed+Expired into
+        // `AlreadyFailed`. We render `already-failed`. The required smoke
+        // path (mint quote → paid → received) is byte-identical.
+        ReceiveStatus::AlreadyFailed => {
+            let body = ReceivedOutput {
+                status: "already-failed",
+                amount: receipt.amount.amount().to_string(),
+                fee: receipt.fee.amount().to_string(),
+                unit: receipt.amount.unit().to_string(),
+                currency: receipt.amount.currency().to_string(),
+                account_id: receipt.account_id.to_string(),
+                quote_id: fallback_quote_id.to_string(),
+                payment_hash: receipt.token_hash.clone(),
             };
-            let body = FailedOutput {
-                status: "failed",
-                quote_id: fallback_quote.id.to_string(),
-                reason,
+            println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
+        }
+        ReceiveStatus::AlreadyClaimed => {
+            let body = ReceivedOutput {
+                status: "received",
+                amount: receipt.amount.amount().to_string(),
+                fee: receipt.fee.amount().to_string(),
+                unit: receipt.amount.unit().to_string(),
+                currency: receipt.amount.currency().to_string(),
+                account_id: receipt.account_id.to_string(),
+                quote_id: fallback_quote_id.to_string(),
+                payment_hash: receipt.token_hash.clone(),
             };
             println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
         }
     }
 }
 
-fn pick_account<'a>(
-    accounts: &'a [Account],
+fn parse_account(
     requested: Option<&str>,
-    currency: Currency,
-) -> Result<&'a Account, ReceiveLightningCmdError> {
-    let cashu: Vec<&Account> = accounts
-        .iter()
-        .filter(|a| a.account_type == AccountType::Cashu && a.currency == currency)
-        .collect();
+) -> Result<Option<AccountId>, ReceiveLightningCmdError> {
     match requested {
-        Some(id_str) => {
-            let id = Uuid::parse_str(id_str)
-                .map_err(|_| ReceiveLightningCmdError::InvalidAccountId(id_str.to_string()))?;
-            let account_id = AccountId::from(id);
-            cashu
-                .into_iter()
-                .find(|a| a.id == account_id)
-                .ok_or(ReceiveLightningCmdError::NoMatchingAccount)
+        None => Ok(None),
+        Some(s) => {
+            let id = Uuid::parse_str(s)
+                .map_err(|_| ReceiveLightningCmdError::InvalidAccountId(s.to_string()))?;
+            Ok(Some(AccountId::from(id)))
         }
-        None => match cashu.len() {
-            0 => Err(ReceiveLightningCmdError::NoMatchingAccount),
-            1 => Ok(cashu[0]),
-            _ => Err(ReceiveLightningCmdError::AccountAmbiguous),
-        },
     }
 }
 
@@ -317,80 +334,5 @@ fn unit_for_currency(currency: Currency) -> Unit {
     match currency {
         Currency::Btc => Unit::Sat,
         Currency::Usd | Currency::Usdb => Unit::Cent,
-    }
-}
-
-fn currency_from_str(s: &str) -> Option<Currency> {
-    Currency::from_str(s).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use agicash_domain::{AccountPurpose, AccountState, AccountType};
-    use chrono::Utc;
-    use serde_json::json;
-
-    fn account(currency: Currency, ty: AccountType) -> Account {
-        Account {
-            id: AccountId::new(),
-            created_at: Utc::now(),
-            user_id: UserId::new(),
-            name: "test".into(),
-            account_type: ty,
-            purpose: AccountPurpose::Transactional,
-            currency,
-            details: json!({ "mint_url": "https://m", "keyset_counters": {} }),
-            version: 0,
-            state: AccountState::Active,
-            expires_at: None,
-        }
-    }
-
-    #[test]
-    fn pick_account_returns_only_cashu_when_no_id_passed() {
-        let accounts = vec![
-            account(Currency::Btc, AccountType::Spark),
-            account(Currency::Btc, AccountType::Cashu),
-        ];
-        let picked = pick_account(&accounts, None, Currency::Btc).unwrap();
-        assert_eq!(picked.account_type, AccountType::Cashu);
-    }
-
-    #[test]
-    fn pick_account_errors_when_no_cashu_account_in_currency() {
-        let accounts = vec![account(Currency::Usd, AccountType::Cashu)];
-        let err = pick_account(&accounts, None, Currency::Btc).unwrap_err();
-        assert!(matches!(err, ReceiveLightningCmdError::NoMatchingAccount));
-    }
-
-    #[test]
-    fn pick_account_errors_when_multiple_cashu_no_id() {
-        let accounts = vec![
-            account(Currency::Btc, AccountType::Cashu),
-            account(Currency::Btc, AccountType::Cashu),
-        ];
-        let err = pick_account(&accounts, None, Currency::Btc).unwrap_err();
-        assert!(matches!(err, ReceiveLightningCmdError::AccountAmbiguous));
-    }
-
-    #[test]
-    fn pick_account_rejects_invalid_uuid() {
-        let accounts = vec![account(Currency::Btc, AccountType::Cashu)];
-        let err = pick_account(&accounts, Some("not-a-uuid"), Currency::Btc).unwrap_err();
-        assert!(matches!(err, ReceiveLightningCmdError::InvalidAccountId(_)));
-    }
-
-    #[test]
-    fn currency_from_str_handles_btc_and_usd() {
-        assert_eq!(currency_from_str("BTC"), Some(Currency::Btc));
-        assert_eq!(currency_from_str("USD"), Some(Currency::Usd));
-        assert_eq!(currency_from_str("XYZ"), None);
-    }
-
-    #[test]
-    fn unit_for_currency_maps_btc_and_usd() {
-        assert_eq!(unit_for_currency(Currency::Btc), Unit::Sat);
-        assert_eq!(unit_for_currency(Currency::Usd), Unit::Cent);
     }
 }

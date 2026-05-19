@@ -1,11 +1,12 @@
 //! `agicash send lightning-address <user@host> <amount>` subcommand.
 //!
-//! Resolves a LUD-16 Lightning Address client-side (no Vercel hop) and
-//! then defers to [`send_lightning::cmd_send_lightning`] with the
-//! resulting BOLT-11 invoice. The resolver lives in the
-//! `agicash-lightning-address` crate; this file is only glue.
+//! LUD-16/LUD-06 resolution stays shell-side (it's a thin
+//! `agicash-lightning-address` crate call, not part of the
+//! OpenSecret/Supabase/CDK composition) and prints the same `resolved`
+//! + `invoice-fetched` lines as before; it then delegates to the
+//! facade-composed [`send_lightning::cmd_send_lightning`].
 
-use crate::composition::{AuthDeps, MeltQuoteDeps, SendSwapDeps, StorageDeps};
+use crate::composition::CliDeps;
 use crate::send_lightning::{cmd_send_lightning, SendLightningCmdError};
 use agicash_lightning_address::{request_invoice, resolve, LightningAddressError};
 use serde::Serialize;
@@ -39,10 +40,7 @@ struct InvoiceFetchedOutput<'a> {
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub async fn cmd_send_lightning_address(
-    auth: &AuthDeps,
-    storage_deps: &StorageDeps,
-    send_swap_deps: &SendSwapDeps,
-    melt_deps: &MeltQuoteDeps,
+    deps: &CliDeps,
     address: String,
     amount_sat: u64,
     account: Option<String>,
@@ -84,18 +82,9 @@ pub async fn cmd_send_lightning_address(
         serde_json::to_string(&fetched).expect("serialize invoice JSON")
     );
 
-    // Step 3: delegate to the regular NUT-05 melt flow.
+    // Step 3: delegate to the facade-composed NUT-05 melt flow.
     cmd_send_lightning(
-        auth,
-        storage_deps,
-        send_swap_deps,
-        melt_deps,
-        invoice,
-        account,
-        dry_run,
-        no_wait,
-        poll_ms,
-        timeout_s,
+        deps, invoice, account, dry_run, no_wait, poll_ms, timeout_s,
     )
     .await?;
     Ok(())

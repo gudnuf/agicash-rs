@@ -10,19 +10,11 @@ mod send_lightning;
 mod send_lightning_address;
 
 use account::AccountCmdError;
-use agicash_cashu::{
-    MeltQuoteError, MeltQuoteStorageError, MintQuoteError, MintQuoteStorageError, ReceiveSwapError,
-    ReceiveSwapStorageError, SendSwapError, SendSwapStorageError,
-};
 use agicash_lightning_address::LightningAddressError;
-use agicash_traits::{AuthError, CashuProviderError, StorageError};
-use auth::rehydrate_session;
+use agicash_traits::{AuthError, StorageError};
 use clap::Parser;
 use cli::{AccountCommand, AuthCommand, Cli, Command, MintCommand, ReceiveCommand, SendCommand};
-use composition::{
-    build_auth_deps, build_cashu_deps, build_exchange_rate_deps, build_melt_quote_deps,
-    build_mint_quote_deps, build_receive_swap_deps, build_send_swap_deps, build_storage_deps,
-};
+use composition::{build_deps, rehydrate_session};
 use mint::MintCmdError;
 use receive::ReceiveCmdError;
 use receive_lightning::ReceiveLightningCmdError;
@@ -79,7 +71,7 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             ReceiveCmdError::NotLoggedIn => ("not-logged-in", 3),
             ReceiveCmdError::InvalidToken(_) => ("invalid-token", 1),
             ReceiveCmdError::NoMatchingAccount(_) => ("no-matching-account", 1),
-            ReceiveCmdError::Receive(inner) => (classify_receive(inner), 1),
+            ReceiveCmdError::Receive(_) => ("mint-error", 1),
             ReceiveCmdError::Storage(inner) => (classify_storage(inner), 1),
             ReceiveCmdError::Auth(inner) => classify_auth(inner),
         };
@@ -94,7 +86,7 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             ReceiveLightningCmdError::UnsupportedCurrency(_) => ("unsupported-currency", 1),
             ReceiveLightningCmdError::AmountTooSmall => ("amount-too-small", 1),
             ReceiveLightningCmdError::QuoteNotPaid => ("quote-not-paid", 1),
-            ReceiveLightningCmdError::Quote(inner) => (classify_mint_quote(inner), 1),
+            ReceiveLightningCmdError::Quote(_) => ("mint-error", 1),
             ReceiveLightningCmdError::Storage(inner) => (classify_storage(inner), 1),
             ReceiveLightningCmdError::Auth(inner) => classify_auth(inner),
         };
@@ -116,7 +108,7 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             SendCmdError::InvalidAccountId(_) => ("invalid-account-id", 1),
             SendCmdError::UnsupportedTokenVersion(_) => ("unsupported-token-version", 1),
             SendCmdError::TokenEncode(_) => ("token-encode-error", 1),
-            SendCmdError::Send(inner) => (classify_send(inner), 1),
+            SendCmdError::Send(_) => ("mint-error", 1),
             SendCmdError::Storage(inner) => (classify_storage(inner), 1),
             SendCmdError::Auth(inner) => classify_auth(inner),
         };
@@ -137,7 +129,7 @@ fn classify_send_lightning(sl_err: &SendLightningCmdError) -> (&'static str, i32
         SendLightningCmdError::AccountAmbiguous => ("account-ambiguous", 1),
         SendLightningCmdError::InvalidAccountId(_) => ("invalid-account-id", 1),
         SendLightningCmdError::InvalidQuoteId(_) => ("invalid-quote-id", 1),
-        SendLightningCmdError::Quote(inner) => (classify_melt_quote(inner), 1),
+        SendLightningCmdError::Quote(_) => ("mint-error", 1),
         SendLightningCmdError::Storage(inner) => (classify_storage(inner), 1),
         SendLightningCmdError::Auth(inner) => classify_auth(inner),
     }
@@ -168,105 +160,6 @@ fn classify_storage(e: &StorageError) -> &'static str {
         StorageError::NotFound => "not-found",
         StorageError::Backend(_) => "storage-backend-error",
         StorageError::Internal(_) => "internal-error",
-    }
-}
-
-fn classify_send(e: &SendSwapError) -> &'static str {
-    match e {
-        SendSwapError::InvalidTransition { .. } => "invalid-state",
-        SendSwapError::Storage(inner) => match inner {
-            SendSwapStorageError::Concurrency(_) => "concurrency-error",
-            SendSwapStorageError::NotFound => "not-found",
-            SendSwapStorageError::InvalidState(_) => "invalid-state",
-            SendSwapStorageError::Backend(_) => "storage-backend-error",
-            SendSwapStorageError::Encryption(_) => "encryption-error",
-        },
-        SendSwapError::Mint(inner) => match inner {
-            CashuProviderError::InvalidUrl(_) => "invalid-mint-url",
-            CashuProviderError::Network(_) => "mint-unreachable",
-            CashuProviderError::Protocol(_) => "mint-error",
-        },
-        SendSwapError::InsufficientBalance { .. } => "insufficient-balance",
-        SendSwapError::AmountTooSmall => "amount-too-small",
-        SendSwapError::CurrencyMismatch { .. } => "currency-mismatch",
-        SendSwapError::TokenEncode(_) => "token-encode-error",
-        SendSwapError::DleqVerificationFailed(_) => "dleq-verification-failed",
-    }
-}
-
-fn classify_melt_quote(e: &MeltQuoteError) -> &'static str {
-    match e {
-        MeltQuoteError::InvalidTransition { .. } => "invalid-state",
-        MeltQuoteError::Storage(inner) => match inner {
-            MeltQuoteStorageError::Concurrency(_) => "concurrency-error",
-            MeltQuoteStorageError::DuplicatePayment => "duplicate-payment",
-            MeltQuoteStorageError::NotFound => "not-found",
-            MeltQuoteStorageError::InvalidState(_) => "invalid-state",
-            MeltQuoteStorageError::Backend(_) => "storage-backend-error",
-            MeltQuoteStorageError::Encryption(_) => "encryption-error",
-        },
-        MeltQuoteError::DuplicatePayment => "duplicate-payment",
-        MeltQuoteError::Mint(inner) => match inner {
-            CashuProviderError::InvalidUrl(_) => "invalid-mint-url",
-            CashuProviderError::Network(_) => "mint-unreachable",
-            CashuProviderError::Protocol(_) => "mint-error",
-        },
-        MeltQuoteError::InvalidInvoice(_) => "invalid-invoice",
-        MeltQuoteError::AmountlessInvoice => "amountless-invoice-unsupported",
-        MeltQuoteError::AmountTooSmall => "amount-too-small",
-        MeltQuoteError::CurrencyMismatch { .. } => "currency-mismatch",
-        MeltQuoteError::InsufficientBalance { .. } => "insufficient-balance",
-        MeltQuoteError::QuoteExpired => "quote-expired",
-        MeltQuoteError::QuoteNotPending => "quote-not-pending",
-        MeltQuoteError::MeltFailed(_) => "melt-failed",
-        MeltQuoteError::Unrecoverable(_) => "mint-unrecoverable",
-        MeltQuoteError::DleqVerificationFailed(_) => "dleq-verification-failed",
-    }
-}
-
-fn classify_mint_quote(e: &MintQuoteError) -> &'static str {
-    match e {
-        MintQuoteError::InvalidTransition { .. } => "invalid-state",
-        MintQuoteError::Storage(inner) => match inner {
-            MintQuoteStorageError::NotFound => "not-found",
-            MintQuoteStorageError::InvalidState(_) => "invalid-state",
-            MintQuoteStorageError::Backend(_) => "storage-backend-error",
-            MintQuoteStorageError::Encryption(_) => "encryption-error",
-        },
-        MintQuoteError::Mint(inner) => match inner {
-            CashuProviderError::InvalidUrl(_) => "invalid-mint-url",
-            CashuProviderError::Network(_) => "mint-unreachable",
-            CashuProviderError::Protocol(_) => "mint-error",
-        },
-        MintQuoteError::AmountTooSmall => "amount-too-small",
-        MintQuoteError::CurrencyMismatch { .. } => "currency-mismatch",
-        MintQuoteError::QuoteNotPaid => "quote-not-paid",
-        MintQuoteError::QuoteExpired => "quote-expired",
-        MintQuoteError::Unrecoverable(_) => "mint-unrecoverable",
-        MintQuoteError::DleqVerificationFailed(_) => "dleq-verification-failed",
-    }
-}
-
-fn classify_receive(e: &ReceiveSwapError) -> &'static str {
-    match e {
-        ReceiveSwapError::InvalidTransition { .. } => "invalid-state",
-        ReceiveSwapError::Storage(inner) => match inner {
-            ReceiveSwapStorageError::AlreadyClaimed => "already-claimed",
-            ReceiveSwapStorageError::NotFound => "not-found",
-            ReceiveSwapStorageError::InvalidState(_) => "invalid-state",
-            ReceiveSwapStorageError::Backend(_) => "storage-backend-error",
-            ReceiveSwapStorageError::Encryption(_) => "encryption-error",
-        },
-        ReceiveSwapError::Mint(inner) => match inner {
-            CashuProviderError::InvalidUrl(_) => "invalid-mint-url",
-            CashuProviderError::Network(_) => "mint-unreachable",
-            CashuProviderError::Protocol(_) => "mint-error",
-        },
-        ReceiveSwapError::TokenParse(_) => "invalid-token",
-        ReceiveSwapError::AmountTooSmall => "amount-too-small",
-        ReceiveSwapError::MintMismatch { .. } => "mint-mismatch",
-        ReceiveSwapError::CurrencyMismatch { .. } => "currency-mismatch",
-        ReceiveSwapError::DleqVerificationFailed(_) => "dleq-verification-failed",
     }
 }
 
@@ -309,60 +202,44 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let auth_deps = build_auth_deps().await?;
-    // Hydrate the in-memory SDK from the keyring once at startup so every
-    // subcommand inherits a live session when one exists on disk. A failed
-    // refresh clears the keyring inside the helper; we swallow the error
-    // so commands like `auth status` and `auth logout` still run and
-    // report the resulting logged-out state.
-    let _ = rehydrate_session(&auth_deps).await;
+    // Single composition root: the `WalletClient` facade via
+    // `from_config` (+ the CLI-shell-resident keyring & thin
+    // UserStorage handle), all wired from one endpoint config.
+    let deps = build_deps().await?;
+    // Hydrate the facade session from the keyring once at startup so
+    // every subcommand inherits a live session when one persists across
+    // processes. `set_session` (inside the facade) does the OpenSecret
+    // handshake+refresh; a failed refresh clears the keyring inside the
+    // helper; we swallow the error so `auth status`/`auth logout` still
+    // run and report the resulting logged-out state.
+    let _ = rehydrate_session(&deps).await;
 
     match args.cmd {
         Some(Command::Version) => unreachable!("handled above"),
         Some(Command::Auth(a)) => match a.cmd {
-            AuthCommand::Guest => auth::cmd_guest(&auth_deps).await?,
-            AuthCommand::Login { email } => auth::cmd_login(&auth_deps, email).await?,
-            AuthCommand::Signup { email } => auth::cmd_signup(&auth_deps, email).await?,
-            AuthCommand::Logout => auth::cmd_logout(&auth_deps).await?,
-            AuthCommand::Status => auth::cmd_status(&auth_deps).await?,
+            AuthCommand::Guest => auth::cmd_guest(&deps).await?,
+            AuthCommand::Login { email } => auth::cmd_login(&deps, email).await?,
+            AuthCommand::Signup { email } => auth::cmd_signup(&deps, email).await?,
+            AuthCommand::Logout => auth::cmd_logout(&deps).await?,
+            AuthCommand::Status => auth::cmd_status(&deps).await?,
         },
         Some(Command::Account(a)) => match a.cmd {
-            AccountCommand::List => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                account::cmd_list(&auth_deps, &storage_deps).await?;
-            }
+            AccountCommand::List => account::cmd_list(&deps).await?,
             AccountCommand::Default { id } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                account::cmd_set_default(&auth_deps, &storage_deps, &id).await?;
+                account::cmd_set_default(&deps, &id).await?;
             }
         },
         Some(Command::Mint(m)) => match m.cmd {
             MintCommand::Add { url, currency } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                mint::cmd_mint_add(&auth_deps, &storage_deps, &cashu_deps, &url, &currency).await?;
+                mint::cmd_mint_add(&deps, &url, &currency).await?;
             }
         },
         Some(Command::Balance { account: _ }) => {
-            let storage_deps = build_storage_deps(&auth_deps)?;
-            let cashu_deps = build_cashu_deps();
-            let send_deps = build_send_swap_deps(&storage_deps, &cashu_deps);
-            let rate_deps = build_exchange_rate_deps();
-            mint::cmd_balance(&auth_deps, &storage_deps, &send_deps, &rate_deps).await?;
+            mint::cmd_balance(&deps).await?;
         }
         Some(Command::Receive(r)) => match r.cmd {
             ReceiveCommand::Token { token } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let receive_deps = build_receive_swap_deps(&storage_deps, &cashu_deps);
-                receive::cmd_receive(
-                    &auth_deps,
-                    &storage_deps,
-                    &cashu_deps,
-                    &receive_deps,
-                    &token,
-                )
-                .await?;
+                receive::cmd_receive(&deps, &token).await?;
             }
             ReceiveCommand::Lightning {
                 amount,
@@ -373,13 +250,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let quote_deps = build_mint_quote_deps(&storage_deps, &cashu_deps);
                 receive_lightning::cmd_receive_lightning(
-                    &auth_deps,
-                    &storage_deps,
-                    &quote_deps,
+                    &deps,
                     amount,
                     account,
                     currency,
@@ -395,16 +267,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let quote_deps = build_mint_quote_deps(&storage_deps, &cashu_deps);
                 receive_lightning::cmd_receive_lightning_complete(
-                    &auth_deps,
-                    &storage_deps,
-                    &quote_deps,
-                    quote_id,
-                    poll_ms,
-                    timeout_s,
+                    &deps, quote_id, poll_ms, timeout_s,
                 )
                 .await?;
             }
@@ -416,20 +280,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token_version,
                 dry_run,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let send_deps = build_send_swap_deps(&storage_deps, &cashu_deps);
-                send::cmd_send(
-                    &auth_deps,
-                    &storage_deps,
-                    &cashu_deps,
-                    &send_deps,
-                    amount,
-                    account,
-                    token_version,
-                    dry_run,
-                )
-                .await?;
+                send::cmd_send(&deps, amount, account, token_version, dry_run).await?;
             }
             SendCommand::Lightning {
                 invoice,
@@ -439,21 +290,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let send_deps = build_send_swap_deps(&storage_deps, &cashu_deps);
-                let melt_deps = build_melt_quote_deps(&storage_deps, &cashu_deps);
                 send_lightning::cmd_send_lightning(
-                    &auth_deps,
-                    &storage_deps,
-                    &send_deps,
-                    &melt_deps,
-                    invoice,
-                    account,
-                    dry_run,
-                    no_wait,
-                    poll_ms,
-                    timeout_s,
+                    &deps, invoice, account, dry_run, no_wait, poll_ms, timeout_s,
                 )
                 .await?;
             }
@@ -462,16 +300,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let melt_deps = build_melt_quote_deps(&storage_deps, &cashu_deps);
                 send_lightning::cmd_send_lightning_complete(
-                    &auth_deps,
-                    &storage_deps,
-                    &melt_deps,
-                    quote_id,
-                    poll_ms,
-                    timeout_s,
+                    &deps, quote_id, poll_ms, timeout_s,
                 )
                 .await?;
             }
@@ -485,22 +315,8 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 poll_ms,
                 timeout_s,
             } => {
-                let storage_deps = build_storage_deps(&auth_deps)?;
-                let cashu_deps = build_cashu_deps();
-                let send_deps = build_send_swap_deps(&storage_deps, &cashu_deps);
-                let melt_deps = build_melt_quote_deps(&storage_deps, &cashu_deps);
                 send_lightning_address::cmd_send_lightning_address(
-                    &auth_deps,
-                    &storage_deps,
-                    &send_deps,
-                    &melt_deps,
-                    address,
-                    amount,
-                    account,
-                    comment,
-                    dry_run,
-                    no_wait,
-                    poll_ms,
+                    &deps, address, amount, account, comment, dry_run, no_wait, poll_ms,
                     timeout_s,
                 )
                 .await?;
