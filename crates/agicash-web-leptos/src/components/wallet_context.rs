@@ -25,10 +25,14 @@
 //!
 //! 1. Read `user_id` from `BrowserSessionStorage` (already persisted by
 //!    [`LoginView`] on successful auth).
-//! 2. Build an `OpenSecretTokenProvider` from the [`AppConfig`] context
-//!    and pass it to `SupabaseStorage::new`. JWTs are minted on
-//!    each call via `OpenSecretClient::generate_third_party_token`
-//!    (cached server-side).
+//! 2. Build an `OpenSecretTokenProvider` over a **session-seeded**
+//!    `OpenSecretClient` (the SDK session manager is in-memory +
+//!    per-client, so the persisted refresh token from
+//!    `BrowserSessionStorage` MUST be threaded in via `set_tokens` +
+//!    `refresh` — see `session_seeded_opensecret_client`), and pass it
+//!    to `SupabaseStorage::new`. JWTs are minted on each call via
+//!    `OpenSecretClient::generate_third_party_token` (cached
+//!    server-side).
 //! 3. `storage.list_accounts(user_id).await` — typed postgrest call,
 //!    same surface every other platform uses.
 //! 4. Per Cashu account, `send_swap_storage.list_unspent_proofs(account.id)`
@@ -395,7 +399,7 @@ impl WalletData {
                 // refresh token. `TokenProviderJwtSource` adapts it to
                 // the realtime crate's `JwtSource` (the wasm variant
                 // takes `Arc<dyn TokenProvider>`, no `Send + Sync`).
-                let client = match build_opensecret_client(&config) {
+                let client = match build_opensecret_client(&config).await {
                     Ok(c) => c,
                     Err(e) => {
                         leptos::logging::log!(
@@ -477,20 +481,81 @@ impl agicash_realtime::TransportFactory for WasmTransportFactory {
     }
 }
 
-/// Build the OpenSecret client from the resolved [`AppConfig`] — the
-/// same construction `fetch_account_summaries` uses for storage, so the
-/// realtime join JWT comes from the identical token source.
+/// Build an `OpenSecretClient` **with the persisted browser session
+/// threaded in** — the single fix for the "No refresh token available"
+/// wallet-load failure.
+///
+/// The OpenSecret SDK's `SessionManager` is purely in-memory and
+/// per-client (`Arc<RwLock<Option<TokenPair>>>`, all `None` on `new()`);
+/// token *persistence* lives separately in `BrowserSessionStorage`
+/// (`window.localStorage`). A bare `OpenSecretClient::new(..)` is
+/// therefore a clean slate with no refresh token, so
+/// `generate_third_party_token` → SDK auto-refresh →
+/// `Error::Authentication("No refresh token available")`. Every
+/// token-provider construction site MUST re-seed the refresh token from
+/// `BrowserSessionStorage` (exactly as `app.rs::rehydrate_session`
+/// does); this helper is that seam, shared by both the storage path
+/// (`fetch_account_summaries`) and the realtime path
+/// (`build_opensecret_client`).
+///
+/// Steps mirror `rehydrate_session`: build client → load persisted
+/// session → `set_tokens("", Some(refresh_token))` → `refresh()` once
+/// (attestation handshake + `/refresh` exchange, which writes the fresh
+/// access + refresh pair into this client's session manager). A missing
+/// persisted session is a hard error here (callers only reach this
+/// after `ProtectedLayout` gated on an authenticated session).
 #[cfg(target_arch = "wasm32")]
-fn build_opensecret_client(
+async fn session_seeded_opensecret_client(
     config: &AppConfig,
-) -> Result<agicash_auth_opensecret::OpenSecretTokenProvider, String> {
-    use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
+) -> Result<agicash_auth_opensecret::OpenSecretClient, String> {
+    use agicash_auth_opensecret::{
+        refresh, BrowserSessionStorage, OpenSecretClient, OpenSecretConfig,
+    };
+    use agicash_traits::SessionStorage;
 
     let client = OpenSecretClient::new(OpenSecretConfig {
         base_url: config.opensecret_base_url.clone(),
         client_id: config.opensecret_client_id,
     })
     .map_err(|e| format!("build opensecret client: {e}"))?;
+
+    let session = match BrowserSessionStorage::new().load().await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Err(
+                "no persisted session — refresh token unavailable (please log in again)".into(),
+            )
+        }
+        Err(e) => return Err(format!("session load failed: {e}")),
+    };
+
+    client
+        .inner()
+        .set_tokens(String::new(), Some(session.refresh_token))
+        .map_err(|e| format!("seed refresh token failed: {e}"))?;
+
+    // Exchange the persisted refresh token for a fresh access token in
+    // THIS client's session manager. Without this the manager still has
+    // only the (now-stale-shaped) refresh token and no access token.
+    refresh(&client)
+        .await
+        .map_err(|e| format!("session refresh failed (re-login required): {e}"))?;
+
+    Ok(client)
+}
+
+/// Build the OpenSecret token provider from the resolved [`AppConfig`]
+/// — the same session-seeded construction `fetch_account_summaries`
+/// uses for storage, so the realtime join JWT comes from the identical
+/// token source. Now async + session-threaded (was a bare empty-client
+/// `new`, the root cause of the "No refresh token available" failure).
+#[cfg(target_arch = "wasm32")]
+async fn build_opensecret_client(
+    config: &AppConfig,
+) -> Result<agicash_auth_opensecret::OpenSecretTokenProvider, String> {
+    use agicash_auth_opensecret::OpenSecretTokenProvider;
+
+    let client = session_seeded_opensecret_client(config).await?;
     Ok(OpenSecretTokenProvider::new(client))
 }
 
@@ -528,7 +593,7 @@ async fn fetch_account_summaries(
 ) -> Result<Vec<AccountSummary>, String> {
     use std::sync::Arc;
 
-    use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
+    use agicash_auth_opensecret::OpenSecretTokenProvider;
     use agicash_cashu::CashuSendSwapStorage;
     use agicash_domain::{AccountType, UserId};
     use agicash_storage_supabase::{
@@ -544,14 +609,15 @@ async fn fetch_account_summaries(
         );
     }
 
-    // OpenSecret-backed token provider: reuses the browser session's
-    // refresh token (in `window.localStorage` via `BrowserSessionStorage`),
-    // mints a fresh Supabase-compatible JWT per call.
-    let client = OpenSecretClient::new(OpenSecretConfig {
-        base_url: config.opensecret_base_url.clone(),
-        client_id: config.opensecret_client_id,
-    })
-    .map_err(|e| format!("build opensecret client: {e}"))?;
+    // OpenSecret-backed token provider over a client that has the
+    // browser session's refresh token threaded in (via
+    // `session_seeded_opensecret_client` → `BrowserSessionStorage` +
+    // `set_tokens` + `refresh`). A bare `OpenSecretClient::new` here was
+    // an empty in-memory session → `generate_third_party_token` failed
+    // with "No refresh token available" and black-holed every
+    // authenticated wallet load. Each `get_jwt` now mints a fresh
+    // Supabase-compatible JWT from the seeded session.
+    let client = session_seeded_opensecret_client(config).await?;
     let tokens: Arc<dyn TokenProvider> = Arc::new(OpenSecretTokenProvider::new(client));
 
     let storage = SupabaseStorage::new(
