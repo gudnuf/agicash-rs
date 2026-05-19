@@ -30,6 +30,7 @@ mod wasm_impl {
     /// (spec architecture) — composition is `from_config`, mapping is
     /// `convert`.
     #[wasm_bindgen]
+    #[derive(Debug)]
     pub struct AgicashWasmWallet {
         client: Arc<WalletClient>,
     }
@@ -207,6 +208,15 @@ mod wasm_impl {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::AgicashWasmWallet;
+
+// Re-export the wasm shell return types at the crate root so consumers
+// (the Leptos crate) can name `agicash_wasm::SendQuotePreviewWasm` etc.
+// Mirrors how the FFI crate re-exports its `*Ffi` records.
+#[cfg(target_arch = "wasm32")]
+pub use types::{
+    AccountWasm, AuthStatusWasm, ReceiveResultWasm, ReceiveStatusWasm, SendQuotePreviewWasm,
+    SendSwapHandleWasm, SessionWasm,
+};
 
 use wasm_bindgen::prelude::*;
 

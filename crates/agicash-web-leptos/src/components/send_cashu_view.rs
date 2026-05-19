@@ -20,33 +20,24 @@
 //!   failure       → error + Retry
 //! ```
 //!
-//! ## SDK boundary
+//! ## SDK boundary (12d: real)
 //!
-//! `agicash-cashu::send_swap::*` is **not wasm-clean** today because its
-//! storage trait pulls in `agicash-storage-supabase` which depends on
-//! `rustls` / `tokio-net` / `ring`. Porting it is a multi-day effort
-//! tracked separately as
-//! `docs/superpowers/specs/2026-05-17-storage-supabase-wasm-port-design.md`
-//! (sibling of the same blocker `feat/leptos-email-and-balance` hit when
-//! it shipped the home page with a direct Supabase REST account fetch).
+//! As of slice 12d the send path is **un-mocked** against the real
+//! `agicash-wasm` shell over `WalletClient::from_config` (the
+//! storage-supabase wasm port + the `AuthClient`/dep target-gates that
+//! made `agicash-wallet` wasm-buildable all landed):
+//!   - `on_continue` → `AgicashWasmWallet::prepare_send_quote` (real fee
+//!     breakdown from `CashuSendSwapService.get_quote`).
+//!   - `on_confirm`  → `AgicashWasmWallet::create_send_swap` (real V4
+//!     `cashuB…` token + real swap id; claimable by a real receiver).
+//!   - `mock_poll_claim` **stays mocked** (flips to `.completed` after
+//!     ~9 s / three 3 s ticks): it maps to the facade's
+//!     `check_send_swap_claimed`, which ships in **12b-3**. 12d depends
+//!     on 12b-1 ONLY — un-mocking the poll is explicit conditional
+//!     follow-up (see the `TODO[12b-3-dependent]` on `mock_poll_claim`).
 //!
-//! So this view ships with the **SDK boundary mocked**:
-//!   - `mock_prepare_send` returns a synthetic quote (1% sender fee, 0
-//!     receive fee — same shape the real `CashuSendSwapService.get_quote`
-//!     emits for sender-pays-fee mode).
-//!   - `mock_commit_send` returns a synthetic V4-ish token handle after a
-//!     1.5 s delay (matches the receive-flow's mock cadence). The token
-//!     is a deterministic-but-fake `cashuB...` string so we can render
-//!     truncation + copy + share UI; pasting it into a real receiver
-//!     will fail (no real mint output).
-//!   - `mock_poll_claim` flips to `.completed` after ~9 s on the share
-//!     screen (three poll ticks at 3 s cadence) so the demo flow exits
-//!     to the claimed state without operator intervention.
-//!
-//! Each mock site carries a `// TODO[slice-13]` marker pointing at the
-//! real call to swap in once the wasm port lands. The view geometry,
-//! state machine, and UX timings are real — only the network round-trips
-//! are synthetic.
+//! The view geometry, state machine, and UX timings are unchanged — only
+//! the data source moved from synthetic to real.
 //!
 //! ## Constraints
 //!
@@ -70,6 +61,7 @@ use leptos::task::spawn_local;
 use crate::components::{
     use_toast, Button, ButtonSize, ButtonVariant, Numpad, SharePayload, ShareSheet, ToastVariant,
 };
+use crate::config::AppConfig;
 use crate::tokens;
 
 // ---- View-model types -----------------------------------------------------
@@ -128,6 +120,14 @@ enum ClaimPoll {
 
 /// View phase. Direct port of iOS `SendCashuTokenView.Phase` with the
 /// inner payload types reshaped into the Rust view-model above.
+///
+/// `Confirming`/`Swapping`/`Share`/`Claimed` are constructed only on the
+/// real wasm path (12d: `cfg(target_arch = "wasm32")` — the browser is
+/// the only shipping target). The native `rlib` (workspace unit-test
+/// build) has no browser wallet so it constructs only the entry/error
+/// phases; the variants are still pattern-matched by the `view!` render
+/// arms. The `allow(dead_code)` is therefore native-only + honest.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 enum Phase {
     /// Numpad + Continue.
@@ -158,6 +158,14 @@ pub fn SendCashuView() -> impl IntoView {
     // inline truncated-token chip (doc.on.doc → checkmark for 1.5 s).
     let show_copied = RwSignal::new(false);
     let toast = use_toast();
+    // 12d: same config source LoginView / wallet_context use. Captured
+    // at component-body level (NOT inside spawn_local) per
+    // feedback_leptos_spawn_local_gotchas — `expect_context` returns
+    // None inside spawn_local. Held in a `StoredValue` (Copy) so the
+    // handler closures stay `Fn + Copy` (the reactive `match phase`
+    // render closure requires `FnMut`; a moved-in non-Copy `AppConfig`
+    // would make a handler `FnOnce` and break it).
+    let config = StoredValue::new(expect_context::<AppConfig>());
 
     // ---- Handlers (mirror iOS method names) ------------------------------
 
@@ -169,18 +177,39 @@ pub fn SendCashuView() -> impl IntoView {
             return;
         }
         phase.set(Phase::Quoting);
+        let config = config.get_value();
 
         spawn_local(async move {
-            // TODO[slice-13]: replace with
-            // `WalletClient::prepare_send_quote(amount, accountId, currency)`
-            // once the storage-supabase wasm port lands. Outcome mapping
-            // stays as-is: `Ok(quote)` → `Phase::Confirming(quote)`;
-            // `Err(msg)` → `Phase::Failure(msg)`.
-            #[cfg(feature = "hydrate")]
+            // 12d: real SDK boundary (was mock_prepare_send).
+            // `Ok(quote)` → `Phase::Confirming`; `Err(msg)` →
+            // `Phase::Failure`. Account/currency: v0 web has no
+            // chooser (None/None → wallet picks the BTC Cashu
+            // account), exactly the FFI `prepare_send_quote(amount,
+            // None, None)` shape.
+            #[cfg(target_arch = "wasm32")]
             {
-                gloo_timers::future::TimeoutFuture::new(800).await;
+                match agicash_wasm::AgicashWasmWallet::new(
+                    config.opensecret_base_url.clone(),
+                    config.opensecret_client_id.to_string(),
+                    config.supabase_url.clone(),
+                    config.supabase_anon_key.clone(),
+                ) {
+                    Ok(wallet) => match wallet.prepare_send_quote(amount, None, None).await {
+                        Ok(q) => phase.set(Phase::Confirming(quote_from_wasm(&q))),
+                        Err(e) => phase.set(Phase::Failure(js_err_string(&e))),
+                    },
+                    Err(e) => phase.set(Phase::Failure(js_err_string(&e))),
+                }
             }
-            phase.set(Phase::Confirming(mock_prepare_send(amount)));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Native rlib (unit tests): no browser wallet. Touch
+                // captured values so they aren't flagged unused.
+                let _ = (&config, amount);
+                phase.set(Phase::Failure(
+                    "wallet unavailable (native build)".to_string(),
+                ));
+            }
         });
     };
 
@@ -189,17 +218,40 @@ pub fn SendCashuView() -> impl IntoView {
             return;
         };
         phase.set(Phase::Swapping);
+        let config = config.get_value();
 
         spawn_local(async move {
-            // TODO[slice-13]: replace with
-            // `WalletClient::create_send_swap(quote)` once the wasm port
-            // lands. The view-model maps to `SendSwapHandle` directly.
-            #[cfg(feature = "hydrate")]
+            // 12d: real SDK boundary (was mock_commit_send). The
+            // facade re-derives the amount from its own quote path;
+            // the view passes the same amount it quoted (V4 always,
+            // verbatim the FFI `create_send_swap`).
+            #[cfg(target_arch = "wasm32")]
             {
-                gloo_timers::future::TimeoutFuture::new(1500).await;
+                match agicash_wasm::AgicashWasmWallet::new(
+                    config.opensecret_base_url.clone(),
+                    config.opensecret_client_id.to_string(),
+                    config.supabase_url.clone(),
+                    config.supabase_anon_key.clone(),
+                ) {
+                    Ok(wallet) => {
+                        match wallet
+                            .create_send_swap(quote.amount_to_send, None, None)
+                            .await
+                        {
+                            Ok(h) => phase.set(Phase::Share(handle_from_wasm(&h))),
+                            Err(e) => phase.set(Phase::Failure(js_err_string(&e))),
+                        }
+                    }
+                    Err(e) => phase.set(Phase::Failure(js_err_string(&e))),
+                }
             }
-            let handle = mock_commit_send(&quote);
-            phase.set(Phase::Share(handle));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = (&config, &quote);
+                phase.set(Phase::Failure(
+                    "wallet unavailable (native build)".to_string(),
+                ));
+            }
         });
     };
 
@@ -966,76 +1018,77 @@ fn truncate_token(s: &str) -> String {
     format!("{head}...{tail}")
 }
 
-// ---- Mocked SDK boundary --------------------------------------------------
+// ---- Real SDK boundary (12d) ----------------------------------------------
 //
-// TODO[slice-13]: each function below maps to a real wallet call once the
-// storage-supabase wasm port lands. Keeping them in one block so the swap
-// is mechanical:
-//   - mock_prepare_send  →  WalletClient::prepare_send_quote
-//   - mock_commit_send   →  WalletClient::create_send_swap
-//   - mock_poll_claim    →  WalletClient::check_send_swap_claimed
-//
-// The view-model types (`SendQuotePreview`, `SendSwapHandle`, `ClaimPoll`)
-// already match the real wallet's emit shape (see iOS `WalletViewModel`
-// `SendQuotePreview` / `SendSwapHandle` / `SendSwapClaimSnapshot` for the
-// canonical structures these will swap into).
+// `on_continue` → `AgicashWasmWallet::prepare_send_quote`,
+// `on_confirm`  → `AgicashWasmWallet::create_send_swap`.
+// The claim-poll (`mock_poll_claim`) stays mocked: it maps to the
+// facade's `check_send_swap_claimed`, which ships in **12b-3**. 12d
+// depends on 12b-1 ONLY (NOT 12b-3) — un-mocking the poll is explicit
+// conditional follow-up, not a 12d requirement (see TODO below).
 
-fn mock_prepare_send(amount: u64) -> SendQuotePreview {
-    // 1% sender fee, ceiling-divided so 50 sats still costs at least 1
-    // sat — same conservative upper bound the real
-    // `CashuSendSwapService.get_quote` returns for sender-pays-fee mode
-    // on small inputs. Receive fee 0 from sender's POV in the same mode.
-    // Integer math (no `f64` casts) avoids precision-loss + truncation
-    // lints; for the synthetic mock this is exactly what we want anyway.
-    let send_fee = amount.saturating_add(99) / 100;
-    let send_fee = send_fee.max(1);
+/// Parse a wasm-shell decimal amount string (e.g. `"100"`) into the
+/// view's `u64` minor-unit. The shell already normalized to the
+/// account's minor unit (sat/cent); a non-numeric value means the
+/// facade returned something unexpected — fall back to 0 so the UI
+/// renders a zero rather than panicking.
+#[cfg(target_arch = "wasm32")]
+fn wasm_amount_to_u64(s: &str) -> u64 {
+    s.trim().parse::<u64>().unwrap_or(0)
+}
+
+/// `agicash_wasm::SendQuotePreviewWasm` → the view's `SendQuotePreview`.
+/// `mint_url` is NOT on the wasm quote (note ◇: facade `SendTokenQuote`
+/// has no `mint_url`); the view's `SendQuotePreview` never carried it
+/// either, so this is a clean 1:1 of the fields the confirm card
+/// renders. `total` ← wasm `total_amount`; `send_fee`/`receive_fee` ←
+/// wasm `cashu_send_fee`/`cashu_receive_fee`.
+#[cfg(target_arch = "wasm32")]
+fn quote_from_wasm(q: &agicash_wasm::SendQuotePreviewWasm) -> SendQuotePreview {
     SendQuotePreview {
-        amount_to_send: amount,
-        send_fee,
-        receive_fee: 0,
-        total: amount.saturating_add(send_fee),
-        unit: "sats".to_string(),
+        amount_to_send: wasm_amount_to_u64(&q.amount_to_send),
+        send_fee: wasm_amount_to_u64(&q.cashu_send_fee),
+        receive_fee: wasm_amount_to_u64(&q.cashu_receive_fee),
+        total: wasm_amount_to_u64(&q.total_amount),
+        unit: q.unit.clone(),
     }
 }
 
-fn mock_commit_send(quote: &SendQuotePreview) -> SendSwapHandle {
-    // Deterministic-but-fake token shape — `cashuB` prefix + 72 bytes of
-    // hex-looking padding so the truncation + copy + share UI all render
-    // identically to a real V4 token. Real tokens are CBOR + base64url so
-    // this won't actually parse on the receiver side; that's fine, it's
-    // the mock.
-    let token = format!(
-        "cashuB{prefix}{filler}{suffix}",
-        prefix = "o2F0gaJhaWlAY2FzaHUuc3BhY2VhcIKjY3NlY",
-        filler = "X".repeat(48),
-        suffix = "ZW5kc2VuZG1vY2tfdXVpZA==",
-    );
+/// `agicash_wasm::SendSwapHandleWasm` → the view's `SendSwapHandle`.
+/// The receipt is field-complete (real V4 token + real swap id).
+#[cfg(target_arch = "wasm32")]
+fn handle_from_wasm(h: &agicash_wasm::SendSwapHandleWasm) -> SendSwapHandle {
     SendSwapHandle {
-        token,
-        swap_id: format!("mock-swap-{}-{}", quote.amount_to_send, mock_tick_id()),
-        amount: quote.amount_to_send,
-        unit: quote.unit.clone(),
+        token: h.token.clone(),
+        swap_id: h.swap_id.clone(),
+        amount: wasm_amount_to_u64(&h.amount),
+        unit: h.unit.clone(),
     }
+}
+
+/// `JsValue` error → display string. The wasm shell's
+/// `wallet_error_to_js` makes the message the `WalletError` Display
+/// string (the discriminator-bearing text the UI branches on, exactly
+/// as iOS parses the FFI string today).
+#[cfg(target_arch = "wasm32")]
+fn js_err_string(e: &wasm_bindgen::JsValue) -> String {
+    e.as_string()
+        .unwrap_or_else(|| "send failed (unknown error)".to_string())
 }
 
 fn mock_poll_claim(tick: u32) -> ClaimPoll {
-    // Flip to Completed on the third tick (≈ 9 s on the share screen).
-    // Matches the demo cadence in the lane brief without needing an
-    // operator to act on the receiver side.
+    // TODO[12b-3-dependent]: un-mock once `check_send_swap_claimed`
+    // lands in the facade (12b-3). 12d depends on 12b-1 ONLY — the
+    // claim-poll stays mocked here by design (D4). When 12b-3 merges,
+    // add `AgicashWasmWallet::checkSendSwapClaimed` (Task-9-style
+    // mini-task mirroring FFI `check_send_swap_claimed`) and replace
+    // this call. Flips to Completed on the third tick (≈ 9 s) so the
+    // demo share-screen flow still completes without a receiver acting.
     if tick >= 3 {
         ClaimPoll::Completed
     } else {
         ClaimPoll::Pending
     }
-}
-
-/// Tiny pseudo-ID used by `mock_commit_send` so two consecutive sends
-/// produce distinct `swap_ids` (needed so the polling Effect's
-/// cancellation guard sees the new id and stops watching the old one).
-fn mock_tick_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(1);
-    N.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---- Clipboard helper -----------------------------------------------------
@@ -1089,8 +1142,7 @@ fn copy_to_clipboard(
 #[cfg(test)]
 mod tests {
     use super::{
-        display_amount, format_amount, mock_poll_claim, mock_prepare_send, parsed_amount,
-        truncate_token, ClaimPoll,
+        display_amount, format_amount, mock_poll_claim, parsed_amount, truncate_token, ClaimPoll,
     };
 
     #[test]
@@ -1145,22 +1197,6 @@ mod tests {
         assert!(truncated.starts_with("cashuBAAAAAA"));
         assert!(truncated.ends_with("AAAAAAAA"));
         assert!(truncated.contains("..."));
-    }
-
-    #[test]
-    fn mock_quote_uses_1pct_fee_floor_1() {
-        let q = mock_prepare_send(100);
-        assert_eq!(q.amount_to_send, 100);
-        assert_eq!(q.send_fee, 1);
-        assert_eq!(q.total, 101);
-        assert_eq!(q.receive_fee, 0);
-    }
-
-    #[test]
-    fn mock_quote_scales_fee() {
-        let q = mock_prepare_send(10_000);
-        assert_eq!(q.send_fee, 100);
-        assert_eq!(q.total, 10_100);
     }
 
     #[test]

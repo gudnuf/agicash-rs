@@ -66,6 +66,11 @@ agicash-storage-supabase = { path = "../agicash-storage-supabase" }
 # after the storage-supabase port.
 agicash-cashu = { path = "../agicash-cashu" }
 agicash-money = { path = "../agicash-money" }
+# The wasm-bindgen wallet shell (slice 12d) over WalletClient::from_config.
+# Replaces the mocked SDK boundary in send_cashu_view /
+# cashu_token_paste_view. `AgicashWasmWallet` is `cfg(target_arch="wasm32")`;
+# the native rlib build only sees the version fn (call sites are gated).
+agicash-wasm = { path = "../agicash-wasm" }
 # Supabase Realtime client (slice 10). Leptos links the crate directly
 # (no FFI) — it drives the balance refresh, replacing the deleted
 # `start_visibility_refresh` visibilitychange/focus/poll Tier-1 hack.

@@ -6,19 +6,20 @@
 //! affordance on the field label, inline destructive error line under the
 //! textarea, primary "Receive" button at the bottom).
 //!
-//! Phase 1 partial behaviour:
+//! Behaviour (12d: receive un-mocked):
 //!   - The textarea + `Preview` button parse the token client-side using
 //!     `cdk::nuts::Token::from_str` (wasm-clean — no network).
-//!   - The `Receive` button is MOCKED: it spawns a 1.5s sleep on wasm
-//!     (`gloo_timers::future::TimeoutFuture`) and then transitions to
-//!     the success card. Slice 12 will replace the sleep with a real
-//!     `WalletClient::receive_cashu_token` call — see the
-//!     `// TODO[slice-12]` markers below.
-//!   - "Mint already added?" is mocked against a hard-coded list of
-//!     well-known mints (`KNOWN_MINTS`). When the user pastes a token
-//!     from an unknown mint we surface an "Add mint first?" CTA that
-//!     navigates to `/accounts/add-mint` (route not yet implemented;
-//!     L2/another slice owns it).
+//!   - The `Receive` button is **real** as of slice 12d: it calls
+//!     `AgicashWasmWallet::receive_token(preview.raw)` over the
+//!     `WalletClient::from_config` core. `Ok` → success card, `Err` →
+//!     inline error (edit + retry).
+//!   - "Mint already added?" remains a **pure client-side UX hint**
+//!     against `KNOWN_MINTS` (the unknown-mint "Add mint first?" CTA).
+//!     The real `receive_token` handles unknown mints per the facade's
+//!     one-shot semantics — no pre-check gates the receive. Replacing
+//!     this hint with an interactive add-mint confirmation against the
+//!     real account list is **12c receive-flow scope**, NOT 12d (see
+//!     the `TODO[12c-receive-flow]` markers below).
 
 // The view body is long but linear; splitting into private sub-components
 // would just add indirection without reuse benefit.
@@ -31,14 +32,17 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_navigate;
 
+use crate::config::AppConfig;
 use crate::tokens;
 
-/// Well-known mints we consider "already added" for the mocked preview.
-/// Real check needs `WalletClient::list_accounts()` from slice 12.
+/// Well-known mints used for the client-side "already added?" UX hint.
+/// Pure presentational — the real `receive_token` (12d) does NOT gate
+/// on this; it handles unknown mints itself.
 //
-// TODO[slice-12]: replace with `WalletClient::accounts()` lookup so the
-// CTA reflects the actual user account list rather than a hard-coded
-// allowlist.
+// TODO[12c-receive-flow]: replace this hard-coded allowlist with a real
+// `AgicashWasmWallet::listAccounts()` lookup + interactive add-mint
+// confirmation. That is 12c receive-flow scope, NOT 12d (12d depends on
+// 12b-1 only and does not touch the receive-flow orchestrator).
 const KNOWN_MINTS: &[&str] = &[
     "https://nofees.testnut.cashu.space",
     "https://mint.minibits.cash/Bitcoin",
@@ -51,19 +55,20 @@ const KNOWN_MINTS: &[&str] = &[
 /// because the cdk type isn't `Clone` on every variant we care about.
 #[derive(Clone, Debug)]
 struct TokenPreview {
-    /// Original encoded token string. Held so slice 12 can pass it
-    /// straight into `WalletClient::receive_cashu_token(&preview.raw)`
-    /// without re-asking the user to paste. Read-after-write only there;
-    /// the preview/success cards render derived fields below.
-    //
-    // TODO[slice-12]: read by the real receive call.
+    /// Original encoded token string. Passed straight into
+    /// `AgicashWasmWallet::receive_token(preview.raw)` (12d) without
+    /// re-asking the user to paste; the preview/success cards render the
+    /// derived fields below. `#[allow(dead_code)]` retained: the real
+    /// read is inside the `cfg(target_arch = "wasm32")` receive block,
+    /// so the native `rlib` (unit-test) build only writes this field.
     #[allow(dead_code)]
     raw: String,
     amount: u64,
     unit: String,
     mint_url: String,
     memo: Option<String>,
-    /// True iff `mint_url` is in `KNOWN_MINTS`. Mocked; see slice-12 TODO.
+    /// True iff `mint_url` is in `KNOWN_MINTS`. Client-side UX hint
+    /// only; see the `TODO[12c-receive-flow]` on `KNOWN_MINTS`.
     mint_known: bool,
 }
 
@@ -81,6 +86,14 @@ struct ReceiveResult {
 /// chrome that gives a continuous "receive" affordance; the web flow
 /// needs an explicit Preview so the user sees what they're about to
 /// claim before committing).
+///
+/// `Success` is constructed only on the real wasm receive path (12d:
+/// `cfg(target_arch = "wasm32")` — the browser is the only shipping
+/// target). The native `rlib` (workspace unit-test build) has no
+/// browser wallet so it constructs only entry/preview/working/error;
+/// the variant is still pattern-matched by the `view!` render arms. The
+/// `allow(dead_code)` is therefore native-only + honest.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 enum Phase {
     /// User is editing the textarea. No preview yet.
@@ -100,6 +113,12 @@ enum Phase {
 #[component]
 pub fn CashuTokenPasteView() -> impl IntoView {
     let navigate = use_navigate();
+    // 12d: same config source LoginView / wallet_context use. Captured
+    // at component-body level (NOT inside spawn_local) per
+    // feedback_leptos_spawn_local_gotchas. Held in a `StoredValue`
+    // (Copy) so the `on_receive` handler stays `Fn + Copy` — the
+    // reactive `match phase` render closure requires `FnMut`.
+    let config = StoredValue::new(expect_context::<AppConfig>());
 
     let token_text = RwSignal::new(String::new());
     let phase: RwSignal<Phase> = RwSignal::new(Phase::Entry);
@@ -152,32 +171,56 @@ pub fn CashuTokenPasteView() -> impl IntoView {
     };
 
     let on_receive = move |_ev| {
-        // Snapshot the preview so we can route to Success regardless of
-        // what the user types during the mocked delay.
+        // Snapshot the preview so we can route to Success regardless
+        // of what the user types during the receive round-trip.
         let Phase::Preview(preview) = phase.get() else {
             return;
         };
         phase.set(Phase::Working(preview.clone()));
+        let config = config.get_value();
 
         spawn_local(async move {
-            // TODO[slice-12]: replace the simulated delay below with a
-            // real `WalletClient::receive_cashu_token(&preview.raw)`
-            // call. The success and error branches will map to the
-            // existing `Phase::Success` / `Phase::Error` transitions.
-            #[cfg(feature = "hydrate")]
+            // 12d: real SDK boundary (was a 1.5 s mock sleep).
+            // `Ok` → `Phase::Success`; `Err(msg)` → `Phase::Error`
+            // (user can edit + retry). The facade handles unknown
+            // mints per its one-shot semantics — no `KNOWN_MINTS`
+            // pre-check (that mocked preview is a pure UX hint;
+            // interactive add-mint confirmation is 12c receive-flow
+            // scope, NOT implemented here).
+            #[cfg(target_arch = "wasm32")]
             {
-                gloo_timers::future::TimeoutFuture::new(1500).await;
+                match agicash_wasm::AgicashWasmWallet::new(
+                    config.opensecret_base_url.clone(),
+                    config.opensecret_client_id.to_string(),
+                    config.supabase_url.clone(),
+                    config.supabase_anon_key.clone(),
+                ) {
+                    Ok(wallet) => match wallet.receive_token(preview.raw.clone()).await {
+                        Ok(r) => phase.set(Phase::Success(ReceiveResult {
+                            amount: r.amount.trim().parse::<u64>().unwrap_or(0),
+                            unit: r.unit.clone(),
+                            mint_url: r.mint_url.clone(),
+                        })),
+                        Err(e) => phase.set(Phase::Error(
+                            e.as_string()
+                                .unwrap_or_else(|| "receive failed".to_string()),
+                        )),
+                    },
+                    Err(e) => phase.set(Phase::Error(
+                        e.as_string()
+                            .unwrap_or_else(|| "receive failed".to_string()),
+                    )),
+                }
             }
-            // SSR path: there's no browser to spin; transition synchronously
-            // so the type-checker is happy. This branch never executes in
-            // practice because Routes don't render to interactive HTML on
-            // first paint in our SSR setup — but cargo still has to
-            // compile it.
-            phase.set(Phase::Success(ReceiveResult {
-                amount: preview.amount,
-                unit: preview.unit.clone(),
-                mint_url: preview.mint_url.clone(),
-            }));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Native rlib (unit tests): no browser wallet. Touch
+                // captured values so they aren't flagged unused.
+                let _ = &config;
+                phase.set(Phase::Error(
+                    "wallet unavailable (native build)".to_string(),
+                ));
+            }
         });
     };
 
@@ -191,9 +234,10 @@ pub fn CashuTokenPasteView() -> impl IntoView {
     let on_add_mint = {
         let navigate = navigate.clone();
         move |_ev| {
-            // TODO[slice-12]: real route exists once the accounts UI
-            // lands. For now this is a placeholder so the CTA goes
-            // somewhere intentional rather than no-op'ing.
+            // TODO[12c-receive-flow]: real add-mint route + interactive
+            // confirmation lands with the 12c receive-flow work. For now
+            // this is a placeholder so the CTA goes somewhere
+            // intentional rather than no-op'ing (not a 12d concern).
             navigate(
                 "/accounts/add-mint",
                 leptos_router::NavigateOptions::default(),
