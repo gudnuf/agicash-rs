@@ -293,4 +293,78 @@ mod tests {
         assert!(*auth.logout_called.lock().unwrap());
         assert!(auth.get_session().await.unwrap().is_none());
     }
+
+    /// Auth fake whose `set_session` succeeds (isolate the persist path).
+    #[derive(Debug, Default)]
+    struct OkSetSessionAuth {
+        slot: Mutex<Option<Session>>,
+    }
+
+    #[async_trait]
+    impl AuthClient for OkSetSessionAuth {
+        async fn register_guest(&self) -> Result<Session, WalletError> {
+            unimplemented!()
+        }
+        async fn login_email(&self, _e: &str, _p: &str) -> Result<Session, WalletError> {
+            unimplemented!()
+        }
+        async fn register_email(
+            &self,
+            _e: &str,
+            _p: &str,
+            _n: Option<&str>,
+        ) -> Result<Session, WalletError> {
+            unimplemented!()
+        }
+        async fn logout(&self) -> Result<(), WalletError> {
+            Ok(())
+        }
+        async fn set_session(&self, s: Session) -> Result<(), WalletError> {
+            *self.slot.lock().unwrap() = Some(s);
+            Ok(())
+        }
+        async fn get_session(&self) -> Result<Option<Session>, WalletError> {
+            Ok(self.slot.lock().unwrap().clone())
+        }
+        async fn cashu_seed(&self) -> Result<[u8; 64], WalletError> {
+            unimplemented!()
+        }
+    }
+
+    /// Storage fake that records `store` calls and ALWAYS errors on store.
+    #[derive(Debug, Default)]
+    struct ErroringStoreStorage {
+        store_called: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl SessionStorage for ErroringStoreStorage {
+        async fn store(&self, _s: &PersistedSession) -> Result<(), agicash_traits::AuthError> {
+            *self.store_called.lock().unwrap() = true;
+            Err(agicash_traits::AuthError::Internal("keystore write failed".into()))
+        }
+        async fn load(&self) -> Result<Option<PersistedSession>, agicash_traits::AuthError> {
+            Ok(None)
+        }
+        async fn clear(&self) -> Result<(), agicash_traits::AuthError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn set_session_success_persists_through_and_swallows_store_error() {
+        let storage = Arc::new(ErroringStoreStorage::default());
+        let contract = SessionContract::with_storage(
+            Arc::new(OkSetSessionAuth::default()),
+            storage.clone(),
+        );
+        let s = Session { user_id: UserId::new(), refresh_token: "fresh".into() };
+
+        let res = contract.set_session(s).await;
+
+        // INV-4: persist was attempted...
+        assert!(*storage.store_called.lock().unwrap());
+        // ...but a store failure must NOT fail the call (session usable in-mem).
+        assert!(res.is_ok());
+    }
 }
