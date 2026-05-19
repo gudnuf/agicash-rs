@@ -50,6 +50,7 @@ pub mod builder;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod opensecret_auth;
 pub mod types;
 
 pub use auth::{AuthClient, Session};

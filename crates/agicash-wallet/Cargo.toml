@@ -18,12 +18,14 @@ agicash-storage-supabase = { path = "../agicash-storage-supabase" }
 async-trait = { workspace = true }
 cdk = { workspace = true }
 chrono = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
