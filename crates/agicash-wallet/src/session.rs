@@ -180,6 +180,7 @@ impl SessionContract {
 mod tests {
     use super::*;
     use crate::auth::Session;
+    use crate::discriminator::AuthErrorCode;
     use agicash_domain::UserId;
     use async_trait::async_trait;
     use std::sync::Mutex;
@@ -212,7 +213,10 @@ mod tests {
             unimplemented!()
         }
         async fn logout(&self) -> Result<(), WalletError> {
-            Err(WalletError::Auth("server 500 on logout".into()))
+            Err(WalletError::Auth {
+                code: AuthErrorCode::Backend,
+                message: "server 500 on logout".into(),
+            })
         }
         async fn set_session(&self, _s: Session) -> Result<(), WalletError> {
             unimplemented!()
@@ -329,7 +333,10 @@ mod tests {
         async fn set_session(&self, s: Session) -> Result<(), WalletError> {
             *self.slot.lock().unwrap() = Some(s);
             // Refresh fails → contract must clear the slot + bubble this error.
-            Err(WalletError::Auth("refresh_token: 401 token revoked".into()))
+            Err(WalletError::Auth {
+                code: AuthErrorCode::Backend,
+                message: "refresh_token: 401 token revoked".into(),
+            })
         }
         async fn get_session(&self) -> Result<Option<Session>, WalletError> {
             Ok(self.slot.lock().unwrap().clone())
@@ -351,7 +358,10 @@ mod tests {
         let res = contract.set_session(s).await;
 
         // Original refresh error is surfaced (not swallowed).
-        assert!(matches!(res, Err(WalletError::Auth(ref m)) if m.contains("token revoked")));
+        assert!(matches!(
+            res,
+            Err(WalletError::Auth { ref message, .. }) if message.contains("token revoked")
+        ));
         // INV-2: the slot was cleared (contract called inner logout).
         assert!(*auth.logout_called.lock().unwrap());
         assert!(auth.get_session().await.unwrap().is_none());
