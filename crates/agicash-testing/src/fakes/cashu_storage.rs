@@ -264,12 +264,9 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
             // under its row lock; without this, a Tier-2 second send on the
             // same account replays counter 0 and the real mint rejects the
             // blinded message ("already signed").
-            let outputs: u32 = input
-                .output_amounts
-                .as_ref()
-                .map_or(0, |o| {
-                    u32::try_from(o.send.len() + o.change.len()).unwrap_or(u32::MAX)
-                });
+            let outputs: u32 = input.output_amounts.as_ref().map_or(0, |o| {
+                u32::try_from(o.send.len() + o.change.len()).unwrap_or(u32::MAX)
+            });
             let mut counters = self.keyset_counter.lock();
             let slot = counters.entry(input.account_id.as_uuid()).or_insert(0);
             let start = *slot;

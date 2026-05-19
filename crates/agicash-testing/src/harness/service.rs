@@ -59,7 +59,6 @@ const JWT_SECRET: &str = "super-secret-jwt-token-with-at-least-32-characters-lon
 /// shared mint (a replayed blinded message is rejected by the real mint).
 static FUND_SEED_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-
 // ---------------------------------------------------------------------------
 // MintProcess — Task 4
 // ---------------------------------------------------------------------------
@@ -132,9 +131,8 @@ impl MintProcess {
                 );
                 // A throwaway tempdir keeps the field type uniform; it is
                 // unused (we attached, not spawned) and auto-cleans.
-                let state_dir = tempfile::tempdir().map_err(|e| {
-                    format!("MintProcess: tempdir (attach placeholder): {e}")
-                })?;
+                let state_dir = tempfile::tempdir()
+                    .map_err(|e| format!("MintProcess: tempdir (attach placeholder): {e}"))?;
                 let state_dir_path = state_dir.path().to_path_buf();
                 return Ok(Self {
                     child: None, // attached → Drop must NOT kill it
@@ -786,16 +784,15 @@ fn token_proofs(proofs: &[cdk::nuts::Proof]) -> Vec<agicash_cashu::TokenProof> {
 /// auto-settle, real `post_mint`, real `construct_proofs`). Returns the
 /// real `cdk::Proof`s (map to `TokenProof` via [`token_proofs`] for
 /// `fund_account`; keep the raw form for protocol-level NUT-07 checks).
-async fn mint_real_proofs(
-    mint_url: &str,
-    amount: u64,
-) -> Result<Vec<cdk::nuts::Proof>, String> {
+async fn mint_real_proofs(mint_url: &str, amount: u64) -> Result<Vec<cdk::nuts::Proof>, String> {
     use std::str::FromStr;
 
     use cdk::amount::{FeeAndAmounts, SplitTarget};
     use cdk::dhke::construct_proofs;
     use cdk::mint_url::MintUrl;
-    use cdk::nuts::{CurrencyUnit, MintQuoteBolt11Request, MintRequest, PaymentMethod, PreMintSecrets};
+    use cdk::nuts::{
+        CurrencyUnit, MintQuoteBolt11Request, MintRequest, PaymentMethod, PreMintSecrets,
+    };
     use cdk::wallet::{HttpClient, MintConnector};
     use cdk::Amount;
 
@@ -893,8 +890,13 @@ async fn mint_real_proofs(
         .get_mint_keyset(keyset_id)
         .await
         .map_err(|e| format!("get_mint_keyset: {e}"))?;
-    let proofs = construct_proofs(resp.signatures, pre_mint.rs(), pre_mint.secrets(), &keyset.keys)
-        .map_err(|e| format!("construct_proofs: {e}"))?;
+    let proofs = construct_proofs(
+        resp.signatures,
+        pre_mint.rs(),
+        pre_mint.secrets(),
+        &keyset.keys,
+    )
+    .map_err(|e| format!("construct_proofs: {e}"))?;
 
     Ok(proofs)
 }

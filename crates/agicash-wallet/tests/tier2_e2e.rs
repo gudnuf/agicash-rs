@@ -382,9 +382,7 @@ mod e2e {
         // payment-hash dedup is covered by `agicash-storage-supabase`'s
         // own real-supabase gate.)
         match w.begin_send_lightning(None, invoice.clone()).await {
-            Err(e) => eprintln!(
-                "[tier2]   second begin_send_lightning -> Err (fake-seam): {e:?}"
-            ),
+            Err(e) => eprintln!("[tier2]   second begin_send_lightning -> Err (fake-seam): {e:?}"),
             Ok(s) => eprintln!(
                 "[tier2]   second begin_send_lightning -> {s:?} (fake-storage \
                  bookkeeping; the real no-double-pay invariant is the NUT-07 \

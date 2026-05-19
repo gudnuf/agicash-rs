@@ -555,11 +555,8 @@ mod gated {
         // this is past account resolution (not `no-matching-account`).
         session.add_test_mint();
 
-        let post_mint_cases: &[(&str, &[&str], &str)] = &[(
-            "send empty wallet",
-            &["send", "token", "100"],
-            "mint-error",
-        )];
+        let post_mint_cases: &[(&str, &[&str], &str)] =
+            &[("send empty wallet", &["send", "token", "100"], "mint-error")];
 
         for (label, args, expected_code) in post_mint_cases {
             let out = session
