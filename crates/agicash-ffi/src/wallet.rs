@@ -23,8 +23,7 @@ use crate::receive_flow::{OpenSecretSeedProvider, ReceiveFlow};
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
 use agicash_auth_opensecret::{
-    auth_error_from_opensecret, logout, register_email, OpenSecretClient, OpenSecretConfig,
-    OpenSecretTokenProvider,
+    auth_error_from_opensecret, logout, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
 };
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
@@ -527,15 +526,19 @@ impl AgicashWallet {
         password: String,
         name: Option<String>,
     ) -> Result<Session, FfiError> {
-        let resp =
-            register_email(&self.client, email, password, self.client.client_id(), name).await?;
+        let s = self
+            .facade
+            .auth_signup(&email, &password, name.as_deref())
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
+        // §6 carve-out (note ‡): mirror into the shell-resident slot.
         let persisted = PersistedSession {
-            user_id: resp.id,
-            refresh_token: resp.refresh_token.clone(),
+            user_id: s.user_id.as_uuid(),
+            refresh_token: s.refresh_token.clone(),
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        Ok(persisted.into())
+        Ok(crate::convert::session_from_facade(s))
     }
 
     /// Best-effort server logout. Always clears the in-memory session even
