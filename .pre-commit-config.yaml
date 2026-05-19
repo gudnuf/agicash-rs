@@ -3,11 +3,11 @@
 # Runner: `prek` (pre-commit-compatible, Rust). Reads this file.
 #
 # DESIGN CONSTRAINT: commits must stay FAST. The pre-commit stage does NO
-# compilation — only `cargo fmt --check` (parse-only, no build) plus cheap
-# text hygiene implemented as pure-shell `language: system` hooks. Heavy
-# checks (clippy/build/test) stay on CI; clippy ALSO runs at the pre-push
-# stage so a push that would fail CI is caught locally without slowing
-# down `git commit`.
+# compilation — only `rustfmt --check` on the staged .rs files
+# (parse-only, no build) plus cheap text hygiene implemented as
+# pure-shell `language: system` hooks. Heavy checks (clippy/build/test)
+# stay on CI; clippy ALSO runs at the pre-push stage so a push that would
+# fail CI is caught locally without slowing down `git commit`.
 #
 # Why the hygiene hooks are local shell, not the upstream
 # pre-commit/pre-commit-hooks repo: those hooks are Python and prek builds
@@ -60,15 +60,20 @@ repos:
         stages: [pre-commit]
 
       # ---- Rust formatting (parse-only, NO compile -> fast) ------------
-      - id: cargo-fmt
-        name: cargo fmt --check (crates workspace)
+      # Checks ONLY the staged .rs files (not `cargo fmt --all`), so a
+      # contributor is blocked for code THEY are introducing, not for the
+      # pre-existing formatting drift already on master (which would
+      # otherwise wedge every concurrent contributor's commits). CI still
+      # runs the authoritative workspace-wide `cargo fmt --all --check`.
+      - id: rustfmt-staged
+        name: rustfmt --check (staged .rs files)
         description: >-
-          Rejects unformatted Rust. Mirrors CI `cd crates && cargo fmt
-          --all --check`. rustfmt only parses; it does not compile.
+          Rejects newly-introduced unformatted Rust. Same formatter CI
+          uses (rustfmt, edition 2021); rustfmt only parses, no compile.
         language: system
-        entry: cargo fmt --manifest-path crates/Cargo.toml --all --check --
+        entry: tools/dev/hooks/rustfmt-staged.sh
         types: [rust]
-        pass_filenames: false
+        pass_filenames: true
         stages: [pre-commit]
 
       # ---- clippy at PRE-PUSH only (never pre-commit) -----------------
