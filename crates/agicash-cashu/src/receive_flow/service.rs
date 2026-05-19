@@ -814,4 +814,77 @@ mod tests {
         assert_eq!(r.status, ReceiveStatus::Received);
         assert_eq!(r.amount, "64");
     }
+
+    // ---- P0-4 invariant guards (12c characterization) ----------------
+    //
+    // These pin the two invariants 12c MUST preserve verbatim while it
+    // EXPOSES the existing receive-flow machine through the facade.
+    // They assert at the `ReceiveFlowMachine` layer (the sans-IO state
+    // machine `ReceiveFlowService` drives) so the guard is deterministic
+    // and network-free — `ReceiveFlowService::dispatch(Start)` cannot be
+    // used here because `ParsedToken::parse` performs a real
+    // `get_mint_keysets` network call (verified `receive_swap/service.rs`
+    // `ParsedToken::parse`), which would make the guard non-deterministic
+    // offline. The `accepts()` event-guard and `AlreadyClaimedInfo`
+    // shape ARE the P0-4 contract; pinning them here is the precise,
+    // non-flaky encoding of the same invariant the plan targets.
+
+    /// P0-4 INVARIANT GUARD #1 (`accepts()` event-guard): from
+    /// `NeedsMintConfirmation` the machine accepts ONLY
+    /// `ConfirmAddMint`/`CancelAddMint` and REJECTS `Start` (an
+    /// unknown-mint token pauses for interactive confirmation — it does
+    /// NOT hard-error or accept a re-`Start` the way a flat one-shot
+    /// would). This is the exact behavior 12c exposes through the
+    /// facade accessor; it must survive the add-mint extraction
+    /// untouched.
+    #[test]
+    fn p0_4_needs_mint_confirmation_accepts_confirm_cancel_only() {
+        use crate::receive_flow::state::ReceiveFlowMachine;
+        let mut m = ReceiveFlowMachine::new();
+        m.transition(ReceiveFlowState::NeedsMintConfirmation(MintConfirmation {
+            mint_url: "https://m.example".into(),
+            mint_name: "Mint".into(),
+            unit: "sat".into(),
+            currency: "BTC".into(),
+            amount: "100".into(),
+            fee: "0".into(),
+        }));
+        assert!(
+            m.accepts(&ReceiveFlowEvent::ConfirmAddMint),
+            "NeedsMintConfirmation must accept ConfirmAddMint (P0-4)"
+        );
+        assert!(
+            m.accepts(&ReceiveFlowEvent::CancelAddMint),
+            "NeedsMintConfirmation must accept CancelAddMint (P0-4)"
+        );
+        assert!(
+            !m.accepts(&ReceiveFlowEvent::Start { token: "x".into() }),
+            "NeedsMintConfirmation must REJECT Start (P0-4 accepts guard)"
+        );
+    }
+
+    /// P0-4 INVARIANT GUARD #2 (`AlreadyClaimed` carries NO amount): the
+    /// idempotent re-paste path surfaces
+    /// `ReceiveFlowState::AlreadyClaimed(AlreadyClaimedInfo)` and
+    /// `AlreadyClaimedInfo` has NO `amount` field (compile-time proof
+    /// via the exhaustive struct literal + a serialized-form assertion).
+    #[test]
+    fn p0_4_already_claimed_info_has_no_amount_field() {
+        // Compile-time proof: this names EVERY field of
+        // AlreadyClaimedInfo. If an `amount` field were added this stops
+        // compiling (the literal would be missing a field).
+        let info = AlreadyClaimedInfo {
+            unit: "sat".into(),
+            currency: "BTC".into(),
+            account_id: "a".into(),
+            mint_url: "https://m".into(),
+            token_hash: "h".into(),
+        };
+        let s = ReceiveFlowState::AlreadyClaimed(info);
+        let j = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            !j.contains("\"amount\""),
+            "AlreadyClaimed must carry NO amount (P0-4); json was {j}"
+        );
+    }
 }
