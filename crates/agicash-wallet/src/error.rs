@@ -16,7 +16,7 @@
 //! `remove_mint`, transaction history) returns it with a stable string
 //! prefix the caller can match on.
 
-use crate::discriminator::AuthErrorCode;
+use crate::discriminator::{AuthErrorCode, CashuDiscriminator};
 use agicash_cashu::{
     MeltQuoteError, MintQuoteError, ReceiveFlowError, ReceiveSwapError, SendSwapError,
 };
@@ -58,6 +58,18 @@ pub enum WalletError {
     /// `MeltQuoteError`, `CashuProviderError`, `ReceiveFlowError`.
     #[error("cashu error: {0}")]
     Cashu(String),
+
+    /// A cashu failure that carries a *named* discriminator the
+    /// consumer must branch on (P0-3): `DUPLICATE_PAYMENT` ("resume,
+    /// do NOT re-quote"), DLEQ-failed (malicious mint), etc. Distinct
+    /// from the flat `Cashu(String)` so a consumer can match the
+    /// signal without string-sniffing. Retry classification is
+    /// unchanged vs. 12a (see `retry_policy`).
+    #[error("cashu error [{discriminator:?}]: {message}")]
+    CashuTyped {
+        discriminator: CashuDiscriminator,
+        message: String,
+    },
 
     /// Transport/connectivity failure (DNS, timeout, connection reset,
     /// offline mint). Retry-able with backoff. Spec §11 `Network`.
@@ -115,7 +127,29 @@ impl WalletError {
             Self::Network(_) | Self::Concurrency(_) => {
                 RetryPolicy::ExponentialBackoff { max_attempts: 3 }
             }
+            // P0-3: DuplicatePayment/QuoteExpired were Concurrency
+            // (retryable) under 12a — preserve that exact policy now
+            // that they carry a name. DLEQ/InsufficientBalance were
+            // Cashu (Never) — preserve that too.
+            Self::CashuTyped { discriminator, .. } => match discriminator {
+                CashuDiscriminator::DuplicatePayment | CashuDiscriminator::QuoteExpired => {
+                    RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+                }
+                CashuDiscriminator::DleqVerificationFailed
+                | CashuDiscriminator::InsufficientBalance => RetryPolicy::Never,
+            },
             _ => RetryPolicy::Never,
+        }
+    }
+
+    /// The named cashu signal a consumer branches on, or `None` for a
+    /// flat/non-cashu error. P0-3 — restores the FFI `DUPLICATE_PAYMENT`
+    /// / `DLEQ verification failed` discriminators.
+    #[must_use]
+    pub fn cashu_discriminator(&self) -> Option<CashuDiscriminator> {
+        match self {
+            Self::CashuTyped { discriminator, .. } => Some(*discriminator),
+            _ => None,
         }
     }
 }
@@ -171,6 +205,10 @@ impl From<ReceiveSwapError> for WalletError {
         match e {
             // delegate to the wrapped provider's classification
             ReceiveSwapError::Mint(p) => p.into(),
+            e @ ReceiveSwapError::DleqVerificationFailed(_) => Self::CashuTyped {
+                discriminator: CashuDiscriminator::DleqVerificationFailed,
+                message: e.to_string(),
+            },
             // no own state-moved variant → no Concurrency arm
             other => Self::Cashu(other.to_string()),
         }
@@ -181,6 +219,14 @@ impl From<SendSwapError> for WalletError {
     fn from(e: SendSwapError) -> Self {
         match e {
             SendSwapError::Mint(p) => p.into(),
+            e @ SendSwapError::InsufficientBalance { .. } => Self::CashuTyped {
+                discriminator: CashuDiscriminator::InsufficientBalance,
+                message: e.to_string(),
+            },
+            e @ SendSwapError::DleqVerificationFailed(_) => Self::CashuTyped {
+                discriminator: CashuDiscriminator::DleqVerificationFailed,
+                message: e.to_string(),
+            },
             // no own state-moved variant → no Concurrency arm
             other => Self::Cashu(other.to_string()),
         }
@@ -192,7 +238,10 @@ impl From<MintQuoteError> for WalletError {
         match e {
             MintQuoteError::Mint(p) => p.into(),
             // quote expired between read & write → retry after re-fetch
-            e @ MintQuoteError::QuoteExpired => Self::Concurrency(e.to_string()),
+            e @ MintQuoteError::QuoteExpired => Self::CashuTyped {
+                discriminator: CashuDiscriminator::QuoteExpired,
+                message: e.to_string(),
+            },
             other => Self::Cashu(other.to_string()),
         }
     }
@@ -202,11 +251,22 @@ impl From<MeltQuoteError> for WalletError {
     fn from(e: MeltQuoteError) -> Self {
         match e {
             MeltQuoteError::Mint(p) => p.into(),
-            // in-flight conflict surfaced from a unique-index race, and
-            // invoice expired before melt initiated → both are state-moved
-            e @ (MeltQuoteError::DuplicatePayment | MeltQuoteError::QuoteExpired) => {
-                Self::Concurrency(e.to_string())
-            }
+            e @ MeltQuoteError::DuplicatePayment => Self::CashuTyped {
+                discriminator: CashuDiscriminator::DuplicatePayment,
+                message: e.to_string(),
+            },
+            e @ MeltQuoteError::QuoteExpired => Self::CashuTyped {
+                discriminator: CashuDiscriminator::QuoteExpired,
+                message: e.to_string(),
+            },
+            e @ MeltQuoteError::InsufficientBalance { .. } => Self::CashuTyped {
+                discriminator: CashuDiscriminator::InsufficientBalance,
+                message: e.to_string(),
+            },
+            e @ MeltQuoteError::DleqVerificationFailed(_) => Self::CashuTyped {
+                discriminator: CashuDiscriminator::DleqVerificationFailed,
+                message: e.to_string(),
+            },
             other => Self::Cashu(other.to_string()),
         }
     }
@@ -357,10 +417,25 @@ mod tests {
     }
 
     #[test]
-    fn mintquote_expired_maps_to_concurrency() {
+    fn mintquote_expired_is_cashutyped_with_12a_retry_policy() {
+        // 12b-2 P0-3: MintQuoteError::QuoteExpired now routes to the
+        // named CashuTyped { QuoteExpired }; 12a retry policy preserved.
         let src = MintQuoteError::QuoteExpired;
         let w: WalletError = src.into();
-        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+        assert!(
+            matches!(
+                w,
+                WalletError::CashuTyped {
+                    discriminator: CashuDiscriminator::QuoteExpired,
+                    ..
+                }
+            ),
+            "got {w:?}"
+        );
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
     }
 
     #[test]
@@ -378,17 +453,45 @@ mod tests {
     }
 
     #[test]
-    fn meltquote_duplicate_payment_maps_to_concurrency() {
+    fn meltquote_duplicate_payment_is_cashutyped_with_12a_retry_policy() {
+        // 12b-2 P0-3: variant is now the *named* CashuTyped, but the
+        // 12a externally-observable retry classification is preserved.
         let src = MeltQuoteError::DuplicatePayment;
         let w: WalletError = src.into();
-        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+        assert!(
+            matches!(
+                w,
+                WalletError::CashuTyped {
+                    discriminator: CashuDiscriminator::DuplicatePayment,
+                    ..
+                }
+            ),
+            "got {w:?}"
+        );
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
     }
 
     #[test]
-    fn meltquote_expired_maps_to_concurrency() {
+    fn meltquote_expired_is_cashutyped_with_12a_retry_policy() {
         let src = MeltQuoteError::QuoteExpired;
         let w: WalletError = src.into();
-        assert!(matches!(w, WalletError::Concurrency(_)), "got {w:?}");
+        assert!(
+            matches!(
+                w,
+                WalletError::CashuTyped {
+                    discriminator: CashuDiscriminator::QuoteExpired,
+                    ..
+                }
+            ),
+            "got {w:?}"
+        );
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
     }
 
     #[test]
@@ -474,5 +577,86 @@ mod tests {
         // facade's retry policy (only Network/Concurrency are).
         let w: WalletError = AuthError::Backend("x".into()).into();
         assert_eq!(w.retry_policy(), RetryPolicy::Never);
+    }
+
+    // --- 12b-2 Task 4: P0-3 named cashu discriminator ---
+
+    #[test]
+    fn p0_3_duplicate_payment_is_named_signal() {
+        // The binding P0-3 signal: "this exact invoice already has an
+        // active melt quote → resume, do NOT re-quote." A named enum the
+        // consumer branches on, not just "retryable".
+        let w: WalletError = MeltQuoteError::DuplicatePayment.into();
+        assert_eq!(
+            w.cashu_discriminator(),
+            Some(CashuDiscriminator::DuplicatePayment),
+            "got {w:?}"
+        );
+    }
+
+    #[test]
+    fn p0_3_duplicate_payment_preserves_12a_retry_policy() {
+        // 12a routed DuplicatePayment -> Concurrency (retryable). The
+        // externally-observable retry classification MUST be unchanged;
+        // only the internal variant gains a name.
+        let w: WalletError = MeltQuoteError::DuplicatePayment.into();
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn p0_3_quote_expired_named_and_preserves_12a_retry_policy() {
+        let w: WalletError = MeltQuoteError::QuoteExpired.into();
+        assert_eq!(
+            w.cashu_discriminator(),
+            Some(CashuDiscriminator::QuoteExpired)
+        );
+        assert_eq!(
+            w.retry_policy(),
+            RetryPolicy::ExponentialBackoff { max_attempts: 3 }
+        );
+    }
+
+    #[test]
+    fn p0_3_dleq_failure_is_named_signal_and_never_retry() {
+        // Build a DLEQ failure through MeltQuoteError which has a
+        // dedicated DleqVerificationFailed(#[from] DleqVerificationError).
+        // ProofVerificationFailed does not exist at the canonical ref;
+        // mirror the codebase's own constructor (dleq.rs:418).
+        use agicash_cashu::DleqVerificationError;
+        let src = MeltQuoteError::DleqVerificationFailed(DleqVerificationError::CountMismatch {
+            sigs: 1,
+            msgs: 0,
+        });
+        let w: WalletError = src.into();
+        assert_eq!(
+            w.cashu_discriminator(),
+            Some(CashuDiscriminator::DleqVerificationFailed),
+            "got {w:?}"
+        );
+        assert_eq!(w.retry_policy(), RetryPolicy::Never);
+    }
+
+    #[test]
+    fn p0_3_insufficient_balance_is_named_signal_and_never_retry() {
+        let w: WalletError = MeltQuoteError::InsufficientBalance {
+            needed: "100".into(),
+            have: "50".into(),
+        }
+        .into();
+        assert_eq!(
+            w.cashu_discriminator(),
+            Some(CashuDiscriminator::InsufficientBalance),
+            "got {w:?}"
+        );
+        assert_eq!(w.retry_policy(), RetryPolicy::Never);
+    }
+
+    #[test]
+    fn p0_3_undiscriminated_cashu_error_has_no_discriminator() {
+        let w: WalletError = MeltQuoteError::MeltFailed("mint said no".into()).into();
+        assert_eq!(w.cashu_discriminator(), None, "got {w:?}");
     }
 }
