@@ -120,6 +120,57 @@ impl SessionContract {
             );
         }
     }
+
+    /// INV-3 (P1-5). Attempt to rehydrate a previously-stored session from
+    /// the injected `SessionStorage` backend. Returns:
+    /// - `Ok(None)` if no backend is installed, OR the backend holds no
+    ///   session, OR `load()` itself errored (a corrupt/unreadable blob is
+    ///   never fatal — route to sign-in).
+    /// - `Ok(Some(session))` if a stored blob loaded AND the
+    ///   `set_session` chain (INV-2 handshake+refresh) succeeded.
+    /// - `Ok(None)` (NOT `Err`) if a stored blob loaded but the
+    ///   `set_session` chain failed (stale token) — the on-disk blob is
+    ///   CLEARED so the next launch doesn't retry a dead token, and the
+    ///   consumer routes to sign-in without a fatal error.
+    ///
+    /// Mirrors FFI `try_restore_session`
+    /// (`agicash-ffi/src/wallet.rs:373-419` @ `241e8194`): `load()` Err ⇒
+    /// `Ok(None)`; `set_session` Err ⇒ `storage.clear()` + `Ok(None)`.
+    pub async fn restore_session(&self) -> Result<Option<Session>, WalletError> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let persisted = match storage.load().await {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(
+                    target: "agicash_wallet::session",
+                    error = %e,
+                    "restore_session: storage.load() failed (treating as no session)"
+                );
+                return Ok(None);
+            }
+        };
+        let session = Session {
+            user_id: agicash_domain::UserId::from(persisted.user_id),
+            refresh_token: persisted.refresh_token.clone(),
+        };
+        // INV-2 chain (handshake+refresh via inner; clear-on-fail).
+        // `set_session` already persists-through on success (INV-4).
+        match self.set_session(session.clone()).await {
+            Ok(()) => Ok(Some(session)),
+            Err(e) => {
+                tracing::warn!(
+                    target: "agicash_wallet::session",
+                    error = %e,
+                    "restore_session: refresh failed, clearing stored blob"
+                );
+                let _ = storage.clear().await;
+                Ok(None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +417,76 @@ mod tests {
         assert!(*storage.store_called.lock().unwrap());
         // ...but a store failure must NOT fail the call (session usable in-mem).
         assert!(res.is_ok());
+    }
+
+    /// Storage holding one blob; records whether `clear` was called.
+    #[derive(Debug)]
+    struct LoadableStorage {
+        blob: Mutex<Option<PersistedSession>>,
+        clear_called: Mutex<bool>,
+    }
+
+    impl LoadableStorage {
+        fn with_blob() -> Self {
+            Self {
+                blob: Mutex::new(Some(PersistedSession {
+                    user_id: uuid::Uuid::new_v4(),
+                    refresh_token: "stored-rt".into(),
+                })),
+                clear_called: Mutex::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionStorage for LoadableStorage {
+        async fn store(&self, _s: &PersistedSession) -> Result<(), agicash_traits::AuthError> {
+            Ok(())
+        }
+        async fn load(&self) -> Result<Option<PersistedSession>, agicash_traits::AuthError> {
+            Ok(self.blob.lock().unwrap().clone())
+        }
+        async fn clear(&self) -> Result<(), agicash_traits::AuthError> {
+            *self.clear_called.lock().unwrap() = true;
+            *self.blob.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_session_no_backend_returns_ok_none() {
+        let contract = SessionContract::new(Arc::new(OkSetSessionAuth::default()));
+        assert!(contract.restore_session().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_session_stale_token_clears_blob_and_returns_ok_none() {
+        // StaleRefreshAuth (Task 3) makes the inner set_session error.
+        let storage = Arc::new(LoadableStorage::with_blob());
+        let contract = SessionContract::with_storage(
+            Arc::new(StaleRefreshAuth::default()),
+            storage.clone(),
+        );
+
+        let res = contract.restore_session().await;
+
+        // INV-3: NOT an Err — Ok(None) so the UI routes to sign-in.
+        assert!(matches!(res, Ok(None)));
+        // INV-3: the dead blob was cleared.
+        assert!(*storage.clear_called.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn restore_session_success_returns_some() {
+        let storage = Arc::new(LoadableStorage::with_blob());
+        let contract = SessionContract::with_storage(
+            Arc::new(OkSetSessionAuth::default()),
+            storage.clone(),
+        );
+        let restored = contract.restore_session().await.unwrap();
+        assert!(restored.is_some());
+        assert_eq!(restored.unwrap().refresh_token, "stored-rt");
+        // Successful restore must NOT clear the blob.
+        assert!(!*storage.clear_called.lock().unwrap());
     }
 }

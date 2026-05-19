@@ -63,6 +63,7 @@ pub use config::{SessionStorageChoice, WalletConfig};
 pub use discriminator::{AuthErrorCode, CashuDiscriminator};
 pub use error::WalletError;
 pub use opensecret_auth::OpenSecretAuthClient;
+pub use session::SessionContract;
 pub use types::{
     AccountSummary, AuthStatus, BalanceSummary, ExchangeRateSnapshot, MintSummary,
     ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState, ReceiveReceipt,
