@@ -45,8 +45,52 @@ use agicash_wallet::{SessionStorageChoice, TokenVersion, WalletClient, WalletCon
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Transport timeout applied to every FFI-driven auth round-trip
+/// (`auth_guest` / `auth_login` / `auth_signup` / `try_restore_session`).
+/// On Android the underlying HTTP client can stall well past 30 s on a
+/// dead network (DNS, half-open TCP); the iOS Keychain trap (`feedback_
+/// ios_sim_keychain_trap`) showed the same shape silently hanging for
+/// ~36 min. Capping at 30 s surfaces a clean `Auth::Network` to the
+/// consumer instead of an indefinite spinner.
+const AUTH_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a facade auth future under [`AUTH_TRANSPORT_TIMEOUT`]. On timeout,
+/// returns an `FfiError::Auth { code: NETWORK }` so the iOS/Android
+/// consumer treats the failure as a transient transport blip (keep the
+/// signed-in UI alive) rather than a genuine `Unauthenticated`. The
+/// inner future's own errors are forwarded unchanged via the same
+/// `wallet_error_to_ffi` mapper every auth method uses.
+async fn run_with_auth_timeout<F, T>(method: &'static str, fut: F) -> Result<T, FfiError>
+where
+    F: std::future::Future<Output = Result<T, agicash_wallet::WalletError>>,
+{
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(AUTH_TRANSPORT_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(crate::convert::wallet_error_to_ffi(e)),
+        Err(_) => {
+            let elapsed = started.elapsed();
+            tracing::warn!(
+                target: "agicash_ffi::wallet",
+                method,
+                elapsed_secs = elapsed.as_secs_f64(),
+                timeout_secs = AUTH_TRANSPORT_TIMEOUT.as_secs(),
+                "auth transport timeout — returning Auth/Network to consumer"
+            );
+            Err(FfiError::Auth {
+                code: crate::error::auth_code::NETWORK,
+                message: format!(
+                    "auth transport timeout after {}s on {method}",
+                    AUTH_TRANSPORT_TIMEOUT.as_secs()
+                ),
+            })
+        }
+    }
+}
 
 #[derive(uniffi::Object)]
 pub struct AgicashWallet {
@@ -431,13 +475,10 @@ impl AgicashWallet {
         // set_session_storage_dir), runs the INV-2 set_session chain, and
         // on a stale token clears the on-disk blob + returns Ok(None)
         // (route to sign-in, never fatal) — exact prior FFI behavior.
-        let restored = self
-            .session_contract
-            .read()
-            .await
-            .restore_session()
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+        let contract = self.session_contract.read().await;
+        let restored =
+            run_with_auth_timeout("try_restore_session", contract.restore_session()).await?;
+        drop(contract);
         match restored {
             Some(s) => {
                 let persisted = PersistedSession {
@@ -498,11 +539,7 @@ impl AgicashWallet {
     /// throwaway password (the user never sees it) and returns the resulting
     /// `Session` so the Swift consumer can persist the refresh token.
     pub async fn auth_guest(&self) -> Result<Session, FfiError> {
-        let s = self
-            .facade
-            .auth_guest()
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+        let s = run_with_auth_timeout("auth_guest", self.facade.auth_guest()).await?;
         // §6 carve-out (note ‡): mirror into the shell-resident session
         // slot + persistence so realtime / set_session /
         // try_restore_session keep working UNCHANGED (Hard Rule 7).
@@ -530,11 +567,8 @@ impl AgicashWallet {
 
     /// Email + password login.
     pub async fn auth_login(&self, email: String, password: String) -> Result<Session, FfiError> {
-        let s = self
-            .facade
-            .auth_login(&email, &password)
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+        let s =
+            run_with_auth_timeout("auth_login", self.facade.auth_login(&email, &password)).await?;
         // §6 carve-out (note ‡): mirror into the shell-resident slot.
         let persisted = PersistedSession {
             user_id: s.user_id.as_uuid(),
@@ -568,11 +602,11 @@ impl AgicashWallet {
         password: String,
         name: Option<String>,
     ) -> Result<Session, FfiError> {
-        let s = self
-            .facade
-            .auth_signup(&email, &password, name.as_deref())
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+        let s = run_with_auth_timeout(
+            "auth_signup",
+            self.facade.auth_signup(&email, &password, name.as_deref()),
+        )
+        .await?;
         // §6 carve-out (note ‡): mirror into the shell-resident slot.
         let persisted = PersistedSession {
             user_id: s.user_id.as_uuid(),
