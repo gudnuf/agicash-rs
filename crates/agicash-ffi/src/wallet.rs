@@ -22,7 +22,9 @@ use crate::receive::ReceiveResult;
 use crate::receive_flow::ReceiveFlow;
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
-use agicash_auth_opensecret::{OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider};
+use agicash_auth_opensecret::{
+    auth_error_from_opensecret, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
+};
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuSendSwapService, CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
@@ -337,6 +339,14 @@ impl AgicashWallet {
             })
             .await
             .map_err(crate::convert::wallet_error_to_ffi)?;
+        // F9: keep the shell-resident `self.client` in session-sync with
+        // the facade. The session contract only seeds the facade's
+        // internal `OpenSecretClient`; without this call the shell client
+        // (used by `self.storage`'s token provider AND realtime's token
+        // provider) stays empty and every shell-storage / realtime path
+        // hits "No refresh token available". Mirrors the CLI fix
+        // (`dfecd5e6` — `sync_shell_client` in `composition.rs`).
+        self.sync_shell_client(&refresh_token).await?;
         // Hard Rule 7 ‡: mirror into the shell-resident slot so realtime /
         // auth_status keep working unchanged (same write the old body did).
         *self.session.write().await = Some(PersistedSession {
@@ -434,6 +444,36 @@ impl AgicashWallet {
                     user_id: s.user_id.as_uuid(),
                     refresh_token: s.refresh_token.clone(),
                 };
+                // F9: keep the shell-resident `self.client` in session-sync
+                // with the facade on cold-start restore. The session
+                // contract only seeded the facade's internal
+                // `OpenSecretClient`; without this call the shell client
+                // (used by `self.storage`'s token provider AND realtime's
+                // token provider) stays empty and Send-post-relaunch +
+                // realtime delivery on Android fail with "No refresh
+                // token available". On shell-refresh failure we treat the
+                // restore as a stale-token (`Ok(None)`) — same shape the
+                // session contract uses internally — and clear the
+                // on-disk blob so the next launch doesn't retry a dead
+                // token. Mirrors the CLI `dfecd5e6` shape.
+                if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
+                    tracing::warn!(
+                        target: "agicash_ffi::wallet",
+                        error = %e,
+                        "try_restore_session: shell client refresh failed, treating as stale (clearing blob)"
+                    );
+                    // Roll back the facade-side restore too so we don't
+                    // leave the two clients in disagreement: clear the
+                    // shared session slot + persistence. (The contract's
+                    // internal `set_session` already succeeded against
+                    // the facade, but a stale shell refresh almost
+                    // certainly means the facade refresh used a
+                    // not-actually-stale token whose access copy will
+                    // expire; cheaper to drop and re-sign-in.)
+                    *self.session.write().await = None;
+                    self.clear_persisted_session().await;
+                    return Ok(None);
+                }
                 // Hard Rule 7 ‡ mirror so realtime / auth_status see it.
                 *self.session.write().await = Some(persisted.clone());
                 tracing::info!(
@@ -472,6 +512,19 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
+        // F9: best-effort shell-client session-sync. A failure here doesn't
+        // fail the auth — the facade-side session is already live and
+        // persisted — but matters for the same-process realtime / shell-
+        // storage paths (`prepare_send_quote`, etc.) so they don't hit
+        // "No refresh token available" on the user's first action. Same
+        // best-effort shape the CLI uses in `persist_session` (dfecd5e6).
+        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
+            tracing::warn!(
+                target: "agicash_ffi::wallet",
+                error = %e,
+                "auth_guest: shell client sync failed (continuing — facade is live)"
+            );
+        }
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -489,6 +542,15 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
+        // F9: best-effort shell-client session-sync. See `auth_guest` for
+        // rationale.
+        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
+            tracing::warn!(
+                target: "agicash_ffi::wallet",
+                error = %e,
+                "auth_login: shell client sync failed (continuing — facade is live)"
+            );
+        }
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -518,6 +580,15 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
+        // F9: best-effort shell-client session-sync. See `auth_guest` for
+        // rationale.
+        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
+            tracing::warn!(
+                target: "agicash_ffi::wallet",
+                error = %e,
+                "auth_signup: shell client sync failed (continuing — facade is live)"
+            );
+        }
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -1493,6 +1564,49 @@ impl AgicashWallet {
                 );
             }
         }
+    }
+
+    /// Drive the shell-resident `self.client` to a usable access token
+    /// from a refresh token (handshake → `set_tokens`(empty access,
+    /// refresh) → `refresh_token`). Mirrors `sync_shell_client` in
+    /// `agicash-cli/src/composition.rs` (`dfecd5e6`) and the Leptos
+    /// `session_seeded_opensecret_client` helper (`f89c0c79`).
+    ///
+    /// Why this exists (F9): the FFI holds TWO `OpenSecretClient`
+    /// instances with independent `Arc<OpensecretInner>` session
+    /// managers — `self.client` (built at `new`, used by `self.storage`'s
+    /// token provider AND by `start_wallet_events`' realtime token
+    /// provider) AND the facade's internal client (built inside
+    /// `WalletClient::from_config`, used by `self.facade.*` methods).
+    /// The session contract's `set_session` / `restore_session` only seed
+    /// the facade's client; the shell client stays empty unless this
+    /// helper runs. Without it on Android cold-start restore, every
+    /// shell-storage path (`prepare_send_quote`, `prepare_melt_quote`,
+    /// `start_mint_quote`, `complete_mint_quote`, `execute_melt_quote`,
+    /// `poll_*_quote`, `get_user`, `set_default_account`) and the
+    /// realtime token-mint fail with `"token provider: auth backend
+    /// error: Authentication error: No refresh token available"` (F9
+    /// Send-post-relaunch + realtime delivery divergence symptoms).
+    ///
+    /// On `refresh_token()` failure we surface the error to the caller
+    /// (which on the restore path treats it the same way the session
+    /// contract treats a stale token — `Ok(None)` + clear-on-disk via
+    /// the contract's own path); we deliberately do NOT clear the shell
+    /// session slot here because the facade slot owns lifecycle (`set_session`
+    /// already mirrors into `self.session` and the contract enforces
+    /// clear-on-fail for the facade).
+    async fn sync_shell_client(&self, refresh_token: &str) -> Result<(), FfiError> {
+        self.client.ensure_handshake().await?;
+        self.client
+            .inner()
+            .set_tokens(String::new(), Some(refresh_token.to_string()))
+            .map_err(|e| FfiError::from(auth_error_from_opensecret(e)))?;
+        self.client
+            .inner()
+            .refresh_token()
+            .await
+            .map_err(|e| FfiError::from(auth_error_from_opensecret(e)))?;
+        Ok(())
     }
 }
 
