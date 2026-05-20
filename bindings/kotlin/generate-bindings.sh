@@ -25,7 +25,7 @@ set -euo pipefail
 KOTLIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUST_DIR="$KOTLIN_DIR/rust"
 BUILD_DIR="$KOTLIN_DIR/build"
-TARGET_DIR="$RUST_DIR/target"
+TARGET_DIR="${CARGO_TARGET_DIR:-$RUST_DIR/target}"
 JNILIBS_DIR="$BUILD_DIR/jniLibs"
 SOURCES_DIR="$BUILD_DIR/sources"
 CDYLIB_NAME="libagicash_ffi_kotlin"
