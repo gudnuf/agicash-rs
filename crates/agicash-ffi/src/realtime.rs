@@ -22,7 +22,7 @@ use agicash_realtime::RealtimeStatus;
 
 /// Lifecycle status forwarded for UI (spinner / "reconnecting" banner).
 /// 1:1 with `agicash_realtime::RealtimeStatus` — the [`From`] impl below
-/// is exhaustive over all six variants so a new realtime status can't
+/// is exhaustive over all variants so a new realtime status can't
 /// silently drop on the FFI floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum RealtimeStatusFfi {
@@ -39,6 +39,13 @@ pub enum RealtimeStatusFfi {
     Error,
     /// `stop_wallet_events` left the channel and closed the socket.
     Closed,
+    /// The supervisor's `JoinReplyError` (auth/RLS deny) retry cap fired
+    /// — see `agicash_realtime::service::MAX_JOIN_REJECT_ATTEMPTS`. The
+    /// supervisor has STOPPED retrying and will stay paused until the
+    /// session resumes (e.g. `set_online(true)` after `set_online(false)`,
+    /// or a fresh sign-in). Lane 1 surface stops here: clients log it as
+    /// a stopgap until Lane 2 wires a UI banner.
+    TerminalError,
 }
 
 impl From<RealtimeStatus> for RealtimeStatusFfi {
@@ -50,6 +57,7 @@ impl From<RealtimeStatus> for RealtimeStatusFfi {
             RealtimeStatus::Reconnecting => Self::Reconnecting,
             RealtimeStatus::Error => Self::Error,
             RealtimeStatus::Closed => Self::Closed,
+            RealtimeStatus::TerminalError => Self::TerminalError,
         }
     }
 }

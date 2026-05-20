@@ -1525,6 +1525,43 @@ impl AgicashWallet {
         }
         Ok(())
     }
+
+    /// Tell the running realtime supervisor whether the host has
+    /// network connectivity (iOS `NWPathMonitor`, Android
+    /// `ConnectivityManager.NetworkCallback`). `true` is the default and
+    /// the initial state when the supervisor starts; clients only need
+    /// to call this on offline → online transitions and back. Mirrors
+    /// React's `useSupabaseRealtimeActivityTracking.setOnlineStatus`.
+    /// See `agicash_realtime::WalletRealtimeService::set_online` for the
+    /// terminal-latch reset semantics (an `online=true` after `false`
+    /// clears a previously-fired `TerminalError` so a session resume
+    /// gets one more chance under fresh network).
+    ///
+    /// No-op if `start_wallet_events` hasn't been called or has been
+    /// stopped — there's no supervisor to inform. Always returns Ok so
+    /// the platform can call this from a lifecycle observer without
+    /// gating on `realtimeStarted`.
+    pub async fn set_realtime_online(&self, online: bool) -> Result<(), FfiError> {
+        if let Some(svc) = self.realtime_service.read().await.as_ref() {
+            svc.set_online(online);
+        }
+        Ok(())
+    }
+
+    /// Tell the running realtime supervisor whether the host app is in
+    /// the foreground / visible. `true` is the default. Backgrounding
+    /// closes the socket (battery-friendly on mobile); foregrounding
+    /// resubscribes. Mirrors React's `setActiveStatus`. Wired from:
+    /// - iOS `scenePhase` (`.active` → true; `.inactive`/`.background` → false)
+    /// - Android `ProcessLifecycleOwner` (`ON_START` → true; `ON_STOP` → false)
+    /// - Web `document.visibilitychange` (Leptos drives via the realtime
+    ///   crate directly — it doesn't go through this FFI).
+    pub async fn set_realtime_active(&self, active: bool) -> Result<(), FfiError> {
+        if let Some(svc) = self.realtime_service.read().await.as_ref() {
+            svc.set_active(active);
+        }
+        Ok(())
+    }
 }
 
 // Internal (non-FFI) helpers. Kept out of the `#[uniffi::export]` impl
@@ -2611,6 +2648,28 @@ mod tests {
         )
         .expect("construct");
         w.stop_wallet_events().await.expect("stop is a no-op");
+    }
+
+    /// `set_realtime_online`/`set_realtime_active` with nothing running
+    /// are clean no-ops. iOS/Android wire these from lifecycle observers
+    /// that may fire BEFORE `start_wallet_events` (e.g. cold-start
+    /// connectivity callback before bootstrap completes) or AFTER
+    /// `stop_wallet_events` (during sign-out teardown); both must
+    /// always return Ok without panicking.
+    #[tokio::test]
+    async fn set_realtime_online_active_without_start_are_noops() {
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+        w.set_realtime_online(true).await.expect("noop");
+        w.set_realtime_online(false).await.expect("noop");
+        w.set_realtime_active(true).await.expect("noop");
+        w.set_realtime_active(false).await.expect("noop");
     }
 
     /// Hermetic bridge smoke test: a fake `WalletEventListener` receives
