@@ -70,6 +70,12 @@ tracing-oslog = { workspace = true }
 [target.'cfg(target_os = "android")'.dependencies]
 rustls-platform-verifier = { workspace = true }
 jni = "0.22"
+# Android-only sink for the FFI's `tracing` subscriber. `tracing-android`
+# is a tracing-subscriber Layer that routes each event through liblog's
+# `__android_log_write`, so events show up as logcat lines under a tag
+# we control (here: `agicash.rust`). Filter with
+# `adb logcat -s agicash.rust:*`.
+tracing-android = "0.2"
 
 [dev-dependencies]
 

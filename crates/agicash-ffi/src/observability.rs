@@ -1,4 +1,4 @@
-//! Tracing → `os_log` bridge for iOS observability.
+//! Tracing → platform-log bridge for FFI observability.
 //!
 //! Installs a process-wide `tracing` subscriber the first time any FFI
 //! method is called. On Apple targets the subscriber routes through
@@ -12,7 +12,14 @@
 //!   --info --debug
 //! ```
 //!
-//! Off Apple (linux CI, wasm) we fall back to a stderr-formatting
+//! On Android the subscriber routes through `tracing-android` so events
+//! show up in logcat under the `agicash.rust` tag, filterable via:
+//!
+//! ```sh
+//! adb logcat -s agicash.rust:*
+//! ```
+//!
+//! Off both (linux CI, wasm) we fall back to a stderr-formatting
 //! subscriber so tests + CLI still get usable output.
 //!
 //! ## Filter level
@@ -46,7 +53,8 @@ static INIT: Once = Once::new();
 /// from every FFI entry point.
 ///
 /// On Apple targets this routes events to `os_log` under subsystem
-/// `app.agicash.rust`, category `rust`. Elsewhere it falls back to a
+/// `app.agicash.rust`, category `rust`. On Android it routes events
+/// to logcat under tag `agicash.rust`. Elsewhere it falls back to a
 /// stderr fmt subscriber.
 pub fn init() {
     INIT.call_once(install_subscriber);
@@ -66,7 +74,33 @@ fn install_subscriber() {
     let _ = Registry::default().with(filter).with(layer).try_init();
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "android")]
+fn install_subscriber() {
+    use tracing_android::layer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Registry};
+
+    let filter = env_filter();
+    // `tracing_android::layer(tag)` returns a `Layer` that routes each
+    // event through `__android_log_write`. `unwrap_or_else` guards
+    // against the (very unlikely) C-string-validation error so a bad
+    // tag never panics the FFI; we degrade to the stderr fallback.
+    let android_layer = match layer("agicash.rust") {
+        Ok(l) => l,
+        Err(_) => {
+            let _ = Registry::default()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+                .try_init();
+            return;
+        }
+    };
+    let _ = Registry::default()
+        .with(filter)
+        .with(android_layer)
+        .try_init();
+}
+
+#[cfg(all(not(target_vendor = "apple"), not(target_os = "android")))]
 fn install_subscriber() {
     use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Registry};
 
