@@ -1,5 +1,6 @@
 package com.makeprisms.agicash.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -84,6 +85,12 @@ private fun SignedInShell(viewModel: WalletViewModel) {
     // per-tab Settings NavHost untouched.
     var overlay by remember { mutableStateOf(Overlay.NONE) }
     var selected by remember { mutableStateOf(Tab.HOME) }
+
+    // Intercept system back while an overlay is showing — return to the
+    // bottom-tab home shell instead of letting the Activity finish.
+    BackHandler(enabled = overlay != Overlay.NONE) {
+        overlay = Overlay.NONE
+    }
 
     when (overlay) {
         Overlay.RECEIVE -> {
