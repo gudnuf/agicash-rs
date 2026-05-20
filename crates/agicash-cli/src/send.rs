@@ -12,7 +12,7 @@ use crate::composition::CliDeps;
 use agicash_domain::{AccountId, Currency};
 use agicash_money::{Money, Unit};
 use agicash_traits::{AuthError, StorageError};
-use agicash_wallet::{TokenVersion, WalletError};
+use agicash_wallet::{CashuDiscriminator, TokenVersion, WalletError};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use uuid::Uuid;
@@ -31,6 +31,8 @@ pub enum SendCmdError {
     UnsupportedTokenVersion(u8),
     #[error("token encode error: {0}")]
     TokenEncode(String),
+    #[error("insufficient balance: {0}")]
+    InsufficientBalance(String),
     #[error("send failed: {0}")]
     Send(String),
     #[error(transparent)]
@@ -77,6 +79,10 @@ fn map_err(e: WalletError) -> SendCmdError {
             _ => SendCmdError::Send(message),
         },
         WalletError::NotFound(_) => SendCmdError::NoMatchingAccount,
+        WalletError::CashuTyped {
+            discriminator: CashuDiscriminator::InsufficientBalance,
+            message,
+        } => SendCmdError::InsufficientBalance(message),
         WalletError::Cashu(m) | WalletError::CashuTyped { message: m, .. } => {
             if m.contains("encode") || m.contains("proof decode") {
                 SendCmdError::TokenEncode(m)

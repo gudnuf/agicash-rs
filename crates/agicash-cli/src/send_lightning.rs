@@ -26,7 +26,7 @@ use crate::composition::CliDeps;
 use agicash_domain::AccountId;
 use agicash_traits::{AuthError, StorageError};
 use agicash_wallet::types::SendLightningStatus;
-use agicash_wallet::{SendLightningQuote, WalletError};
+use agicash_wallet::{CashuDiscriminator, SendLightningQuote, WalletError};
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -44,6 +44,8 @@ pub enum SendLightningCmdError {
     InvalidAccountId(String),
     #[error("invalid quote id: {0}")]
     InvalidQuoteId(String),
+    #[error("insufficient balance: {0}")]
+    InsufficientBalance(String),
     #[error("melt quote failed: {0}")]
     Quote(String),
     #[error(transparent)]
@@ -103,6 +105,10 @@ fn map_err(e: WalletError) -> SendLightningCmdError {
             _ => SendLightningCmdError::Quote(message),
         },
         WalletError::NotFound(_) => SendLightningCmdError::NoMatchingAccount,
+        WalletError::CashuTyped {
+            discriminator: CashuDiscriminator::InsufficientBalance,
+            message,
+        } => SendLightningCmdError::InsufficientBalance(message),
         WalletError::Cashu(m)
         | WalletError::CashuTyped { message: m, .. }
         | WalletError::Concurrency(m)

@@ -103,6 +103,7 @@ mod gated {
         "invalid-account-id",
         "unsupported-token-version",
         "token-encode-error",
+        "insufficient-balance",
         "amount-too-small",
         // --- classify_error: lightning receive ---
         "invalid-quote-id",
@@ -547,16 +548,18 @@ mod gated {
 
         // Add a mint so the empty-wallet send path gets past account
         // resolution and into the proof-selection / mint-send branch.
-        // Post cli-facade migration (#5) an empty-wallet send no longer
-        // surfaces a dedicated `insufficient-balance` code: the facade
-        // funnels the wallet send failure (incl. "insufficient balance")
-        // through `SendCmdError::Send` → `mint-error`. We assert the
-        // real emitted code here; the distinction we care about is that
-        // this is past account resolution (not `no-matching-account`).
+        // The facade surfaces a NUT-typed `WalletError::CashuTyped` with
+        // the `InsufficientBalance` discriminator on the empty-wallet
+        // proof-select guard; the CLI routes that to
+        // `SendCmdError::InsufficientBalance` → `insufficient-balance`
+        // (restored as part of the polish-papercuts lane).
         session.add_test_mint();
 
-        let post_mint_cases: &[(&str, &[&str], &str)] =
-            &[("send empty wallet", &["send", "token", "100"], "mint-error")];
+        let post_mint_cases: &[(&str, &[&str], &str)] = &[(
+            "send empty wallet",
+            &["send", "token", "100"],
+            "insufficient-balance",
+        )];
 
         for (label, args, expected_code) in post_mint_cases {
             let out = session
