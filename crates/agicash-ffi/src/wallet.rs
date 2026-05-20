@@ -374,15 +374,16 @@ impl AgicashWallet {
         // performs the OpenSecret handshake → set_tokens → refresh; the
         // contract guarantees the slot is cleared if that fails (for ANY
         // AuthClient impl) and the original error is surfaced.
-        self.session_contract
-            .read()
-            .await
-            .set_session(agicash_wallet::Session {
+        let contract = self.session_contract.read().await;
+        run_with_auth_timeout(
+            "set_session",
+            contract.set_session(agicash_wallet::Session {
                 user_id: agicash_domain::UserId::from(user_id),
                 refresh_token: refresh_token.clone(),
-            })
-            .await
-            .map_err(crate::convert::wallet_error_to_ffi)?;
+            }),
+        )
+        .await?;
+        drop(contract);
         // F9: keep the shell-resident `self.client` in session-sync with
         // the facade. The session contract only seeds the facade's
         // internal `OpenSecretClient`; without this call the shell client
