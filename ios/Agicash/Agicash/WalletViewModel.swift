@@ -947,6 +947,36 @@ final class WalletViewModel {
         eventBridge = nil
     }
 
+    /// Forward an OS-level reachability transition to the realtime
+    /// supervisor (Gap-E, audit `2026-05-19-realtime-parity.md`).
+    /// Wired from `NWPathMonitor` in `AgicashApp`. No-op on the Rust
+    /// side when no subscription is running, so it's safe to call
+    /// before/after `subscribeWalletEvents`/`unsubscribeWalletEvents`.
+    /// Best-effort: failing must not block any UI flow.
+    func setRealtimeOnline(_ online: Bool) async {
+        if isDemoMode { return }
+        do {
+            try await wallet.setRealtimeOnline(online: online)
+        } catch {
+            _ = error
+        }
+    }
+
+    /// Forward a `scenePhase` transition to the realtime supervisor
+    /// (Gap-E). `.active` → true; everything else (`.inactive`,
+    /// `.background`) → false. Backgrounded socket closes — saves
+    /// battery + an OpenSecret enclave round-trip every 25s. Foreground
+    /// resumes; supervisor reconnects and the `onConnected` catch-up
+    /// refetch fires (replaces the deleted scenePhase poll).
+    func setRealtimeActive(_ active: Bool) async {
+        if isDemoMode { return }
+        do {
+            try await wallet.setRealtimeActive(active: active)
+        } catch {
+            _ = error
+        }
+    }
+
     /// Outcome shape returned to the swipe handler in `AccountsView`.
     /// Success carries no payload (the view re-reads `model.user` via
     /// `@Bindable`); failure carries a presentation-ready string.

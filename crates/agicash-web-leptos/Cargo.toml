@@ -100,12 +100,14 @@ web-sys = { version = "0.3", features = [
     "Clipboard",
     "Document",
     "Element",
+    "Event",
     "EventTarget",
     "HtmlMetaElement",
     "Navigator",
     "Window",
     "Storage",
     "ShareData",
+    "VisibilityState",
 ] }
 
 # `getrandom` for the throwaway guest-registration password. Wasm

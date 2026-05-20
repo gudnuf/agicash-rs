@@ -1,8 +1,21 @@
+import Network
 import SwiftUI
 
 @main
 struct AgicashApp: App {
     @State private var walletState: WalletState
+    /// Tracks reachability via `NWPathMonitor` and forwards online/offline
+    /// transitions into the wallet's realtime supervisor (audit
+    /// `2026-05-19-realtime-parity.md` Gap-E). Started once at app launch
+    /// and runs for the process lifetime — symmetric with the realtime
+    /// subscription itself, which lives from session start to sign-out.
+    @State private var reachability = ReachabilityMonitor()
+    /// SwiftUI's app-wide scene phase. `.active`/`.inactive`/`.background`
+    /// transitions are forwarded to the realtime supervisor as
+    /// `setRealtimeActive(true/false)` — backgrounded socket closes
+    /// (battery-friendly), foregrounding resumes + fires `onConnected`'s
+    /// catch-up refetch.
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         self.walletState = WalletState()
@@ -12,6 +25,63 @@ struct AgicashApp: App {
         WindowGroup {
             ContentView(state: walletState)
                 .task { await walletState.bootstrap() }
+                .task {
+                    // Drive the reachability stream for the wallet's
+                    // lifetime. `for await` keeps the task alive until
+                    // the view goes away (app termination); each
+                    // boolean is forwarded once on every transition.
+                    for await online in reachability.stream() {
+                        if case .ready(let model) = walletState.result {
+                            await model.setRealtimeOnline(online)
+                        }
+                    }
+                }
+                .onChange(of: scenePhase, initial: false) { _, newValue in
+                    let isActive = (newValue == .active)
+                    Task { @MainActor in
+                        if case .ready(let model) = walletState.result {
+                            await model.setRealtimeActive(isActive)
+                        }
+                    }
+                }
+        }
+    }
+}
+
+/// Wraps `NWPathMonitor` as an `AsyncStream<Bool>` of reachability
+/// transitions. Emits `true` whenever the OS reports a usable path
+/// and `false` whenever it reports `.unsatisfied`. Deduplicates by
+/// definition (only fires when `path.status` differs from the last
+/// emitted value). Mirrors what React's
+/// `useSupabaseRealtimeActivityTracking` gets for free from
+/// `navigator.onLine` + `window` `online`/`offline` events.
+///
+/// Lifetime: created once in `AgicashApp`, started by the `.task`
+/// modifier on `ContentView`; the monitor lives until the process
+/// exits. Cancellation of the stream consumer cancels the monitor.
+@MainActor
+final class ReachabilityMonitor {
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "app.agicash.reachability")
+
+    /// Yields a new boolean on every reachability transition. The
+    /// initial value is also yielded so the supervisor learns the
+    /// state at startup (typically `true` on a successful launch).
+    func stream() -> AsyncStream<Bool> {
+        AsyncStream { continuation in
+            // Capture last value so we don't yield on no-op updates.
+            var last: Bool? = nil
+            monitor.pathUpdateHandler = { path in
+                let online = (path.status == .satisfied)
+                if last != online {
+                    last = online
+                    continuation.yield(online)
+                }
+            }
+            continuation.onTermination = { [monitor] _ in
+                monitor.cancel()
+            }
+            monitor.start(queue: queue)
         }
     }
 }

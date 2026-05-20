@@ -456,6 +456,14 @@ impl WalletData {
                     });
                 }
 
+                // Wire DOM lifecycle hooks (Gap-E): forward
+                // `visibilitychange` and `online`/`offline` to the
+                // service. iOS/Android get this from native lifecycle
+                // observers via the FFI; on the web the equivalents
+                // are window-level events. The service handle is held
+                // by the closures via `Arc` so they outlive the spawn.
+                wire_dom_lifecycle(Arc::clone(&service));
+
                 // Drive the connect→join→serve→reconnect supervisor for
                 // the page's lifetime. `run()` borrows `&self`; the
                 // `Arc` keeps the service alive across the spawned task.
@@ -464,6 +472,76 @@ impl WalletData {
                 });
             });
         }
+    }
+}
+
+/// Wire DOM lifecycle events to the realtime supervisor (Gap-E):
+/// - `document.visibilitychange` → `set_active(document.visibilityState === 'visible')`
+/// - `window.online` / `window.offline` → `set_online(true/false)`
+///
+/// All three listeners use `.forget()` so the closures live for the
+/// page's lifetime. This matches the supervisor itself (`spawn_local`'d
+/// onto the page's task pool with no symmetric teardown — Lane 1 keeps
+/// teardown symmetry as Gap-G's responsibility). The supervisor's
+/// `set_online`/`set_active` calls are idempotent and cheap (atomic
+/// swap + 1-msg broadcast), so a redundant dispatch from a no-op
+/// transition is a non-issue.
+#[cfg(target_arch = "wasm32")]
+fn wire_dom_lifecycle(service: std::sync::Arc<agicash_realtime::WalletRealtimeService>) {
+    use wasm_bindgen::{closure::Closure, JsCast};
+
+    let Some(window) = web_sys::window() else {
+        leptos::logging::log!(
+            "wire_dom_lifecycle: window unavailable — skipping online/active wiring"
+        );
+        return;
+    };
+
+    // `online` / `offline`
+    {
+        let service_on = service.clone();
+        let online_cb = Closure::<dyn FnMut()>::new(move || {
+            service_on.set_online(true);
+        });
+        let _ =
+            window.add_event_listener_with_callback("online", online_cb.as_ref().unchecked_ref());
+        online_cb.forget();
+    }
+    {
+        let service_off = service.clone();
+        let offline_cb = Closure::<dyn FnMut()>::new(move || {
+            service_off.set_online(false);
+        });
+        let _ =
+            window.add_event_listener_with_callback("offline", offline_cb.as_ref().unchecked_ref());
+        offline_cb.forget();
+    }
+    // Apply the initial reachability state once so the supervisor doesn't
+    // sit on a stale `true` after the page loads offline.
+    if let Ok(online) = web_sys::js_sys::Reflect::get(
+        &window.navigator(),
+        &wasm_bindgen::JsValue::from_str("onLine"),
+    ) {
+        if let Some(b) = online.as_bool() {
+            service.set_online(b);
+        }
+    }
+
+    // `visibilitychange` — drives `set_active`. The document's
+    // `visibilityState` is the truth (string `"visible"` vs `"hidden"`);
+    // a focus change alone doesn't fire this.
+    if let Some(document) = window.document() {
+        let service_vis = service.clone();
+        let doc_for_cb = document.clone();
+        let vis_cb = Closure::<dyn FnMut()>::new(move || {
+            let visible = doc_for_cb.visibility_state() == web_sys::VisibilityState::Visible;
+            service_vis.set_active(visible);
+        });
+        let _ = document
+            .add_event_listener_with_callback("visibilitychange", vis_cb.as_ref().unchecked_ref());
+        vis_cb.forget();
+        // Initial state.
+        service.set_active(document.visibility_state() == web_sys::VisibilityState::Visible);
     }
 }
 

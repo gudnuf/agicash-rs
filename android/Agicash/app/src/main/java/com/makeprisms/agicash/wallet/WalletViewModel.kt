@@ -1,7 +1,15 @@
 package com.makeprisms.agicash.wallet
 
 import android.app.Application
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -153,6 +161,43 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     private var realtimeStarted = false
 
     /**
+     * Observer wired to [ProcessLifecycleOwner] so a backgrounded app
+     * tells the Rust realtime supervisor `setRealtimeActive(false)` —
+     * the supervisor closes the socket + parks until `ON_START` fires
+     * `setRealtimeActive(true)`. Mirrors iOS `scenePhase` + audit
+     * Gap-E. Lifetime = view-model lifetime: attached in `init`,
+     * detached in `onCleared` so the singleton lifecycle owner doesn't
+     * keep a strong ref past the ViewModel.
+     */
+    private val processLifecycleObserver = object : DefaultLifecycleObserver {
+        override fun onStart(owner: LifecycleOwner) {
+            forwardRealtimeActive(true)
+        }
+        override fun onStop(owner: LifecycleOwner) {
+            forwardRealtimeActive(false)
+        }
+    }
+
+    /**
+     * `ConnectivityManager.NetworkCallback` for the Lane 1 Gap-E
+     * online/offline lifecycle. `onAvailable` → `setRealtimeOnline(true)`;
+     * `onLost` → `setRealtimeOnline(false)`. The Rust side resets a
+     * latched terminal status on `false → true` so a session resume
+     * after a network outage gets one more chance under fresh network.
+     * Requires `ACCESS_NETWORK_STATE` (declared in the manifest).
+     */
+    private val connectivityCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            forwardRealtimeOnline(true)
+        }
+        override fun onLost(network: Network) {
+            forwardRealtimeOnline(false)
+        }
+    }
+
+    private var connectivityRegistered = false
+
+    /**
      * Forwards Supabase-Realtime activity (delivered on the Rust
      * realtime supervisor's tokio task — see the `WalletEventListener`
      * UniFFI callback-interface doc) onto the existing
@@ -200,6 +245,93 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
     init {
         bootstrap()
+        // Attach the app-wide lifecycle observer NOW (not after sign-in)
+        // so a backgrounded splash / login screen still tells the
+        // supervisor `setRealtimeActive(false)` — the FFI safely no-ops
+        // before `startWalletEvents` is called. Must be touched on the
+        // main thread (ProcessLifecycleOwner requires it).
+        ProcessLifecycleOwner.get().lifecycle.addObserver(processLifecycleObserver)
+
+        // Register a network callback for online/offline transitions.
+        // Same defensive timing as the lifecycle observer — the FFI
+        // ignores the calls until `startWalletEvents` runs.
+        registerConnectivityCallback()
+    }
+
+    /** Helper: dispatch `setRealtimeActive` from the lifecycle observer. */
+    private fun forwardRealtimeActive(active: Boolean) {
+        val w = wallet ?: return
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { w.setRealtimeActive(active) }
+            } catch (e: Throwable) {
+                android.util.Log.w(
+                    "WalletViewModel",
+                    "setRealtimeActive($active) failed (ignored): ${e.message}",
+                )
+            }
+        }
+    }
+
+    /** Helper: dispatch `setRealtimeOnline` from the connectivity callback. */
+    private fun forwardRealtimeOnline(online: Boolean) {
+        val w = wallet ?: return
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { w.setRealtimeOnline(online) }
+            } catch (e: Throwable) {
+                android.util.Log.w(
+                    "WalletViewModel",
+                    "setRealtimeOnline($online) failed (ignored): ${e.message}",
+                )
+            }
+        }
+    }
+
+    /**
+     * Register the network callback against the `ConnectivityManager`.
+     * Idempotent via [connectivityRegistered] so a future reattachment
+     * (process restore, configuration change) doesn't double-register.
+     */
+    private fun registerConnectivityCallback() {
+        if (connectivityRegistered) return
+        val cm = getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        try {
+            cm.registerNetworkCallback(request, connectivityCallback)
+            connectivityRegistered = true
+        } catch (e: Throwable) {
+            // Some emulator images / device configurations reject the
+            // registration; log and continue without online-lifecycle.
+            android.util.Log.w(
+                "WalletViewModel",
+                "registerNetworkCallback failed (continuing without online-lifecycle): ${e.message}",
+            )
+        }
+    }
+
+    /**
+     * Tear down the connectivity callback. Safe to call when not
+     * registered (no-op via [connectivityRegistered]).
+     */
+    private fun unregisterConnectivityCallback() {
+        if (!connectivityRegistered) return
+        connectivityRegistered = false
+        val cm = getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return
+        try {
+            cm.unregisterNetworkCallback(connectivityCallback)
+        } catch (e: Throwable) {
+            android.util.Log.w(
+                "WalletViewModel",
+                "unregisterNetworkCallback failed (ignored): ${e.message}",
+            )
+        }
     }
 
     /**
@@ -993,6 +1125,11 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
     override fun onCleared() {
         super.onCleared()
+        // Detach lifecycle / connectivity observers FIRST so a transition
+        // mid-teardown doesn't try to call into a half-cleared FFI.
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(processLifecycleObserver)
+        unregisterConnectivityCallback()
+
         if (!realtimeStarted) return
         val w = wallet ?: return
         realtimeStarted = false

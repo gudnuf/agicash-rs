@@ -3,6 +3,10 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ConnectivityManager.NetworkCallback for Lane 1 Gap-E (realtime
+         online/offline lifecycle). Permission-protected at "normal"
+         level — no runtime prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".AgicashApplication"
