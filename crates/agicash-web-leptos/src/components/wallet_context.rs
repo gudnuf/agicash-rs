@@ -54,6 +54,27 @@ use uuid::Uuid;
 // build constructs a dev-defaults instance).
 use crate::config::AppConfig;
 
+// `RealtimeStatus` is re-exported in `WalletData::realtime_status` so the
+// status-banner component (and any future consumer) can match on it
+// without depending on the realtime crate directly. On native (rlib test
+// build) we stub it so the public signal still has a concrete type even
+// though the wasm-only pump never runs.
+#[cfg(target_arch = "wasm32")]
+pub use agicash_realtime::RealtimeStatus;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RealtimeStatus {
+    #[default]
+    Idle,
+    Connecting,
+    Subscribed,
+    Reconnecting,
+    Error,
+    Closed,
+    TerminalError,
+}
+
 /// Loading state envelope. Replaces a tri-state Option pattern so the
 /// view layer can distinguish "haven't asked yet" from "asked, still
 /// waiting" from "asked, failed" from "asked, here's data".
@@ -117,6 +138,33 @@ pub struct WalletData {
     /// Account list keyed by load state. `Ready(vec![])` is the
     /// canonical empty-wallet state.
     pub accounts: RwSignal<LoadState<Vec<AccountSummary>>>,
+    /// Live realtime channel status. Drives the
+    /// [`crate::components::RealtimeStatusBanner`] (Reconnecting / lost-
+    /// connection affordance). Updated by the pump in
+    /// [`WalletData::start_realtime`] on every `StatusChanged(_)` event;
+    /// stays at `Idle` if realtime never starts (e.g. native test build,
+    /// missing supabase anon key).
+    pub realtime_status: RwSignal<RealtimeStatus>,
+    /// Tracked handle to the running [`agicash_realtime::WalletRealtimeService`]
+    /// so the sign-out / session-teardown path can call `.stop()` on it
+    /// (closes the socket, drops the supervisor) — fixes the resource-leak
+    /// `.forget()` pattern Lane 2b inherited. `None` until the pump
+    /// finishes wiring (the async session-load + client-build can fail),
+    /// or after `.stop()` clears it. Wasm-only — the native rlib build
+    /// never opens a socket, so this is `Option<()>` there to keep the
+    /// `Clone + Debug` shape uniform across cfg.
+    ///
+    /// `LocalStorage` (not the default `SyncStorage`) because the wasm
+    /// `WalletRealtimeService` holds non-`Send` transport handles
+    /// (`web_sys::WebSocket`); the value is pinned to the JS main thread
+    /// where it was constructed, which is exactly what `LocalStorage`
+    /// promises. Accessing the signal from another thread would panic,
+    /// but wasm32 + leptos hydration is single-threaded by design.
+    #[cfg(target_arch = "wasm32")]
+    pub realtime_service:
+        RwSignal<Option<std::sync::Arc<agicash_realtime::WalletRealtimeService>>, LocalStorage>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub realtime_service: RwSignal<Option<()>, LocalStorage>,
     /// Idempotency latch for [`WalletData::start_realtime`]. The
     /// realtime subscription + pump are wired into the page lifetime
     /// exactly once; a Home remount (client-side nav back to `/`) must
@@ -133,7 +181,62 @@ impl WalletData {
         Self {
             user_id: RwSignal::new(None),
             accounts: RwSignal::new(LoadState::Idle),
+            realtime_status: RwSignal::new(RealtimeStatus::Idle),
+            // `new_local`: thread-pinned storage for the non-`Send`
+            // wasm transport handles inside `WalletRealtimeService`.
+            // See the struct field doc.
+            realtime_service: RwSignal::new_local(None),
             reactivity_wired: RwSignal::new(false),
+        }
+    }
+
+    /// Tear down the realtime subscription + clear local view-model
+    /// state. Called from the sign-out flow (see
+    /// [`crate::pages::SettingsIndexPage`]) before the auth signal is
+    /// cleared. Best-effort and idempotent: `.stop()` is a single
+    /// atomic-store + 1-msg broadcast, the supervisor task observes the
+    /// flag and exits at its next loop tick (closing the socket cleanly).
+    /// Safe to call when realtime never started — the service handle is
+    /// `None` and nothing happens.
+    ///
+    /// After teardown the `reactivity_wired` latch is reset so a later
+    /// sign-in can wire a fresh subscription (the App root keeps a
+    /// single `WalletData` instance for the page's lifetime).
+    pub fn teardown_realtime(&self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(service) = self.realtime_service.get_untracked() {
+            service.stop();
+        }
+        self.realtime_service.set(None);
+        self.realtime_status.set(RealtimeStatus::Idle);
+        self.reactivity_wired.set(false);
+    }
+
+    /// Reset the view-model to a freshly-signed-out shape. Companion to
+    /// [`Self::teardown_realtime`] — the sign-out path runs both so the
+    /// next sign-in starts from `Idle` accounts + no stale user id.
+    pub fn clear_for_signout(&self) {
+        self.teardown_realtime();
+        self.user_id.set(None);
+        self.accounts.set(LoadState::Idle);
+    }
+
+    /// Best-effort retry after a `TerminalError` (the `JoinRejected` /
+    /// auth-deny cap was hit, supervisor has stopped retrying). The
+    /// service's terminal latch clears on an `online: false → true`
+    /// edge (see `WalletRealtimeService::set_online`), which is the
+    /// minimal API that already exists — no new realtime surface
+    /// required. The supervisor then resumes its connect→join cycle.
+    ///
+    /// No-op if realtime never started or has already been torn down.
+    /// Wasm-only: the native rlib build has no service to poke.
+    pub fn retry_realtime(&self) {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(service) = self.realtime_service.get_untracked() {
+            // Edge-trigger the terminal latch clear. The service
+            // dedupes redundant calls cheaply (atomic swap + 1 broadcast).
+            service.set_online(false);
+            service.set_online(true);
         }
     }
 
@@ -421,15 +524,38 @@ impl WalletData {
                     factory,
                 ));
 
+                // Publish the service handle so the sign-out / teardown
+                // path can call `.stop()` (and the banner's retry-on-
+                // TerminalError can call `.set_online(false → true)` to
+                // clear the terminal latch). Replaces the
+                // `Arc::clone(...).forget()`-shaped leak the old wiring
+                // had: the `Arc` is now reachable from the view-model,
+                // so the supervisor stays addressable for its whole
+                // lifetime instead of being orphaned in a detached task.
+                wallet.realtime_service.set(Some(Arc::clone(&service)));
+
                 // Pump: on every Connected (no replay → catch up) and
                 // every broadcast Event, refetch in background/SWR mode
                 // — keep the last balance, never flash the spinner, and
                 // a refetch failure is itself non-fatal (the SWR path in
-                // `refresh_with_config` keeps stale data). StatusChanged
-                // / Error are intentionally NOT surfaced to the UI: a
-                // disconnect must keep the last balance with no error
-                // screen; the service reconnects with backoff and emits
-                // a fresh `Connected` we then catch up on.
+                // `refresh_with_config` keeps stale data).
+                //
+                // `StatusChanged(_)` is forwarded to
+                // [`WalletData::realtime_status`] so the
+                // `RealtimeStatusBanner` can render a "Reconnecting…"
+                // bar (Disconnected/Reconnecting/Error/Closed) or the
+                // persistent "Connection lost — Retry" affordance
+                // (TerminalError). The balance is NEVER blanked on a
+                // disconnect — Lane V's stale-while-revalidate
+                // discipline still owns that, the banner is purely an
+                // additive surface.
+                //
+                // `Error(_)` is logged + folded into the status banner
+                // by leaving the existing status (most often
+                // `Reconnecting` / `Error`) intact — the supervisor
+                // emits its own `StatusChanged` on transitions, so we
+                // don't need to synthesize one from a transient `Error`
+                // payload (which is opaque-string anyway).
                 {
                     let service_for_pump = Arc::clone(&service);
                     let wallet = wallet.clone();
@@ -444,12 +570,20 @@ impl WalletData {
                                         .clone()
                                         .refresh_with_config(Some(config.clone()), true);
                                 }
-                                // Lifecycle/transport status is internal:
-                                // the supervisor handles reconnect; the
-                                // UI must NOT show an error or blank the
-                                // balance on a disconnect (non-fatal).
-                                Some(WalletRealtimeEvent::StatusChanged(_))
-                                | Some(WalletRealtimeEvent::Error(_)) => {}
+                                Some(WalletRealtimeEvent::StatusChanged(status)) => {
+                                    wallet.realtime_status.set(status);
+                                }
+                                Some(WalletRealtimeEvent::Error(msg)) => {
+                                    // Log only — the supervisor emits a
+                                    // companion `StatusChanged` so the
+                                    // banner already reflects the new
+                                    // state. Toasting every transient
+                                    // socket blip would be noise.
+                                    leptos::logging::log!(
+                                        "realtime: transient error (banner reflects \
+                                         status): {msg}"
+                                    );
+                                }
                                 None => break, // sender dropped — service gone.
                             }
                         }
@@ -467,6 +601,9 @@ impl WalletData {
                 // Drive the connect→join→serve→reconnect supervisor for
                 // the page's lifetime. `run()` borrows `&self`; the
                 // `Arc` keeps the service alive across the spawned task.
+                // The view-model `Arc` (stored above) keeps the same
+                // service addressable from outside, so `teardown_realtime`
+                // can flip the stop flag and this loop exits cleanly.
                 wasm_bindgen_futures::spawn_local(async move {
                     service.run().await;
                 });
