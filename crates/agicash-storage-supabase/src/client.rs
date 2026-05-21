@@ -87,7 +87,12 @@ fn http_client() -> Result<reqwest::Client, StorageError> {
 
 /// wasm32: browser handles TLS inside `fetch`. No timeout knobs exist
 /// in the reqwest wasm builder — the browser's own policy applies.
+// The `Result` wrapper is infallible on wasm32 but kept deliberately
+// uniform with the `cfg(not(wasm32))` variant above so call sites
+// (`http_client()?`) stay identical across targets — no cfg-gated
+// callers. Hence the narrow allow rather than dropping the `Result`.
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::unnecessary_wraps)]
 fn http_client() -> Result<reqwest::Client, StorageError> {
     Ok(reqwest::Client::new())
 }
