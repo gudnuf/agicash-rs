@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -523,26 +523,26 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 public protocol AgicashWalletProtocol: AnyObject, Sendable {
-    
+
     /**
      * Register an anonymous guest account against OpenSecret. Generates a
      * throwaway password (the user never sees it) and returns the resulting
      * `Session` so the Swift consumer can persist the refresh token.
      */
     func authGuest() async throws  -> Session
-    
+
     /**
      * Email + password login.
      */
     func authLogin(email: String, password: String) async throws  -> Session
-    
+
     /**
      * Best-effort server logout. Always clears the in-memory session even
      * if the server-side call fails (e.g. expired token, network error).
      * The Swift consumer should also drop its Keychain entry on success.
      */
-    func authLogout() async throws 
-    
+    func authLogout() async throws
+
     /**
      * Register a new email + password user against OpenSecret. Mirrors the
      * web app's `/signup` flow: on success the user is auto-signed-in and
@@ -554,12 +554,12 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * without another FFI churn.
      */
     func authSignup(email: String, password: String, name: String?) async throws  -> Session
-    
+
     /**
      * Return whether the wallet currently holds a session.
      */
     func authStatus() async throws  -> AuthStatus
-    
+
     /**
      * Check whether the receiver has claimed a previously-created
      * send swap. Pure poll: re-loads the swap, asks the mint via
@@ -584,7 +584,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func checkSendSwapClaimed(swapId: String) async throws  -> SendSwapClaimSnapshot
-    
+
     /**
      * Drive a PAID quote to COMPLETED — mint proofs and credit the
      * account. Returns a [`ReceiveResult`] shape identical to
@@ -602,7 +602,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func completeMintQuote(quoteId: String) async throws  -> ReceiveResult
-    
+
     /**
      * Request a NUT-05 melt quote, persist the UNPAID row, and reserve
      * the proofs. Mirrors the CLI's `agicash send lightning <bolt11>`
@@ -622,7 +622,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * preview and create.
      */
     func createMeltQuote(bolt11: String, accountId: String?, currency: String?) async throws  -> MeltQuoteHandle
-    
+
     /**
      * Persist a new Cashu send swap and produce a wire-form token.
      * Mirrors the CLI's `agicash send <amount>` (without `--dry-run`).
@@ -633,7 +633,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * Errors mirror `prepare_send_quote` plus token-encode failures.
      */
     func createSendSwap(amount: UInt64, accountId: String?, currency: String?) async throws  -> SendSwapHandle
-    
+
     /**
      * Initiate the melt for a previously-created UNPAID quote: marks
      * it PENDING, calls NUT-05 `post_melt`, then dispatches on the
@@ -657,7 +657,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func executeMeltQuote(quoteId: String) async throws  -> MeltQuoteSnapshot
-    
+
     /**
      * Fetch the current exchange rate for one currency pair.
      *
@@ -687,14 +687,14 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * `mempool.space` fetch.
      */
     func getExchangeRate(from: String, to: String) async throws  -> ExchangeRateSnapshot
-    
+
     /**
      * Return the currently-loaded session, or `None` if the wallet is
      * logged out. Lets the Swift consumer re-sync its Keychain copy after
      * a `auth_guest` / `auth_login` call.
      */
     func getPersistedSession() async  -> Session?
-    
+
     /**
      * Load the current user row from Supabase. Requires an active session.
      *
@@ -710,7 +710,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func getUser() async throws  -> UserFfi
-    
+
     /**
      * List Supabase `wallet.accounts` rows for the currently-logged-in
      * user. For each Cashu account, sums the account's UNSPENT proofs
@@ -724,7 +724,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * proofs. A grouped query is the natural follow-up.
      */
     func listAccounts() async throws  -> [AccountFfi]
-    
+
     /**
      * Provision a new Cashu mint and create a BTC account row for it.
      *
@@ -757,7 +757,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures (network, etc.).
      */
     func mintAdd(url: String) async throws  -> MintAddResult
-    
+
     /**
      * Poll the mint for the current state of a PENDING melt quote.
      * Single-shot: reconciles change proofs + storage on PAID,
@@ -781,7 +781,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func pollMeltQuote(quoteId: String) async throws  -> MeltQuoteSnapshot
-    
+
     /**
      * Poll the mint for the current state of a previously-started
      * quote. Single-shot: returns the snapshot of the persisted row
@@ -805,7 +805,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func pollMintQuote(quoteId: String) async throws  -> MintQuoteSnapshot
-    
+
     /**
      * Compute the fee + amount breakdown for a hypothetical Lightning
      * send. Pure preview — no quote row is created, no proofs are
@@ -828,7 +828,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func prepareMeltQuote(bolt11: String, accountId: String?, currency: String?) async throws  -> MeltQuotePreview
-    
+
     /**
      * Compute the fee breakdown for a hypothetical send. Pure preview —
      * no swap row is created. Mirrors the CLI's `agicash send <amount>
@@ -846,7 +846,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func prepareSendQuote(amount: UInt64, accountId: String?, currency: String?) async throws  -> SendQuotePreview
-    
+
     /**
      * Construct a fresh [`ReceiveFlow`] handle for an interactive
      * receive-token flow. Each call returns a new orchestrator —
@@ -860,7 +860,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * otherwise.
      */
     func receiveFlow() async throws  -> ReceiveFlow
-    
+
     /**
      * Redeem a Cashu token (V3 `cashuA…` or V4 `cashuB…`).
      *
@@ -881,7 +881,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures (network, etc.).
      */
     func receiveToken(token: String) async throws  -> ReceiveResult
-    
+
     /**
      * Set the user's default account for the account's currency. Mirrors
      * the web `UserService.setDefaultAccount` exactly: writes the matching
@@ -909,7 +909,38 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func setDefaultAccount(accountId: String) async throws  -> UserFfi
-    
+
+    /**
+     * Tell the running realtime supervisor whether the host app is in
+     * the foreground / visible. `true` is the default. Backgrounding
+     * closes the socket (battery-friendly on mobile); foregrounding
+     * resubscribes. Mirrors React's `setActiveStatus`. Wired from:
+     * - iOS `scenePhase` (`.active` → true; `.inactive`/`.background` → false)
+     * - Android `ProcessLifecycleOwner` (`ON_START` → true; `ON_STOP` → false)
+     * - Web `document.visibilitychange` (Leptos drives via the realtime
+     * crate directly — it doesn't go through this FFI).
+     */
+    func setRealtimeActive(active: Bool) async throws
+
+    /**
+     * Tell the running realtime supervisor whether the host has
+     * network connectivity (iOS `NWPathMonitor`, Android
+     * `ConnectivityManager.NetworkCallback`). `true` is the default and
+     * the initial state when the supervisor starts; clients only need
+     * to call this on offline → online transitions and back. Mirrors
+     * React's `useSupabaseRealtimeActivityTracking.setOnlineStatus`.
+     * See `agicash_realtime::WalletRealtimeService::set_online` for the
+     * terminal-latch reset semantics (an `online=true` after `false`
+     * clears a previously-fired `TerminalError` so a session resume
+     * gets one more chance under fresh network).
+     *
+     * No-op if `start_wallet_events` hasn't been called or has been
+     * stopped — there's no supervisor to inform. Always returns Ok so
+     * the platform can call this from a lifecycle observer without
+     * gating on `realtimeStarted`.
+     */
+    func setRealtimeOnline(online: Bool) async throws
+
     /**
      * Rehydrate an existing session into the wallet. Called by the Swift
      * consumer on app launch after reading the refresh token from Keychain.
@@ -918,8 +949,8 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * cleared and an `Auth` error is returned so the consumer can drop the
      * Keychain entry.
      */
-    func setSession(userIdUuid: String, refreshToken: String) async throws 
-    
+    func setSession(userIdUuid: String, refreshToken: String) async throws
+
     /**
      * Install a filesystem-backed `SessionStorage` rooted at the given
      * directory. On Android the caller passes
@@ -939,8 +970,8 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * returns an `Internal` error if the storage backend isn't compiled
      * in on the current target.
      */
-    func setSessionStorageDir(dir: String) async throws 
-    
+    func setSessionStorageDir(dir: String) async throws
+
     /**
      * Start a NUT-04 mint quote — request a BOLT-11 invoice from the
      * mint backing the user's Cashu account.
@@ -972,7 +1003,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * - `FfiError::Storage` for raw Supabase failures.
      */
     func startMintQuote(amount: UInt64, accountId: String?, currency: String?) async throws  -> MintQuoteHandle
-    
+
     /**
      * Start the realtime wallet-event subscription for the
      * currently-logged-in user. Joins `realtime:wallet:<userId>` and
@@ -991,16 +1022,16 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * Errors with `FfiError::Auth { UNAUTHENTICATED }` if no session is
      * loaded (there is no user id to scope the channel to).
      */
-    func startWalletEvents(listener: WalletEventListener) async throws 
-    
+    func startWalletEvents(listener: WalletEventListener) async throws
+
     /**
      * Stop the realtime subscription: `phx_leave` + close the socket
      * (clean), then abort the supervisor task. Idempotent — calling it
      * with nothing running is a no-op (the platform calls it
      * unconditionally on teardown / sign-out).
      */
-    func stopWalletEvents() async throws 
-    
+    func stopWalletEvents() async throws
+
     /**
      * Attempt to rehydrate a previously-stored session from the
      * installed `SessionStorage` backend. Returns the rehydrated
@@ -1015,7 +1046,7 @@ public protocol AgicashWalletProtocol: AnyObject, Sendable {
      * refresh chain, same in-memory slot rehydration.
      */
     func tryRestoreSession() async throws  -> Session?
-    
+
 }
 open class AgicashWallet: AgicashWalletProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -1079,9 +1110,9 @@ public convenience init(opensecretUrl: String, opensecretClientIdUuid: String, s
         try! rustCall { uniffi_agicash_ffi_fn_free_agicashwallet(handle, $0) }
     }
 
-    
 
-    
+
+
     /**
      * Register an anonymous guest account against OpenSecret. Generates a
      * throwaway password (the user never sees it) and returns the resulting
@@ -1093,7 +1124,7 @@ open func authGuest()async throws  -> Session  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_auth_guest(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1103,7 +1134,7 @@ open func authGuest()async throws  -> Session  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Email + password login.
      */
@@ -1123,7 +1154,7 @@ open func authLogin(email: String, password: String)async throws  -> Session  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Best-effort server logout. Always clears the in-memory session even
      * if the server-side call fails (e.g. expired token, network error).
@@ -1135,7 +1166,7 @@ open func authLogout()async throws   {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_auth_logout(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_void,
@@ -1145,7 +1176,7 @@ open func authLogout()async throws   {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Register a new email + password user against OpenSecret. Mirrors the
      * web app's `/signup` flow: on success the user is auto-signed-in and
@@ -1172,7 +1203,7 @@ open func authSignup(email: String, password: String, name: String?)async throws
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Return whether the wallet currently holds a session.
      */
@@ -1182,7 +1213,7 @@ open func authStatus()async throws  -> AuthStatus  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_auth_status(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1192,7 +1223,7 @@ open func authStatus()async throws  -> AuthStatus  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Check whether the receiver has claimed a previously-created
      * send swap. Pure poll: re-loads the swap, asks the mint via
@@ -1232,7 +1263,7 @@ open func checkSendSwapClaimed(swapId: String)async throws  -> SendSwapClaimSnap
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Drive a PAID quote to COMPLETED — mint proofs and credit the
      * account. Returns a [`ReceiveResult`] shape identical to
@@ -1265,7 +1296,7 @@ open func completeMintQuote(quoteId: String)async throws  -> ReceiveResult  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Request a NUT-05 melt quote, persist the UNPAID row, and reserve
      * the proofs. Mirrors the CLI's `agicash send lightning <bolt11>`
@@ -1300,7 +1331,7 @@ open func createMeltQuote(bolt11: String, accountId: String?, currency: String?)
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Persist a new Cashu send swap and produce a wire-form token.
      * Mirrors the CLI's `agicash send <amount>` (without `--dry-run`).
@@ -1326,7 +1357,7 @@ open func createSendSwap(amount: UInt64, accountId: String?, currency: String?)a
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Initiate the melt for a previously-created UNPAID quote: marks
      * it PENDING, calls NUT-05 `post_melt`, then dispatches on the
@@ -1365,7 +1396,7 @@ open func executeMeltQuote(quoteId: String)async throws  -> MeltQuoteSnapshot  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Fetch the current exchange rate for one currency pair.
      *
@@ -1410,7 +1441,7 @@ open func getExchangeRate(from: String, to: String)async throws  -> ExchangeRate
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Return the currently-loaded session, or `None` if the wallet is
      * logged out. Lets the Swift consumer re-sync its Keychain copy after
@@ -1422,7 +1453,7 @@ open func getPersistedSession()async  -> Session?  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_get_persisted_session(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1430,10 +1461,10 @@ open func getPersistedSession()async  -> Session?  {
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeSession.lift,
             errorHandler: nil
-            
+
         )
 }
-    
+
     /**
      * Load the current user row from Supabase. Requires an active session.
      *
@@ -1454,7 +1485,7 @@ open func getUser()async throws  -> UserFfi  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_get_user(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1464,7 +1495,7 @@ open func getUser()async throws  -> UserFfi  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * List Supabase `wallet.accounts` rows for the currently-logged-in
      * user. For each Cashu account, sums the account's UNSPENT proofs
@@ -1483,7 +1514,7 @@ open func listAccounts()async throws  -> [AccountFfi]  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_list_accounts(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1493,7 +1524,7 @@ open func listAccounts()async throws  -> [AccountFfi]  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Provision a new Cashu mint and create a BTC account row for it.
      *
@@ -1541,7 +1572,7 @@ open func mintAdd(url: String)async throws  -> MintAddResult  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Poll the mint for the current state of a PENDING melt quote.
      * Single-shot: reconciles change proofs + storage on PAID,
@@ -1580,7 +1611,7 @@ open func pollMeltQuote(quoteId: String)async throws  -> MeltQuoteSnapshot  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Poll the mint for the current state of a previously-started
      * quote. Single-shot: returns the snapshot of the persisted row
@@ -1619,7 +1650,7 @@ open func pollMintQuote(quoteId: String)async throws  -> MintQuoteSnapshot  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Compute the fee + amount breakdown for a hypothetical Lightning
      * send. Pure preview — no quote row is created, no proofs are
@@ -1657,7 +1688,7 @@ open func prepareMeltQuote(bolt11: String, accountId: String?, currency: String?
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Compute the fee breakdown for a hypothetical send. Pure preview —
      * no swap row is created. Mirrors the CLI's `agicash send <amount>
@@ -1690,7 +1721,7 @@ open func prepareSendQuote(amount: UInt64, accountId: String?, currency: String?
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Construct a fresh [`ReceiveFlow`] handle for an interactive
      * receive-token flow. Each call returns a new orchestrator —
@@ -1709,7 +1740,7 @@ open func receiveFlow()async throws  -> ReceiveFlow  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_receive_flow(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_u64,
@@ -1719,7 +1750,7 @@ open func receiveFlow()async throws  -> ReceiveFlow  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Redeem a Cashu token (V3 `cashuA…` or V4 `cashuB…`).
      *
@@ -1755,7 +1786,7 @@ open func receiveToken(token: String)async throws  -> ReceiveResult  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Set the user's default account for the account's currency. Mirrors
      * the web `UserService.setDefaultAccount` exactly: writes the matching
@@ -1798,7 +1829,68 @@ open func setDefaultAccount(accountId: String)async throws  -> UserFfi  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
+    /**
+     * Tell the running realtime supervisor whether the host app is in
+     * the foreground / visible. `true` is the default. Backgrounding
+     * closes the socket (battery-friendly on mobile); foregrounding
+     * resubscribes. Mirrors React's `setActiveStatus`. Wired from:
+     * - iOS `scenePhase` (`.active` → true; `.inactive`/`.background` → false)
+     * - Android `ProcessLifecycleOwner` (`ON_START` → true; `ON_STOP` → false)
+     * - Web `document.visibilitychange` (Leptos drives via the realtime
+     * crate directly — it doesn't go through this FFI).
+     */
+open func setRealtimeActive(active: Bool)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_set_realtime_active(
+                    self.uniffiCloneHandle(),
+                    FfiConverterBool.lower(active)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_void,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_void,
+            freeFunc: ffi_agicash_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+
+    /**
+     * Tell the running realtime supervisor whether the host has
+     * network connectivity (iOS `NWPathMonitor`, Android
+     * `ConnectivityManager.NetworkCallback`). `true` is the default and
+     * the initial state when the supervisor starts; clients only need
+     * to call this on offline → online transitions and back. Mirrors
+     * React's `useSupabaseRealtimeActivityTracking.setOnlineStatus`.
+     * See `agicash_realtime::WalletRealtimeService::set_online` for the
+     * terminal-latch reset semantics (an `online=true` after `false`
+     * clears a previously-fired `TerminalError` so a session resume
+     * gets one more chance under fresh network).
+     *
+     * No-op if `start_wallet_events` hasn't been called or has been
+     * stopped — there's no supervisor to inform. Always returns Ok so
+     * the platform can call this from a lifecycle observer without
+     * gating on `realtimeStarted`.
+     */
+open func setRealtimeOnline(online: Bool)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_agicash_ffi_fn_method_agicashwallet_set_realtime_online(
+                    self.uniffiCloneHandle(),
+                    FfiConverterBool.lower(online)
+                )
+            },
+            pollFunc: ffi_agicash_ffi_rust_future_poll_void,
+            completeFunc: ffi_agicash_ffi_rust_future_complete_void,
+            freeFunc: ffi_agicash_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+
     /**
      * Rehydrate an existing session into the wallet. Called by the Swift
      * consumer on app launch after reading the refresh token from Keychain.
@@ -1823,7 +1915,7 @@ open func setSession(userIdUuid: String, refreshToken: String)async throws   {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Install a filesystem-backed `SessionStorage` rooted at the given
      * directory. On Android the caller passes
@@ -1859,7 +1951,7 @@ open func setSessionStorageDir(dir: String)async throws   {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Start a NUT-04 mint quote — request a BOLT-11 invoice from the
      * mint backing the user's Cashu account.
@@ -1906,7 +1998,7 @@ open func startMintQuote(amount: UInt64, accountId: String?, currency: String?)a
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Start the realtime wallet-event subscription for the
      * currently-logged-in user. Joins `realtime:wallet:<userId>` and
@@ -1941,7 +2033,7 @@ open func startWalletEvents(listener: WalletEventListener)async throws   {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Stop the realtime subscription: `phx_leave` + close the socket
      * (clean), then abort the supervisor task. Idempotent — calling it
@@ -1954,7 +2046,7 @@ open func stopWalletEvents()async throws   {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_stop_wallet_events(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_void,
@@ -1964,7 +2056,7 @@ open func stopWalletEvents()async throws   {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
+
     /**
      * Attempt to rehydrate a previously-stored session from the
      * installed `SessionStorage` backend. Returns the rehydrated
@@ -1984,7 +2076,7 @@ open func tryRestoreSession()async throws  -> Session?  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_agicashwallet_try_restore_session(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -1994,9 +2086,9 @@ open func tryRestoreSession()async throws  -> Session?  {
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
 
-    
+
+
 }
 
 
@@ -2054,19 +2146,19 @@ public func FfiConverterTypeAgicashWallet_lower(_ value: AgicashWallet) -> UInt6
  * returns a fresh handle — flows are not persisted across constructions.
  */
 public protocol ReceiveFlowProtocol: AnyObject, Sendable {
-    
+
     /**
      * Snapshot the current state of the flow. Cheap; safe to call from a
      * polling UI loop.
      */
     func currentState() async  -> ReceiveFlowStateFfi
-    
+
     /**
      * Send a UI event into the flow and run any side effects it triggers.
      * Returns the next stable state (waiting on user input or terminal).
      */
     func dispatch(event: ReceiveFlowEventFfi) async throws  -> ReceiveFlowStateFfi
-    
+
 }
 /**
  * Long-lived handle the UI holds for the duration of one receive flow.
@@ -2121,9 +2213,9 @@ open class ReceiveFlow: ReceiveFlowProtocol, @unchecked Sendable {
         try! rustCall { uniffi_agicash_ffi_fn_free_receiveflow(handle, $0) }
     }
 
-    
 
-    
+
+
     /**
      * Snapshot the current state of the flow. Cheap; safe to call from a
      * polling UI loop.
@@ -2134,7 +2226,7 @@ open func currentState()async  -> ReceiveFlowStateFfi  {
             rustFutureFunc: {
                 uniffi_agicash_ffi_fn_method_receiveflow_current_state(
                     self.uniffiCloneHandle()
-                    
+
                 )
             },
             pollFunc: ffi_agicash_ffi_rust_future_poll_rust_buffer,
@@ -2142,10 +2234,10 @@ open func currentState()async  -> ReceiveFlowStateFfi  {
             freeFunc: ffi_agicash_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeReceiveFlowStateFfi_lift,
             errorHandler: nil
-            
+
         )
 }
-    
+
     /**
      * Send a UI event into the flow and run any side effects it triggers.
      * Returns the next stable state (waiting on user input or terminal).
@@ -2166,9 +2258,9 @@ open func dispatch(event: ReceiveFlowEventFfi)async throws  -> ReceiveFlowStateF
             errorHandler: FfiConverterTypeFfiError_lift
         )
 }
-    
 
-    
+
+
 }
 
 
@@ -2253,23 +2345,23 @@ public struct AccountFfi: Equatable, Hashable {
     public init(
         /**
          * Stringified UUID for the account row.
-         */id: String, name: String, 
+         */id: String, name: String,
         /**
          * One of `"cashu"` or `"spark"` (matches the wire enum on the Rust side).
-         */accountType: String, 
+         */accountType: String,
         /**
          * One of `"BTC"`, `"USD"`, `"USDB"`.
-         */currency: String, 
+         */currency: String,
         /**
          * Cashu mints set this to the mint URL from `details.mint_url`; Spark
          * accounts return `None`.
-         */mintUrl: String?, 
+         */mintUrl: String?,
         /**
          * Decimal-stringified balance in the account's smallest unit (`sat`
          * for BTC, `cent` for USD/USDB). For Cashu accounts this is the sum of
          * UNSPENT proof amounts; for Spark accounts (slice 9 pending) it is
          * always `"0"`.
-         */balance: String, 
+         */balance: String,
         /**
          * Sub-unit label that pairs with `balance`. `"sat"` for BTC accounts,
          * `"cent"` for USD/USDB accounts. Empty string only for accounts whose
@@ -2284,7 +2376,7 @@ public struct AccountFfi: Equatable, Hashable {
         self.unit = unit
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2298,12 +2390,12 @@ public struct FfiConverterTypeAccountFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountFfi {
         return
             try AccountFfi(
-                id: FfiConverterString.read(from: &buf), 
-                name: FfiConverterString.read(from: &buf), 
-                accountType: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                mintUrl: FfiConverterOptionString.read(from: &buf), 
-                balance: FfiConverterString.read(from: &buf), 
+                id: FfiConverterString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf),
+                accountType: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                mintUrl: FfiConverterOptionString.read(from: &buf),
+                balance: FfiConverterString.read(from: &buf),
                 unit: FfiConverterString.read(from: &buf)
         )
     }
@@ -2356,7 +2448,7 @@ public struct AlreadyClaimedInfoFfi: Equatable, Hashable {
         self.tokenHash = tokenHash
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2370,10 +2462,10 @@ public struct FfiConverterTypeAlreadyClaimedInfoFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AlreadyClaimedInfoFfi {
         return
             try AlreadyClaimedInfoFfi(
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
-                mintUrl: FfiConverterString.read(from: &buf), 
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
+                mintUrl: FfiConverterString.read(from: &buf),
                 tokenHash: FfiConverterString.read(from: &buf)
         )
     }
@@ -2412,7 +2504,7 @@ public struct AuthStatus: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(loggedIn: Bool, 
+    public init(loggedIn: Bool,
         /**
          * Stringified user UUID when `logged_in == true`, else None.
          */userId: String?) {
@@ -2420,7 +2512,7 @@ public struct AuthStatus: Equatable, Hashable {
         self.userId = userId
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2434,7 +2526,7 @@ public struct FfiConverterTypeAuthStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AuthStatus {
         return
             try AuthStatus(
-                loggedIn: FfiConverterBool.read(from: &buf), 
+                loggedIn: FfiConverterBool.read(from: &buf),
                 userId: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2504,11 +2596,11 @@ public struct ExchangeRateSnapshot: Equatable, Hashable {
          * Price of `1` major unit of `from` in major units of `to`.
          * Decimal-stringified (matches the `ReceiveResult.amount`
          * convention).
-         */rate: String, 
+         */rate: String,
         /**
          * Canonical upper-case source currency code (`BTC`, `USD`,
          * `USDB`).
-         */from: String, 
+         */from: String,
         /**
          * Canonical upper-case target currency code (`BTC`, `USD`,
          * `USDB`).
@@ -2518,7 +2610,7 @@ public struct ExchangeRateSnapshot: Equatable, Hashable {
         self.to = to
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2532,8 +2624,8 @@ public struct FfiConverterTypeExchangeRateSnapshot: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ExchangeRateSnapshot {
         return
             try ExchangeRateSnapshot(
-                rate: FfiConverterString.read(from: &buf), 
-                from: FfiConverterString.read(from: &buf), 
+                rate: FfiConverterString.read(from: &buf),
+                from: FfiConverterString.read(from: &buf),
                 to: FfiConverterString.read(from: &buf)
         )
     }
@@ -2608,22 +2700,22 @@ public struct LightningAddressInfo: Equatable, Hashable {
     public init(
         /**
          * Must be `"payRequest"` for LUD-06 (the resolver enforces this).
-         */tag: String, 
+         */tag: String,
         /**
          * Callback URL the wallet GETs with `?amount=<msat>` to receive
          * an invoice.
-         */callback: String, 
+         */callback: String,
         /**
          * Minimum amount in millisats the service is willing to invoice.
-         */minSendable: UInt64, 
+         */minSendable: UInt64,
         /**
          * Maximum amount in millisats the service is willing to invoice.
-         */maxSendable: UInt64, 
+         */maxSendable: UInt64,
         /**
          * Raw LUD-06 metadata blob (JSON-encoded string). Not parsed here
          * — surfaced verbatim so the UI can extract `text/plain` or
          * `image/png` entries on demand.
-         */metadata: String, 
+         */metadata: String,
         /**
          * Maximum comment length the server accepts per LUD-12, or
          * `None` if comments are not advertised.
@@ -2636,7 +2728,7 @@ public struct LightningAddressInfo: Equatable, Hashable {
         self.commentAllowed = commentAllowed
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2650,11 +2742,11 @@ public struct FfiConverterTypeLightningAddressInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LightningAddressInfo {
         return
             try LightningAddressInfo(
-                tag: FfiConverterString.read(from: &buf), 
-                callback: FfiConverterString.read(from: &buf), 
-                minSendable: FfiConverterUInt64.read(from: &buf), 
-                maxSendable: FfiConverterUInt64.read(from: &buf), 
-                metadata: FfiConverterString.read(from: &buf), 
+                tag: FfiConverterString.read(from: &buf),
+                callback: FfiConverterString.read(from: &buf),
+                minSendable: FfiConverterUInt64.read(from: &buf),
+                maxSendable: FfiConverterUInt64.read(from: &buf),
+                metadata: FfiConverterString.read(from: &buf),
                 commentAllowed: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
@@ -2710,7 +2802,7 @@ public struct LightningAddressParts: Equatable, Hashable {
     public init(
         /**
          * Lowercase localpart per LUD-16 (allowed chars: `a-z 0-9 _ -`).
-         */localpart: String, 
+         */localpart: String,
         /**
          * Domain portion — may include a port for local-dev addresses
          * (e.g. `localhost:8080`).
@@ -2719,7 +2811,7 @@ public struct LightningAddressParts: Equatable, Hashable {
         self.domain = domain
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2733,7 +2825,7 @@ public struct FfiConverterTypeLightningAddressParts: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LightningAddressParts {
         return
             try LightningAddressParts(
-                localpart: FfiConverterString.read(from: &buf), 
+                localpart: FfiConverterString.read(from: &buf),
                 domain: FfiConverterString.read(from: &buf)
         )
     }
@@ -2833,39 +2925,39 @@ public struct MeltQuoteHandle: Equatable, Hashable {
         /**
          * Wallet-side UUID of the persisted quote row. Pass this to
          * `execute_melt_quote` and `poll_melt_quote`.
-         */quoteId: String, 
+         */quoteId: String,
         /**
          * Mint-side NUT-05 quote id string. Informational; not used for
          * follow-up FFI calls.
-         */meltQuoteId: String, 
+         */meltQuoteId: String,
         /**
          * BOLT-11 invoice the mint pays on the user's behalf.
-         */invoice: String, 
+         */invoice: String,
         /**
          * Hex-encoded BOLT-11 payment hash.
-         */paymentHash: String, 
+         */paymentHash: String,
         /**
          * Amount the receiver gets. Decimal-stringified (matches the
          * `ReceiveResult.amount` convention).
-         */amount: String, 
+         */amount: String,
         /**
          * Mint-quoted Lightning fee reserve. Decimal-stringified.
-         */lightningFeeReserve: String, 
+         */lightningFeeReserve: String,
         /**
          * Cashu input fee. Decimal-stringified.
-         */cashuFee: String, 
+         */cashuFee: String,
         /**
          * `lightning_fee_reserve + cashu_fee`. Decimal-stringified.
-         */totalFee: String, 
+         */totalFee: String,
         /**
          * Cashu sub-unit (`sat`, `usd`).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`).
-         */currency: String, 
+         */currency: String,
         /**
          * UUID of the account the send debits.
-         */accountId: String, 
+         */accountId: String,
         /**
          * ISO 8601 timestamp at which the quote expires.
          */expiresAt: String) {
@@ -2883,7 +2975,7 @@ public struct MeltQuoteHandle: Equatable, Hashable {
         self.expiresAt = expiresAt
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -2897,17 +2989,17 @@ public struct FfiConverterTypeMeltQuoteHandle: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteHandle {
         return
             try MeltQuoteHandle(
-                quoteId: FfiConverterString.read(from: &buf), 
-                meltQuoteId: FfiConverterString.read(from: &buf), 
-                invoice: FfiConverterString.read(from: &buf), 
-                paymentHash: FfiConverterString.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
-                lightningFeeReserve: FfiConverterString.read(from: &buf), 
-                cashuFee: FfiConverterString.read(from: &buf), 
-                totalFee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
+                quoteId: FfiConverterString.read(from: &buf),
+                meltQuoteId: FfiConverterString.read(from: &buf),
+                invoice: FfiConverterString.read(from: &buf),
+                paymentHash: FfiConverterString.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
+                lightningFeeReserve: FfiConverterString.read(from: &buf),
+                cashuFee: FfiConverterString.read(from: &buf),
+                totalFee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
                 expiresAt: FfiConverterString.read(from: &buf)
         )
     }
@@ -3009,34 +3101,34 @@ public struct MeltQuotePreview: Equatable, Hashable {
         /**
          * The amount the receiver gets (the BOLT-11 invoice amount), in
          * the account's minor unit. Decimal-stringified.
-         */amount: String, 
+         */amount: String,
         /**
          * Mint-quoted Lightning fee reserve. The actual Lightning fee is
          * `<= this`; any unspent reserve is refunded as change on PAID.
          * Decimal-stringified.
-         */lightningFeeReserve: String, 
+         */lightningFeeReserve: String,
         /**
          * Cashu input fee for the proofs the wallet will spend.
          * Decimal-stringified.
-         */cashuFee: String, 
+         */cashuFee: String,
         /**
          * `lightning_fee_reserve + cashu_fee` — the worst-case fee.
          * Decimal-stringified.
-         */totalFee: String, 
+         */totalFee: String,
         /**
          * `amount + total_fee` — the worst-case total deducted from the
          * account (the actual debit may be lower after the reserve
          * refund). Decimal-stringified.
-         */totalAmount: String, 
+         */totalAmount: String,
         /**
          * Cashu sub-unit (`sat`, `usd`).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`).
-         */currency: String, 
+         */currency: String,
         /**
          * UUID of the account the send will debit.
-         */accountId: String, 
+         */accountId: String,
         /**
          * Hex-encoded BOLT-11 payment hash. Stable identifier for the
          * receipt / debugging.
@@ -3052,7 +3144,7 @@ public struct MeltQuotePreview: Equatable, Hashable {
         self.paymentHash = paymentHash
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3066,14 +3158,14 @@ public struct FfiConverterTypeMeltQuotePreview: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuotePreview {
         return
             try MeltQuotePreview(
-                amount: FfiConverterString.read(from: &buf), 
-                lightningFeeReserve: FfiConverterString.read(from: &buf), 
-                cashuFee: FfiConverterString.read(from: &buf), 
-                totalFee: FfiConverterString.read(from: &buf), 
-                totalAmount: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
+                amount: FfiConverterString.read(from: &buf),
+                lightningFeeReserve: FfiConverterString.read(from: &buf),
+                cashuFee: FfiConverterString.read(from: &buf),
+                totalFee: FfiConverterString.read(from: &buf),
+                totalAmount: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
                 paymentHash: FfiConverterString.read(from: &buf)
         )
     }
@@ -3146,23 +3238,23 @@ public struct MeltQuoteSnapshot: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(state: MeltQuoteFfiState, 
+    public init(state: MeltQuoteFfiState,
         /**
          * Operator-facing failure message. `Some` iff `state == Failed`.
-         */failureReason: String?, 
+         */failureReason: String?,
         /**
          * BOLT-11 payment preimage proving settlement. `Some` iff
          * `state == Paid`.
-         */paymentPreimage: String?, 
+         */paymentPreimage: String?,
         /**
          * Actual Lightning fee charged (`lightning_fee_reserve` minus the
          * refunded change). Decimal-stringified. `Some` iff
          * `state == Paid`.
-         */lightningFee: String?, 
+         */lightningFee: String?,
         /**
          * `amount + lightning_fee` — what really left the account in
          * network terms. Decimal-stringified. `Some` iff `state == Paid`.
-         */amountSpent: String?, 
+         */amountSpent: String?,
         /**
          * `lightning_fee + cashu_fee`. Decimal-stringified. `Some` iff
          * `state == Paid`.
@@ -3175,7 +3267,7 @@ public struct MeltQuoteSnapshot: Equatable, Hashable {
         self.totalFee = totalFee
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3189,11 +3281,11 @@ public struct FfiConverterTypeMeltQuoteSnapshot: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteSnapshot {
         return
             try MeltQuoteSnapshot(
-                state: FfiConverterTypeMeltQuoteFfiState.read(from: &buf), 
-                failureReason: FfiConverterOptionString.read(from: &buf), 
-                paymentPreimage: FfiConverterOptionString.read(from: &buf), 
-                lightningFee: FfiConverterOptionString.read(from: &buf), 
-                amountSpent: FfiConverterOptionString.read(from: &buf), 
+                state: FfiConverterTypeMeltQuoteFfiState.read(from: &buf),
+                failureReason: FfiConverterOptionString.read(from: &buf),
+                paymentPreimage: FfiConverterOptionString.read(from: &buf),
+                lightningFee: FfiConverterOptionString.read(from: &buf),
+                amountSpent: FfiConverterOptionString.read(from: &buf),
                 totalFee: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3260,15 +3352,15 @@ public struct MintAddResult: Equatable, Hashable {
     public init(
         /**
          * Stringified UUID of the new `wallet.accounts` row.
-         */accountId: String, 
+         */accountId: String,
         /**
          * Human-readable mint name (NUT-06 `name`, falling back to the URL
          * itself when the mint doesn't supply one).
-         */mintName: String, 
+         */mintName: String,
         /**
          * Canonical mint URL (parsed through `MintUrl`, so trailing-slash
          * normalized).
-         */mintUrl: String, 
+         */mintUrl: String,
         /**
          * Currency code the account was created with — always `"BTC"` for
          * now, but exposed so the iOS UI can render it in the success state
@@ -3280,7 +3372,7 @@ public struct MintAddResult: Equatable, Hashable {
         self.currency = currency
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3294,9 +3386,9 @@ public struct FfiConverterTypeMintAddResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MintAddResult {
         return
             try MintAddResult(
-                accountId: FfiConverterString.read(from: &buf), 
-                mintName: FfiConverterString.read(from: &buf), 
-                mintUrl: FfiConverterString.read(from: &buf), 
+                accountId: FfiConverterString.read(from: &buf),
+                mintName: FfiConverterString.read(from: &buf),
+                mintUrl: FfiConverterString.read(from: &buf),
                 currency: FfiConverterString.read(from: &buf)
         )
     }
@@ -3347,7 +3439,7 @@ public struct MintConfirmationFfi: Equatable, Hashable {
         self.fee = fee
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3361,11 +3453,11 @@ public struct FfiConverterTypeMintConfirmationFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MintConfirmationFfi {
         return
             try MintConfirmationFfi(
-                mintUrl: FfiConverterString.read(from: &buf), 
-                mintName: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
+                mintUrl: FfiConverterString.read(from: &buf),
+                mintName: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
                 fee: FfiConverterString.read(from: &buf)
         )
     }
@@ -3462,34 +3554,34 @@ public struct MintQuoteHandle: Equatable, Hashable {
         /**
          * Wallet-side UUID of the persisted quote row. Pass this to
          * `poll_mint_quote` and `complete_mint_quote`.
-         */quoteId: String, 
+         */quoteId: String,
         /**
          * Mint-side NUT-04 quote id string. Informational; not used for
          * follow-up FFI calls.
-         */mintQuoteId: String, 
+         */mintQuoteId: String,
         /**
          * BOLT-11 payment request the user pays.
-         */invoice: String, 
+         */invoice: String,
         /**
          * Hex-encoded BOLT-11 payment hash.
-         */paymentHash: String, 
+         */paymentHash: String,
         /**
          * Amount credited on completion. Decimal-stringified (matches the
          * `ReceiveResult.amount` convention).
-         */amount: String, 
+         */amount: String,
         /**
          * Mint fee added to the invoice amount. Decimal-stringified.
          * `"0"` when the mint charges nothing.
-         */fee: String, 
+         */fee: String,
         /**
          * Cashu sub-unit (`sat`, `usd`).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`).
-         */currency: String, 
+         */currency: String,
         /**
          * UUID of the account that will receive the proofs.
-         */accountId: String, 
+         */accountId: String,
         /**
          * ISO 8601 timestamp at which the invoice expires.
          */expiresAt: String) {
@@ -3505,7 +3597,7 @@ public struct MintQuoteHandle: Equatable, Hashable {
         self.expiresAt = expiresAt
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3519,15 +3611,15 @@ public struct FfiConverterTypeMintQuoteHandle: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MintQuoteHandle {
         return
             try MintQuoteHandle(
-                quoteId: FfiConverterString.read(from: &buf), 
-                mintQuoteId: FfiConverterString.read(from: &buf), 
-                invoice: FfiConverterString.read(from: &buf), 
-                paymentHash: FfiConverterString.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
-                fee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
+                quoteId: FfiConverterString.read(from: &buf),
+                mintQuoteId: FfiConverterString.read(from: &buf),
+                invoice: FfiConverterString.read(from: &buf),
+                paymentHash: FfiConverterString.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
+                fee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
                 expiresAt: FfiConverterString.read(from: &buf)
         )
     }
@@ -3579,7 +3671,7 @@ public struct MintQuoteSnapshot: Equatable, Hashable {
         self.failureReason = failureReason
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3593,7 +3685,7 @@ public struct FfiConverterTypeMintQuoteSnapshot: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MintQuoteSnapshot {
         return
             try MintQuoteSnapshot(
-                state: FfiConverterTypeMintQuoteFfiState.read(from: &buf), 
+                state: FfiConverterTypeMintQuoteFfiState.read(from: &buf),
                 failureReason: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3647,7 +3739,7 @@ public struct ReceiveFlowResultFfi: Equatable, Hashable {
         self.tokenHash = tokenHash
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3661,13 +3753,13 @@ public struct FfiConverterTypeReceiveFlowResultFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveFlowResultFfi {
         return
             try ReceiveFlowResultFfi(
-                status: FfiConverterTypeReceiveStatusFfi.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
-                fee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
-                mintUrl: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeReceiveStatusFfi.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
+                fee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
+                mintUrl: FfiConverterString.read(from: &buf),
                 tokenHash: FfiConverterString.read(from: &buf)
         )
     }
@@ -3744,27 +3836,27 @@ public struct ReceiveResult: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(status: ReceiveStatus, 
+    public init(status: ReceiveStatus,
         /**
          * Amount credited after mint fees. Decimal-stringified.
-         */amount: String, 
+         */amount: String,
         /**
          * Mint fee deducted from the input proofs. Decimal-stringified.
-         */fee: String, 
+         */fee: String,
         /**
          * Cashu sub-unit (`sat`, `cent`, etc.).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`, `USDB`).
-         */currency: String, 
+         */currency: String,
         /**
          * Stringified UUID of the account that received the proofs.
-         */accountId: String, 
+         */accountId: String,
         /**
          * Mint URL the token was redeemed against (canonical, no trailing
          * slash normalization is applied at the FFI seam — the iOS app
          * renders whatever the swap row carries).
-         */mintUrl: String, 
+         */mintUrl: String,
         /**
          * SHA-256 hex of the encoded token. Useful for receipts and
          * dedupe-by-hash UI.
@@ -3779,7 +3871,7 @@ public struct ReceiveResult: Equatable, Hashable {
         self.tokenHash = tokenHash
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3793,13 +3885,13 @@ public struct FfiConverterTypeReceiveResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveResult {
         return
             try ReceiveResult(
-                status: FfiConverterTypeReceiveStatus.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
-                fee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
-                mintUrl: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeReceiveStatus.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
+                fee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
+                mintUrl: FfiConverterString.read(from: &buf),
                 tokenHash: FfiConverterString.read(from: &buf)
         )
     }
@@ -3890,36 +3982,36 @@ public struct SendQuotePreview: Equatable, Hashable {
     public init(
         /**
          * What the user asked to send (their typed amount).
-         */amountRequested: String, 
+         */amountRequested: String,
         /**
          * What is encoded in the token the receiver claims. Equals
          * `amount_requested + cashu_receive_fee` because the sender
          * pre-pays the receive fee out of their own proofs.
-         */amountToSend: String, 
+         */amountToSend: String,
         /**
          * `amount_to_send + cashu_send_fee` — total deducted from the
          * sender's account.
-         */totalAmount: String, 
+         */totalAmount: String,
         /**
          * `cashu_send_fee + cashu_receive_fee`.
-         */totalFee: String, 
+         */totalFee: String,
         /**
          * Mint fee for the sender's input swap. Zero when the account
          * already holds exact-amount proofs.
-         */cashuSendFee: String, 
+         */cashuSendFee: String,
         /**
          * Mint fee the receiver pays when claiming (pre-paid by sender via
          * the token's encoded value).
-         */cashuReceiveFee: String, 
+         */cashuReceiveFee: String,
         /**
          * Cashu sub-unit (`sat`, `usd`).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`).
-         */currency: String, 
+         */currency: String,
         /**
          * UUID of the account the send debits.
-         */accountId: String, 
+         */accountId: String,
         /**
          * Canonical mint URL.
          */mintUrl: String) {
@@ -3935,7 +4027,7 @@ public struct SendQuotePreview: Equatable, Hashable {
         self.mintUrl = mintUrl
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -3949,15 +4041,15 @@ public struct FfiConverterTypeSendQuotePreview: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendQuotePreview {
         return
             try SendQuotePreview(
-                amountRequested: FfiConverterString.read(from: &buf), 
-                amountToSend: FfiConverterString.read(from: &buf), 
-                totalAmount: FfiConverterString.read(from: &buf), 
-                totalFee: FfiConverterString.read(from: &buf), 
-                cashuSendFee: FfiConverterString.read(from: &buf), 
-                cashuReceiveFee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
+                amountRequested: FfiConverterString.read(from: &buf),
+                amountToSend: FfiConverterString.read(from: &buf),
+                totalAmount: FfiConverterString.read(from: &buf),
+                totalFee: FfiConverterString.read(from: &buf),
+                cashuSendFee: FfiConverterString.read(from: &buf),
+                cashuReceiveFee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
                 mintUrl: FfiConverterString.read(from: &buf)
         )
     }
@@ -4008,7 +4100,7 @@ public struct SendSwapClaimSnapshot: Equatable, Hashable {
         self.failureReason = failureReason
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -4022,7 +4114,7 @@ public struct FfiConverterTypeSendSwapClaimSnapshot: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendSwapClaimSnapshot {
         return
             try SendSwapClaimSnapshot(
-                state: FfiConverterTypeSendSwapClaimState.read(from: &buf), 
+                state: FfiConverterTypeSendSwapClaimState.read(from: &buf),
                 failureReason: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -4093,25 +4185,25 @@ public struct SendSwapHandle: Equatable, Hashable {
     public init(
         /**
          * Wallet-side UUID. Pass to `check_send_swap_claimed`.
-         */swapId: String, 
+         */swapId: String,
         /**
          * V4 (`cashuB…`) wire token the sender shares.
-         */token: String, 
+         */token: String,
         /**
          * What the receiver will get on claim. Decimal-stringified.
-         */amount: String, 
+         */amount: String,
         /**
          * Total fee paid (decimal-stringified).
-         */fee: String, 
+         */fee: String,
         /**
          * Cashu sub-unit (`sat`, `usd`).
-         */unit: String, 
+         */unit: String,
         /**
          * Wallet account currency (`BTC`, `USD`).
-         */currency: String, 
+         */currency: String,
         /**
          * UUID of the account that was debited.
-         */accountId: String, 
+         */accountId: String,
         /**
          * Canonical mint URL.
          */mintUrl: String) {
@@ -4125,7 +4217,7 @@ public struct SendSwapHandle: Equatable, Hashable {
         self.mintUrl = mintUrl
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -4139,13 +4231,13 @@ public struct FfiConverterTypeSendSwapHandle: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendSwapHandle {
         return
             try SendSwapHandle(
-                swapId: FfiConverterString.read(from: &buf), 
-                token: FfiConverterString.read(from: &buf), 
-                amount: FfiConverterString.read(from: &buf), 
-                fee: FfiConverterString.read(from: &buf), 
-                unit: FfiConverterString.read(from: &buf), 
-                currency: FfiConverterString.read(from: &buf), 
-                accountId: FfiConverterString.read(from: &buf), 
+                swapId: FfiConverterString.read(from: &buf),
+                token: FfiConverterString.read(from: &buf),
+                amount: FfiConverterString.read(from: &buf),
+                fee: FfiConverterString.read(from: &buf),
+                unit: FfiConverterString.read(from: &buf),
+                currency: FfiConverterString.read(from: &buf),
+                accountId: FfiConverterString.read(from: &buf),
                 mintUrl: FfiConverterString.read(from: &buf)
         )
     }
@@ -4195,7 +4287,7 @@ public struct Session: Equatable, Hashable {
     public init(
         /**
          * Stringified UUID for the authenticated user.
-         */userId: String, 
+         */userId: String,
         /**
          * `OpenSecret` refresh token. The Swift consumer is expected to persist
          * this in the iOS Keychain and reload it on subsequent app launches via
@@ -4205,7 +4297,7 @@ public struct Session: Equatable, Hashable {
         self.refreshToken = refreshToken
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -4219,7 +4311,7 @@ public struct FfiConverterTypeSession: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Session {
         return
             try Session(
-                userId: FfiConverterString.read(from: &buf), 
+                userId: FfiConverterString.read(from: &buf),
                 refreshToken: FfiConverterString.read(from: &buf)
         )
     }
@@ -4273,14 +4365,14 @@ public struct UserFfi: Equatable, Hashable {
     public init(
         /**
          * Stringified UUID for the user row.
-         */id: String, 
+         */id: String,
         /**
          * User's default BTC account id, or `None` if no BTC default is set.
          * Stringified UUID. Matches `wallet.users.default_btc_account_id`.
-         */defaultBtcAccountId: String?, 
+         */defaultBtcAccountId: String?,
         /**
          * User's default USD account id, or `None` if no USD default is set.
-         */defaultUsdAccountId: String?, 
+         */defaultUsdAccountId: String?,
         /**
          * One of `"BTC"`, `"USD"`, `"USDB"`. The currency the user has
          * picked as their "primary" — drives which default slot the
@@ -4293,7 +4385,7 @@ public struct UserFfi: Equatable, Hashable {
         self.defaultCurrency = defaultCurrency
     }
 
-    
+
 }
 
 #if compiler(>=6)
@@ -4307,9 +4399,9 @@ public struct FfiConverterTypeUserFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UserFfi {
         return
             try UserFfi(
-                id: FfiConverterString.read(from: &buf), 
-                defaultBtcAccountId: FfiConverterOptionString.read(from: &buf), 
-                defaultUsdAccountId: FfiConverterOptionString.read(from: &buf), 
+                id: FfiConverterString.read(from: &buf),
+                defaultBtcAccountId: FfiConverterOptionString.read(from: &buf),
+                defaultUsdAccountId: FfiConverterOptionString.read(from: &buf),
                 defaultCurrency: FfiConverterString.read(from: &buf)
         )
     }
@@ -4340,8 +4432,8 @@ public func FfiConverterTypeUserFfi_lower(_ value: UserFfi) -> RustBuffer {
 
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     /**
      * Auth-layer error (`OpenSecret` or local session handling).
      */
@@ -4358,13 +4450,13 @@ public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErro
     case Internal(message: String
     )
 
-    
 
-    
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -4381,15 +4473,15 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .Auth(
-            code: try FfiConverterUInt32.read(from: &buf), 
+            code: try FfiConverterUInt32.read(from: &buf),
             message: try FfiConverterString.read(from: &buf)
             )
         case 2: return .Storage(
-            code: try FfiConverterUInt32.read(from: &buf), 
+            code: try FfiConverterUInt32.read(from: &buf),
             message: try FfiConverterString.read(from: &buf)
             )
         case 3: return .Internal(
@@ -4403,26 +4495,26 @@ public struct FfiConverterTypeFfiError: FfiConverterRustBuffer {
     public static func write(_ value: FfiError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case let .Auth(code,message):
             writeInt(&buf, Int32(1))
             FfiConverterUInt32.write(code, into: &buf)
             FfiConverterString.write(message, into: &buf)
-            
-        
+
+
         case let .Storage(code,message):
             writeInt(&buf, Int32(2))
             FfiConverterUInt32.write(code, into: &buf)
             FfiConverterString.write(message, into: &buf)
-            
-        
+
+
         case let .Internal(message):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(message, into: &buf)
-            
+
         }
     }
 }
@@ -4460,8 +4552,8 @@ public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
  */
 public enum LightningAddressError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-    
-    
+
+
     case InvalidAddress(message: String
     )
     case Network(message: String
@@ -4473,13 +4565,13 @@ public enum LightningAddressError: Swift.Error, Equatable, Hashable, Foundation.
     case ServerError(message: String
     )
 
-    
 
-    
+
+
     public var errorDescription: String? {
         String(reflecting: self)
     }
-    
+
 }
 
 #if compiler(>=6)
@@ -4496,9 +4588,9 @@ public struct FfiConverterTypeLightningAddressError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        
 
-        
+
+
         case 1: return .InvalidAddress(
             message: try FfiConverterString.read(from: &buf)
             )
@@ -4509,8 +4601,8 @@ public struct FfiConverterTypeLightningAddressError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
             )
         case 4: return .AmountOutOfRange(
-            amountMsat: try FfiConverterUInt64.read(from: &buf), 
-            min: try FfiConverterUInt64.read(from: &buf), 
+            amountMsat: try FfiConverterUInt64.read(from: &buf),
+            min: try FfiConverterUInt64.read(from: &buf),
             max: try FfiConverterUInt64.read(from: &buf)
             )
         case 5: return .ServerError(
@@ -4524,36 +4616,36 @@ public struct FfiConverterTypeLightningAddressError: FfiConverterRustBuffer {
     public static func write(_ value: LightningAddressError, into buf: inout [UInt8]) {
         switch value {
 
-        
 
-        
-        
+
+
+
         case let .InvalidAddress(message):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(message, into: &buf)
-            
-        
+
+
         case let .Network(message):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(message, into: &buf)
-            
-        
+
+
         case let .InvalidResponse(message):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(message, into: &buf)
-            
-        
+
+
         case let .AmountOutOfRange(amountMsat,min,max):
             writeInt(&buf, Int32(4))
             FfiConverterUInt64.write(amountMsat, into: &buf)
             FfiConverterUInt64.write(min, into: &buf)
             FfiConverterUInt64.write(max, into: &buf)
-            
-        
+
+
         case let .ServerError(message):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(message, into: &buf)
-            
+
         }
     }
 }
@@ -4584,7 +4676,7 @@ public func FfiConverterTypeLightningAddressError_lower(_ value: LightningAddres
  */
 
 public enum MeltQuoteFfiState: Equatable, Hashable {
-    
+
     /**
      * Quote created, no melt issued — proofs reserved, awaiting the
      * user's confirm.
@@ -4626,44 +4718,44 @@ public struct FfiConverterTypeMeltQuoteFfiState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeltQuoteFfiState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .unpaid
-        
+
         case 2: return .pending
-        
+
         case 3: return .paid
-        
+
         case 4: return .expired
-        
+
         case 5: return .failed
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: MeltQuoteFfiState, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .unpaid:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .pending:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .paid:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .expired:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .failed:
             writeInt(&buf, Int32(5))
-        
+
         }
     }
 }
@@ -4694,7 +4786,7 @@ public func FfiConverterTypeMeltQuoteFfiState_lower(_ value: MeltQuoteFfiState) 
  */
 
 public enum MintQuoteFfiState: Equatable, Hashable {
-    
+
     /**
      * Invoice issued, awaiting payment.
      */
@@ -4736,44 +4828,44 @@ public struct FfiConverterTypeMintQuoteFfiState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MintQuoteFfiState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .unpaid
-        
+
         case 2: return .paid
-        
+
         case 3: return .completed
-        
+
         case 4: return .expired
-        
+
         case 5: return .failed
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: MintQuoteFfiState, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .unpaid:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .paid:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .completed:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .expired:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .failed:
             writeInt(&buf, Int32(5))
-        
+
         }
     }
 }
@@ -4799,12 +4891,12 @@ public func FfiConverterTypeMintQuoteFfiState_lower(_ value: MintQuoteFfiState) 
 /**
  * Lifecycle status forwarded for UI (spinner / "reconnecting" banner).
  * 1:1 with `agicash_realtime::RealtimeStatus` — the [`From`] impl below
- * is exhaustive over all six variants so a new realtime status can't
+ * is exhaustive over all variants so a new realtime status can't
  * silently drop on the FFI floor.
  */
 
 public enum RealtimeStatusFfi: Equatable, Hashable {
-    
+
     /**
      * No subscription yet (pre-`start_wallet_events`).
      */
@@ -4830,6 +4922,15 @@ public enum RealtimeStatusFfi: Equatable, Hashable {
      * `stop_wallet_events` left the channel and closed the socket.
      */
     case closed
+    /**
+     * The supervisor's `JoinReplyError` (auth/RLS deny) retry cap fired
+     * — see `agicash_realtime::service::MAX_JOIN_REJECT_ATTEMPTS`. The
+     * supervisor has STOPPED retrying and will stay paused until the
+     * session resumes (e.g. `set_online(true)` after `set_online(false)`,
+     * or a fresh sign-in). Lane 1 surface stops here: clients log it as
+     * a stopgap until Lane 2 wires a UI banner.
+     */
+    case terminalError
 
 
 
@@ -4848,50 +4949,56 @@ public struct FfiConverterTypeRealtimeStatusFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RealtimeStatusFfi {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .idle
-        
+
         case 2: return .connecting
-        
+
         case 3: return .subscribed
-        
+
         case 4: return .reconnecting
-        
+
         case 5: return .error
-        
+
         case 6: return .closed
-        
+
+        case 7: return .terminalError
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: RealtimeStatusFfi, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .idle:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .connecting:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .subscribed:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .reconnecting:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .error:
             writeInt(&buf, Int32(5))
-        
-        
+
+
         case .closed:
             writeInt(&buf, Int32(6))
-        
+
+
+        case .terminalError:
+            writeInt(&buf, Int32(7))
+
         }
     }
 }
@@ -4919,7 +5026,7 @@ public func FfiConverterTypeRealtimeStatusFfi_lower(_ value: RealtimeStatusFfi) 
  */
 
 public enum ReceiveFlowEventFfi: Equatable, Hashable {
-    
+
     case start(token: String
     )
     case confirmAddMint
@@ -4944,46 +5051,46 @@ public struct FfiConverterTypeReceiveFlowEventFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveFlowEventFfi {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .start(token: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 2: return .confirmAddMint
-        
+
         case 3: return .cancelAddMint
-        
+
         case 4: return .retry
-        
+
         case 5: return .dismiss
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ReceiveFlowEventFfi, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case let .start(token):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(token, into: &buf)
-            
-        
+
+
         case .confirmAddMint:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .cancelAddMint:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .retry:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .dismiss:
             writeInt(&buf, Int32(5))
-        
+
         }
     }
 }
@@ -5012,7 +5119,7 @@ public func FfiConverterTypeReceiveFlowEventFfi_lower(_ value: ReceiveFlowEventF
  */
 
 public enum ReceiveFlowStateFfi: Equatable, Hashable {
-    
+
     case idle
     case parsing
     case needsMintConfirmation(confirmation: MintConfirmationFfi
@@ -5050,76 +5157,76 @@ public struct FfiConverterTypeReceiveFlowStateFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveFlowStateFfi {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .idle
-        
+
         case 2: return .parsing
-        
+
         case 3: return .needsMintConfirmation(confirmation: try FfiConverterTypeMintConfirmationFfi.read(from: &buf)
         )
-        
+
         case 4: return .addingMint(mintUrl: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 5: return .swapping(accountId: try FfiConverterString.read(from: &buf), mintUrl: try FfiConverterString.read(from: &buf)
         )
-        
+
         case 6: return .done(result: try FfiConverterTypeReceiveFlowResultFfi.read(from: &buf)
         )
-        
+
         case 7: return .alreadyClaimed(info: try FfiConverterTypeAlreadyClaimedInfoFfi.read(from: &buf)
         )
-        
+
         case 8: return .failed(reason: try FfiConverterString.read(from: &buf), code: try FfiConverterString.read(from: &buf)
         )
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ReceiveFlowStateFfi, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .idle:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .parsing:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case let .needsMintConfirmation(confirmation):
             writeInt(&buf, Int32(3))
             FfiConverterTypeMintConfirmationFfi.write(confirmation, into: &buf)
-            
-        
+
+
         case let .addingMint(mintUrl):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(mintUrl, into: &buf)
-            
-        
+
+
         case let .swapping(accountId,mintUrl):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(accountId, into: &buf)
             FfiConverterString.write(mintUrl, into: &buf)
-            
-        
+
+
         case let .done(result):
             writeInt(&buf, Int32(6))
             FfiConverterTypeReceiveFlowResultFfi.write(result, into: &buf)
-            
-        
+
+
         case let .alreadyClaimed(info):
             writeInt(&buf, Int32(7))
             FfiConverterTypeAlreadyClaimedInfoFfi.write(info, into: &buf)
-            
-        
+
+
         case let .failed(reason,code):
             writeInt(&buf, Int32(8))
             FfiConverterString.write(reason, into: &buf)
             FfiConverterString.write(code, into: &buf)
-            
+
         }
     }
 }
@@ -5148,7 +5255,7 @@ public func FfiConverterTypeReceiveFlowStateFfi_lower(_ value: ReceiveFlowStateF
  */
 
 public enum ReceiveStatus: Equatable, Hashable {
-    
+
     /**
      * Token was claimed for the first time and proofs are now in the
      * wallet. `amount` is the credited value (after mint fees).
@@ -5188,38 +5295,38 @@ public struct FfiConverterTypeReceiveStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveStatus {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .received
-        
+
         case 2: return .alreadyClaimed
-        
+
         case 3: return .alreadyFailed
-        
+
         case 4: return .pending
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ReceiveStatus, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .received:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .alreadyClaimed:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .alreadyFailed:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .pending:
             writeInt(&buf, Int32(4))
-        
+
         }
     }
 }
@@ -5252,7 +5359,7 @@ public func FfiConverterTypeReceiveStatus_lower(_ value: ReceiveStatus) -> RustB
  */
 
 public enum ReceiveStatusFfi: Equatable, Hashable {
-    
+
     case received
     case alreadyFailed
     case pending
@@ -5274,32 +5381,32 @@ public struct FfiConverterTypeReceiveStatusFfi: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiveStatusFfi {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .received
-        
+
         case 2: return .alreadyFailed
-        
+
         case 3: return .pending
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ReceiveStatusFfi, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .received:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .alreadyFailed:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .pending:
             writeInt(&buf, Int32(3))
-        
+
         }
     }
 }
@@ -5327,7 +5434,7 @@ public func FfiConverterTypeReceiveStatusFfi_lower(_ value: ReceiveStatusFfi) ->
  */
 
 public enum SendSwapClaimState: Equatable, Hashable {
-    
+
     /**
      * At least one proof in the token is still UNSPENT — receiver
      * hasn't claimed yet, keep polling.
@@ -5361,32 +5468,32 @@ public struct FfiConverterTypeSendSwapClaimState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SendSwapClaimState {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .pending
-        
+
         case 2: return .completed
-        
+
         case 3: return .failed
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: SendSwapClaimState, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .pending:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .completed:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .failed:
             writeInt(&buf, Int32(3))
-        
+
         }
     }
 }
@@ -5424,32 +5531,32 @@ public func FfiConverterTypeSendSwapClaimState_lower(_ value: SendSwapClaimState
  * (each callback is a fire-and-forget notification, not a request).
  */
 public protocol WalletEventListener: AnyObject, Sendable {
-    
+
     /**
      * Channel (re)connected & joined. The platform MUST refetch wallet
      * + balance state — there is no replay; this is the catch-up hook
      * that replaces the deleted Tier-1 pollers.
      */
-    func onConnected() 
-    
+    func onConnected()
+
     /**
      * A DB-originated broadcast. `event` ∈ {ACCOUNT_CREATED,
      * ACCOUNT_UPDATED, TRANSACTION_CREATED, TRANSACTION_UPDATED,
      * CASHU_RECEIVE_QUOTE_*, ...}. `payload_json` is the raw jsonb the
      * trigger sent (opaque to transport; parsed by the caller).
      */
-    func onEvent(event: String, payloadJson: String) 
-    
+    func onEvent(event: String, payloadJson: String)
+
     /**
      * Status transitions for UI affordances.
      */
-    func onStatus(status: RealtimeStatusFfi) 
-    
+    func onStatus(status: RealtimeStatusFfi)
+
     /**
      * Non-fatal/observability error string.
      */
-    func onError(message: String) 
-    
+    func onError(message: String)
+
 }
 
 
@@ -5490,7 +5597,7 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5516,7 +5623,7 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5540,7 +5647,7 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5564,7 +5671,7 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 )
             }
 
-            
+
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5965,6 +6072,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_default_account() != 28440) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_realtime_active() != 17907) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_realtime_online() != 39315) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_agicashwallet_set_session() != 35776) {

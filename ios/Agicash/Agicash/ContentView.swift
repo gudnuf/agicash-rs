@@ -37,7 +37,17 @@ struct AuthGateView: View {
         case .signedOut:
             LoginView(model: model)
         case .signedIn:
-            RootTabView(model: model)
+            // Stack the realtime status banner above the signed-in tab
+            // shell. The banner takes zero height when the channel is
+            // healthy, so RootTabView measures identically to today on
+            // the happy path. We animate the banner's appear/disappear
+            // so transient reconnects don't pop the tab content down.
+            VStack(spacing: 0) {
+                RealtimeStatusBanner(model: model)
+                RootTabView(model: model)
+            }
+            .animation(.easeInOut(duration: 0.2), value: model.realtimeStatus)
+            .animation(.easeInOut(duration: 0.2), value: model.realtimeRetryInFlight)
         case .error(let message):
             VStack(spacing: 16) {
                 Image(systemName: "exclamationmark.octagon")

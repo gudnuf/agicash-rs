@@ -25,18 +25,23 @@ import os
 /// point the catch-up refetch runs. Nothing here ever touches `phase`,
 /// so a realtime fault can never reach the fatal sign-out teardown.
 ///
-/// `@unchecked Sendable`: the only stored member is an immutable
-/// `@Sendable` closure; the closure itself hops to the `@MainActor`
-/// before touching any view-model state.
+/// `@unchecked Sendable`: stored members are immutable `@Sendable`
+/// closures; each closure hops to the `@MainActor` before touching any
+/// view-model state.
 final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
     private static let log = Logger(
         subsystem: "app.agicash.rust", category: "realtime"
     )
 
     private let onChange: @Sendable () -> Void
+    private let onStatusChange: @Sendable (RealtimeStatusFfi) -> Void
 
-    init(onChange: @escaping @Sendable () -> Void) {
+    init(
+        onChange: @escaping @Sendable () -> Void,
+        onStatusChange: @escaping @Sendable (RealtimeStatusFfi) -> Void
+    ) {
         self.onChange = onChange
+        self.onStatusChange = onStatusChange
     }
 
     /// Channel (re)connected & joined. No replay → refetch once to
@@ -54,11 +59,12 @@ final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
         onChange()
     }
 
-    /// UI-affordance status transitions. Non-fatal: logged only. A
-    /// disconnect/reconnect never escalates — the Rust side retries and
-    /// re-emits `onConnected`.
+    /// UI-affordance status transitions. Forwarded to the view model so
+    /// the top-of-app banner can reflect Reconnecting / TerminalError.
+    /// Still non-fatal — a status flip never escalates to `phase`.
     func onStatus(status: RealtimeStatusFfi) {
         Self.log.info("realtime status \(String(describing: status), privacy: .public)")
+        onStatusChange(status)
     }
 
     /// Non-fatal observability error. Logged, never surfaced to the UI
@@ -127,6 +133,19 @@ final class WalletViewModel {
     /// otherwise hit Supabase and either replace the mocks with empty data
     /// or surface a network error). Production builds never set this.
     var isDemoMode: Bool = false
+
+    /// Latest status forwarded by the Rust realtime supervisor. Defaults
+    /// to `.idle` (matches the supervisor's pre-`start_wallet_events`
+    /// state). The top-level `RealtimeStatusBanner` reads this to choose
+    /// between hidden / "Reconnecting…" / "Connection lost — tap to
+    /// retry". Non-fatal: a status flip never touches `phase`.
+    var realtimeStatus: RealtimeStatusFfi = .idle
+    /// True while a user-initiated retry round-trip is in flight (the
+    /// `set_realtime_online(false)` then `(true)` pair below). Banner
+    /// renders a small inline spinner on the tap target while this is
+    /// true so a tap registers visually even if the supervisor takes a
+    /// beat to flip status back to `connecting`/`subscribed`.
+    var realtimeRetryInFlight: Bool = false
 
     private let wallet: AgicashWallet
 
@@ -915,11 +934,25 @@ final class WalletViewModel {
     func subscribeWalletEvents() async {
         if isDemoMode { return }
         if eventBridge != nil { return }
-        let bridge = WalletEventBridge { [weak self] in
-            Task { @MainActor [weak self] in
-                await self?.refreshAccounts(background: true)
+        let bridge = WalletEventBridge(
+            onChange: { [weak self] in
+                Task { @MainActor [weak self] in
+                    await self?.refreshAccounts(background: true)
+                }
+            },
+            onStatusChange: { [weak self] status in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.realtimeStatus = status
+                    // Any non-terminal status implicitly resolves a
+                    // user-initiated retry — the supervisor is making
+                    // progress again, so stop showing the spinner.
+                    if status != .terminalError {
+                        self.realtimeRetryInFlight = false
+                    }
+                }
             }
-        }
+        )
         eventBridge = bridge
         do {
             try await wallet.startWalletEvents(listener: bridge)
@@ -945,6 +978,37 @@ final class WalletViewModel {
             _ = error
         }
         eventBridge = nil
+        // Reset banner state to the pre-subscription baseline so the
+        // next sign-in starts clean.
+        realtimeStatus = .idle
+        realtimeRetryInFlight = false
+    }
+
+    /// User-initiated reconnect tap from the realtime status banner. Maps
+    /// to `set_realtime_online(false)` then `(true)` — the supervisor's
+    /// online-edge handler clears the latched `terminal` flag exactly on
+    /// the false→true transition (see
+    /// `agicash_realtime::service::WalletRealtimeService::set_online`),
+    /// then wakes the parked supervisor. The next `on_status` callback
+    /// will flip `realtimeStatus` back to `.connecting`/`.subscribed` and
+    /// reset `realtimeRetryInFlight`.
+    ///
+    /// Safe to call on every status (the FFI is idempotent), but the
+    /// banner only exposes this affordance on `.terminalError` so a user
+    /// can't accidentally pump the supervisor mid-reconnect.
+    func retryRealtime() async {
+        if isDemoMode { return }
+        if realtimeRetryInFlight { return }
+        realtimeRetryInFlight = true
+        do {
+            try await wallet.setRealtimeOnline(online: false)
+            try await wallet.setRealtimeOnline(online: true)
+        } catch {
+            // Best-effort: if the FFI rejected (e.g. nothing running),
+            // clear the in-flight flag so a future tap retries.
+            realtimeRetryInFlight = false
+            _ = error
+        }
     }
 
     /// Forward an OS-level reachability transition to the realtime
