@@ -1102,109 +1102,93 @@ fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
 }
 
 /// Realtime-(re)connect catch-up: fetch the signed-in user's full
-/// in-flight money state from storage (slice 12e Lane 3, Gap-D).
+/// in-flight money state (slice 12e Lane 3, Gap-D).
 ///
-/// Replicates `agicash_wallet::WalletClient::refresh_pending_state`
-/// against the four `agicash-cashu` storage traits the Leptos crate
-/// already links — building the heavyweight facade `WalletClient`
-/// (auth client + cashu provider + …) just for four `list_*` storage
-/// reads would be out of proportion to the catch-up. The four reads
-/// run concurrently; the first storage error short-circuits.
+/// Delegates to `agicash_wallet::WalletClient::refresh_pending_state` —
+/// the single in-flight money-state aggregator the FFI shell also calls.
+/// The `agicash-wallet` facade is wasm-composable (its deps are
+/// `cfg`-gated since `c11731cf`), so the Leptos client no longer needs
+/// to hand-roll a duplicate of the four `list_*` storage reads.
 ///
-/// Storage construction mirrors `fetch_account_summaries`:
-/// session-seeded `OpenSecretTokenProvider` → `SupabaseStorage` → the
-/// four `SupabaseCashu*Storage` wrappers with `PassthroughProofEncryption`
-/// (the production composition until the encryption layer ships).
-// See `fetch_account_summaries`: `Arc<SupabaseStorage>` is mandated by
-// the `SupabaseCashu*Storage::new` public API, not a free choice.
+/// Construction path: `WalletClient::from_config` (the same composition
+/// root the FFI and the wasm-bindgen shell use) → `set_session` with the
+/// browser-persisted refresh token. `set_session` seeds the `OpenSecret`
+/// client the facade's storage layer shares, exactly as the old
+/// `session_seeded_opensecret_client` helper did (`ensure_handshake` +
+/// `set_tokens` + `refresh`). `refresh_pending_state` then issues the
+/// four reads concurrently and short-circuits on the first error.
+///
+/// The facade returns `PendingStateSnapshot` (raw `agicash-cashu` row
+/// types); this maps it to the local `(id, state)` view summary using
+/// the same state-label helpers.
 #[cfg(target_arch = "wasm32")]
-#[allow(clippy::arc_with_non_send_sync)]
 async fn fetch_pending_state(
     config: &AppConfig,
     user_id: Uuid,
 ) -> Result<PendingStateSummary, String> {
-    use std::sync::Arc;
-
-    use agicash_auth_opensecret::OpenSecretTokenProvider;
-    use agicash_cashu::{
-        CashuMeltQuoteStorage, CashuMintQuoteStorage, CashuReceiveSwapStorage, CashuSendSwapStorage,
-    };
-    use agicash_domain::UserId;
-    use agicash_storage_supabase::{
-        SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage,
-        SupabaseCashuReceiveSwapStorage, SupabaseCashuSendSwapStorage, SupabaseStorage,
-        SupabaseStorageConfig,
-    };
-    use agicash_traits::{PassthroughProofEncryption, ProofEncryption, TokenProvider};
+    use agicash_traits::SessionStorage;
+    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
 
     if config.supabase_anon_key.is_empty() {
         return Err("Supabase anon key missing — pending-state catch-up skipped".to_string());
     }
 
-    let client = session_seeded_opensecret_client(config).await?;
-    let tokens: Arc<dyn TokenProvider> = Arc::new(OpenSecretTokenProvider::new(client));
+    // Build the facade over the SAME `from_config` composition root the
+    // FFI / wasm-bindgen shell use. No network I/O at construction; the
+    // browser persists the refresh token via `BrowserSessionStorage`, so
+    // the facade's own session-storage choice is irrelevant here.
+    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
+        opensecret_url: config.opensecret_base_url.clone(),
+        opensecret_client_id: config.opensecret_client_id,
+        supabase_url: config.supabase_url.clone(),
+        supabase_anon_key: config.supabase_anon_key.clone(),
+        session_storage: SessionStorageChoice::InMemory,
+    })
+    .map_err(|e| format!("build wallet client: {e}"))?;
 
-    let storage = SupabaseStorage::new(
-        SupabaseStorageConfig {
-            url: config.supabase_url.clone(),
-            anon_key: config.supabase_anon_key.clone(),
-        },
-        tokens,
-    )
-    .map_err(|e| format!("build supabase storage: {e}"))?;
-    let storage_arc = Arc::new(storage);
+    // Seed the session from the browser-persisted refresh token. This
+    // threads the token into the `OpenSecret` client the facade's
+    // storage layer shares — `set_session` does the same
+    // `ensure_handshake` + `set_tokens` + `refresh` the old
+    // `session_seeded_opensecret_client` helper did.
+    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
+        .load()
+        .await
+    {
+        Ok(Some(s)) => s.refresh_token,
+        Ok(None) => {
+            return Err(
+                "no persisted session — refresh token unavailable (please log in again)".into(),
+            )
+        }
+        Err(e) => return Err(format!("session load failed: {e}")),
+    };
+    wallet
+        .set_session(Session {
+            user_id: agicash_domain::UserId::from(user_id),
+            refresh_token,
+        })
+        .await
+        .map_err(|e| format!("seed wallet session: {e}"))?;
 
-    let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
-    let mint_quote_storage =
-        SupabaseCashuMintQuoteStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
-    let receive_swap_storage =
-        SupabaseCashuReceiveSwapStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
-    let melt_quote_storage =
-        SupabaseCashuMeltQuoteStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
-    let send_swap_storage =
-        SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
-
-    let uid = UserId::from(user_id);
-
-    // Four concurrent storage reads — no mint round-trip, idempotent.
-    // `try_join` here is `futures_util`'s (wasm has no tokio runtime);
-    // the first error short-circuits the whole snapshot.
-    let (mint_quotes, receive_swaps, melt_quotes, send_swaps) = futures_util::try_join!(
-        async {
-            mint_quote_storage
-                .list_pending_for_user(uid)
-                .await
-                .map_err(|e| format!("list_pending_mint_quotes: {e}"))
-        },
-        async {
-            receive_swap_storage
-                .list_pending_for_user(uid)
-                .await
-                .map_err(|e| format!("list_pending_receive_swaps: {e}"))
-        },
-        async {
-            melt_quote_storage
-                .list_unresolved_for_user(uid)
-                .await
-                .map_err(|e| format!("list_unresolved_melt_quotes: {e}"))
-        },
-        async {
-            send_swap_storage
-                .list_unresolved_for_user(uid)
-                .await
-                .map_err(|e| format!("list_unresolved_send_swaps: {e}"))
-        },
-    )?;
+    // One call — the facade issues the four reads concurrently and
+    // short-circuits on the first storage error.
+    let snapshot = wallet
+        .refresh_pending_state()
+        .await
+        .map_err(|e| format!("refresh_pending_state: {e}"))?;
 
     Ok(PendingStateSummary {
-        mint_quotes: mint_quotes
+        mint_quotes: snapshot
+            .mint_quotes
             .iter()
             .map(|q| PendingItem {
                 id: q.id.to_string(),
                 state: mint_quote_state_label(&q.state),
             })
             .collect(),
-        receive_swaps: receive_swaps
+        receive_swaps: snapshot
+            .receive_swaps
             .iter()
             .map(|sw| PendingItem {
                 // Receive-swap identity is its token_hash — no row UUID.
@@ -1212,14 +1196,16 @@ async fn fetch_pending_state(
                 state: receive_swap_state_label(&sw.state),
             })
             .collect(),
-        melt_quotes: melt_quotes
+        melt_quotes: snapshot
+            .melt_quotes
             .iter()
             .map(|q| PendingItem {
                 id: q.id.to_string(),
                 state: melt_quote_state_label(&q.state),
             })
             .collect(),
-        send_swaps: send_swaps
+        send_swaps: snapshot
+            .send_swaps
             .iter()
             .map(|sw| PendingItem {
                 id: sw.id.to_string(),

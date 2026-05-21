@@ -71,6 +71,12 @@ agicash-money = { path = "../agicash-money" }
 # cashu_token_paste_view. `AgicashWasmWallet` is `cfg(target_arch="wasm32")`;
 # the native rlib build only sees the version fn (call sites are gated).
 agicash-wasm = { path = "../agicash-wasm" }
+# The `agicash-wallet` facade — `fetch_pending_state` calls
+# `WalletClient::refresh_pending_state` (the FFI/wasm-shared in-flight
+# money-state aggregator) instead of hand-rolling the four storage
+# reads. wasm-composable since c11731cf cfg-gated its deps; the native
+# rlib build only links it for the `target_arch = "wasm32"` call site.
+agicash-wallet = { path = "../agicash-wallet" }
 # Supabase Realtime client (slice 10). Leptos links the crate directly
 # (no FFI) — it drives the balance refresh, replacing the deleted
 # `start_visibility_refresh` visibilitychange/focus/poll Tier-1 hack.

@@ -409,6 +409,7 @@ dependencies = [
  "agicash-realtime",
  "agicash-storage-supabase",
  "agicash-traits",
+ "agicash-wallet",
  "agicash-wasm",
  "async-trait",
  "cdk",
