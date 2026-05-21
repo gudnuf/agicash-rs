@@ -606,7 +606,10 @@ impl WalletClient {
 
         // Reject non-reversible states with a prescriptive validation
         // error before any I/O.
-        if !matches!(swap.state, agicash_cashu::CashuSendSwapState::Pending { .. }) {
+        if !matches!(
+            swap.state,
+            agicash_cashu::CashuSendSwapState::Pending { .. }
+        ) {
             return Err(WalletError::validation(
                 "swap_not_reversible",
                 format!(
