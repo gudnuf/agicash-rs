@@ -26,7 +26,7 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
 use crate::app::{AccessToken, SessionRehydrating};
-use crate::components::BottomNav;
+use crate::components::{BottomNav, RealtimeStatusBanner};
 use crate::tokens;
 
 #[component]
@@ -71,6 +71,12 @@ pub fn ProtectedLayout() -> impl IntoView {
 
     view! {
         <div style=shell_style>
+            // Connection-status strip: hidden in the steady-state
+            // `Subscribed` (and first-paint Idle/Connecting) case, so
+            // it adds zero chrome cost when realtime is healthy. See
+            // `RealtimeStatusBanner` for the visual states + retry
+            // affordance.
+            <RealtimeStatusBanner/>
             <div style=content_style>
                 <Outlet/>
             </div>
