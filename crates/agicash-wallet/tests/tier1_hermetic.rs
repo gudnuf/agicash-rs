@@ -125,6 +125,40 @@ async fn receive_flow_without_session_is_unauthenticated() {
     let _ = AccountId::new();
 }
 
+/// `reverse_send_swap` is `require_session`-guarded — logged out it
+/// short-circuits to `Unauthenticated` before any storage/provider call,
+/// the same auth seam as `check_send_token_claimed`.
+#[tokio::test]
+async fn reverse_send_swap_without_session_is_unauthenticated() {
+    let tw = TestWallet::new(); // logged out
+    let err = tw
+        .wallet()
+        .reverse_send_swap(Uuid::new_v4())
+        .await
+        .expect_err("logged-out reverse must error");
+    assert!(
+        matches!(err, WalletError::Unauthenticated),
+        "expected Unauthenticated, got {err:?}"
+    );
+}
+
+/// `reverse_send_swap` on a swap id that does not exist returns
+/// `NotFound` — a logged-in wallet with empty send storage has no row to
+/// reverse.
+#[tokio::test]
+async fn reverse_send_swap_unknown_id_is_not_found() {
+    let tw = TestWallet::logged_in();
+    let err = tw
+        .wallet()
+        .reverse_send_swap(Uuid::new_v4())
+        .await
+        .expect_err("reversing a non-existent swap must error");
+    assert!(
+        matches!(err, WalletError::NotFound(_)),
+        "expected NotFound, got {err:?}"
+    );
+}
+
 /// F15 Lane 3: `refresh_pending_state` is `require_session`-guarded —
 /// logged out it short-circuits to `Unauthenticated` before any of the
 /// four storage reads fire (the realtime-reconnect catch-up never runs

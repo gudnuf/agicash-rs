@@ -123,6 +123,32 @@ pub struct SendTokenReceipt {
     pub token_hash: String,
 }
 
+/// Receipt for a `reverse_send_swap` call — reclaiming an unclaimed send.
+///
+/// Returned whether the swap was reversed on this call or was already
+/// `REVERSED` (idempotent re-run); the `status` discriminates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReverseSendReceipt {
+    pub status: ReverseSendStatus,
+    /// Local send-swap row id (UUID).
+    pub swap_id: Uuid,
+    /// The account the reclaimed funds returned to.
+    pub account_id: AccountId,
+    /// Amount the token encoded (the funds reclaimed into the account,
+    /// before the receive-side mint fee).
+    pub amount: Money,
+}
+
+/// Outcome discriminator for [`ReverseSendReceipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReverseSendStatus {
+    /// The send was PENDING and is now REVERSED — funds reclaimed.
+    Reversed,
+    /// The send was already REVERSED on an earlier call; no action taken.
+    AlreadyReversed,
+}
+
 /// Discriminator carried on receipt records that span both happy paths and
 /// idempotent re-runs. Matches the FFI's `ReceiveStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

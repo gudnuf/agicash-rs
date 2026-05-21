@@ -558,6 +558,85 @@ impl WalletClient {
         }
     }
 
+    /// Reclaim an unclaimed Cashu send — flip a PENDING send swap to
+    /// REVERSED, returning the funds to the originating account.
+    ///
+    /// Mirrors the TS web app's `reverse()` flow: builds a compensating
+    /// receive swap over the swap's `proofs_to_send` (tagged with the send
+    /// transaction id) and drives it to completion; the
+    /// `complete_cashu_receive_swap` RPC then flips the send-swap row
+    /// PENDING → REVERSED server-side. Idempotent on an already-REVERSED
+    /// swap (returns `AlreadyReversed`).
+    ///
+    /// Errors with [`WalletError::Validation`] (`swap_not_reversible`) if
+    /// the swap is COMPLETED/FAILED/DRAFT — only an unclaimed PENDING send
+    /// can be retracted.
+    pub async fn reverse_send_swap(
+        &self,
+        swap_id: Uuid,
+    ) -> Result<crate::types::ReverseSendReceipt, WalletError> {
+        use crate::types::{ReverseSendReceipt, ReverseSendStatus};
+
+        let session = self.require_session().await?;
+
+        let swap = self
+            .cashu_send_storage
+            .get(swap_id)
+            .await
+            .map_err(|e| match e {
+                agicash_cashu::SendSwapStorageError::NotFound => {
+                    WalletError::NotFound(format!("send swap {swap_id}"))
+                }
+                other => WalletError::Storage(format!("get send swap: {other}")),
+            })?;
+        if swap.user_id != session.user_id {
+            return Err(WalletError::NotFound(format!("send swap {swap_id}")));
+        }
+
+        // Fast-path the idempotent terminal case without resolving the
+        // account or touching the mint (mirrors `reverse()`'s short-circuit).
+        if matches!(swap.state, agicash_cashu::CashuSendSwapState::Reversed) {
+            return Ok(ReverseSendReceipt {
+                status: ReverseSendStatus::AlreadyReversed,
+                swap_id: swap.id,
+                account_id: swap.account_id,
+                amount: swap.amount_to_send.clone(),
+            });
+        }
+
+        // Reject non-reversible states with a prescriptive validation
+        // error before any I/O.
+        if !matches!(swap.state, agicash_cashu::CashuSendSwapState::Pending { .. }) {
+            return Err(WalletError::validation(
+                "swap_not_reversible",
+                format!(
+                    "only a PENDING (unclaimed) send can be reversed; swap {swap_id} is {}",
+                    send_swap_state_name(&swap.state)
+                ),
+            ));
+        }
+
+        let accounts = self.user_storage.list_accounts(session.user_id).await?;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == swap.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| WalletError::Internal("no matching account for swap".into()))?
+            .clone();
+
+        let seed = self.auth.cashu_seed().await?;
+        let reversed = self
+            .send_swap_service
+            .reverse(&swap, &account, &self.receive_swap_service, &seed)
+            .await?;
+
+        Ok(ReverseSendReceipt {
+            status: ReverseSendStatus::Reversed,
+            swap_id: reversed.id,
+            account_id: reversed.account_id,
+            amount: reversed.amount_to_send.clone(),
+        })
+    }
+
     /// NUT-05 melt-quote preview. Returns the fees + total without
     /// reserving any proofs.
     pub async fn quote_send_lightning(
@@ -1227,6 +1306,18 @@ fn unit_for_currency(currency: Currency) -> Unit {
     match currency {
         Currency::Btc => Unit::Sat,
         Currency::Usd | Currency::Usdb => Unit::Cent,
+    }
+}
+
+/// Lower-case wire name for a send-swap state — used in the prescriptive
+/// `swap_not_reversible` error message.
+fn send_swap_state_name(state: &agicash_cashu::CashuSendSwapState) -> &'static str {
+    match state {
+        agicash_cashu::CashuSendSwapState::Draft => "DRAFT",
+        agicash_cashu::CashuSendSwapState::Pending { .. } => "PENDING",
+        agicash_cashu::CashuSendSwapState::Completed { .. } => "COMPLETED",
+        agicash_cashu::CashuSendSwapState::Failed { .. } => "FAILED",
+        agicash_cashu::CashuSendSwapState::Reversed => "REVERSED",
     }
 }
 
