@@ -156,6 +156,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "agicash-driver"
+version = "0.1.0"
+dependencies = [
+ "agicash-cashu",
+ "agicash-domain",
+ "agicash-money",
+ "agicash-testing",
+ "agicash-traits",
+ "agicash-wallet",
+ "async-trait",
+ "chrono",
+ "rust_decimal",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agicash-exchange-rate"
 version = "0.1.0"
 dependencies = [

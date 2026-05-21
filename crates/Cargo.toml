@@ -15,6 +15,7 @@ members = [
     "agicash-services",
     "agicash-realtime",
     "agicash-wallet",
+    "agicash-driver",
     "agicash-testing",
     "agicash-cli",
     "agicash-wasm",
