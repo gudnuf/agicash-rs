@@ -28,6 +28,7 @@ import uniffi.agicash_ffi.MeltQuoteSnapshot
 import uniffi.agicash_ffi.MintAddResult
 import uniffi.agicash_ffi.MintQuoteFfiState
 import uniffi.agicash_ffi.MintQuoteHandle
+import uniffi.agicash_ffi.PendingStateSnapshotFfi
 import uniffi.agicash_ffi.RealtimeStatusFfi
 import uniffi.agicash_ffi.ReceiveResult
 import uniffi.agicash_ffi.SendQuotePreview
@@ -271,6 +272,22 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
         override fun onError(message: String) {
             // Observability only — explicitly NOT escalated to Phase.Error.
             android.util.Log.w("WalletViewModel", "realtime error (non-fatal): $message")
+        }
+
+        override fun onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi) {
+            // In-flight money-state snapshot from the post-reconnect
+            // catch-up (slice 12e Lane 3, Gap-D). Logging-only for now —
+            // mirrors the pre-banner state of `onStatus`. Wiring the
+            // pending-list to UI (clearing stale "waiting…" rows) is a
+            // scoped follow-up; until then just record the list counts.
+            android.util.Log.d(
+                "WalletViewModel",
+                "realtime pending-state refreshed: " +
+                    "mintQuotes=${snapshot.mintQuotes.size} " +
+                    "receiveSwaps=${snapshot.receiveSwaps.size} " +
+                    "meltQuotes=${snapshot.meltQuotes.size} " +
+                    "sendSwaps=${snapshot.sendSwaps.size}",
+            )
         }
     }
 
