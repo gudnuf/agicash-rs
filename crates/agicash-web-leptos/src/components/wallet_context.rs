@@ -579,6 +579,13 @@ impl WalletData {
         not(target_arch = "wasm32"),
         allow(clippy::needless_pass_by_value, unused_variables)
     )]
+    // On wasm32 the realtime handles (`Arc<dyn JwtSource>`,
+    // `Arc<WalletRealtimeService>`) are `!Send`/`!Sync` — `web_sys`
+    // sockets are JS-main-thread-pinned. `Arc` is the type the
+    // `agicash-realtime` public API (`WalletRealtimeService::new`) and
+    // the `realtime_service` field both require; `Rc` would mean
+    // changing that crate's API surface, out of scope for lint cleanup.
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub fn start_realtime(&self, config: Option<AppConfig>) {
         // Flip the latch once. If it was already set, another mount
         // already wired the subscription — bail without stacking a
@@ -742,7 +749,7 @@ impl WalletData {
                 // observers via the FFI; on the web the equivalents
                 // are window-level events. The service handle is held
                 // by the closures via `Arc` so they outlive the spawn.
-                wire_dom_lifecycle(Arc::clone(&service));
+                wire_dom_lifecycle(&service);
 
                 // Drive the connect→join→serve→reconnect supervisor for
                 // the page's lifetime. `run()` borrows `&self`; the
@@ -770,7 +777,7 @@ impl WalletData {
 /// swap + 1-msg broadcast), so a redundant dispatch from a no-op
 /// transition is a non-issue.
 #[cfg(target_arch = "wasm32")]
-fn wire_dom_lifecycle(service: std::sync::Arc<agicash_realtime::WalletRealtimeService>) {
+fn wire_dom_lifecycle(service: &std::sync::Arc<agicash_realtime::WalletRealtimeService>) {
     use wasm_bindgen::{closure::Closure, JsCast};
 
     let Some(window) = web_sys::window() else {
@@ -846,7 +853,7 @@ impl agicash_realtime::TransportFactory for WasmTransportFactory {
 /// threaded in** — the single fix for the "No refresh token available"
 /// wallet-load failure.
 ///
-/// The OpenSecret SDK's `SessionManager` is purely in-memory and
+/// The `OpenSecret` SDK's `SessionManager` is purely in-memory and
 /// per-client (`Arc<RwLock<Option<TokenPair>>>`, all `None` on `new()`);
 /// token *persistence* lives separately in `BrowserSessionStorage`
 /// (`window.localStorage`). A bare `OpenSecretClient::new(..)` is
@@ -905,7 +912,7 @@ async fn session_seeded_opensecret_client(
     Ok(client)
 }
 
-/// Build the OpenSecret token provider from the resolved [`AppConfig`]
+/// Build the `OpenSecret` token provider from the resolved [`AppConfig`]
 /// — the same session-seeded construction `fetch_account_summaries`
 /// uses for storage, so the realtime join JWT comes from the identical
 /// token source. Now async + session-threaded (was a bare empty-client
@@ -947,7 +954,14 @@ async fn load_session_user_id() -> Result<Option<Uuid>, String> {
 /// fetch the user's accounts, and compute the per-account balance.
 ///
 /// Mirrors `agicash_ffi::wallet::list_accounts` + `compute_cashu_balance`.
+// `SupabaseStorage` is `!Send`/`!Sync` on wasm32, but
+// `SupabaseCashuSendSwapStorage::new` (the `agicash-storage-supabase`
+// public API) requires `Arc<SupabaseStorage>` — the `Arc` is
+// API-mandated, not a free choice; `Rc` would mean changing that
+// crate's signature. Out of scope for lint cleanup. (This fn is
+// already wasm32-only, so a plain allow is correct.)
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::arc_with_non_send_sync)]
 async fn fetch_account_summaries(
     config: &AppConfig,
     user_id: Uuid,
@@ -1101,7 +1115,10 @@ fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
 /// session-seeded `OpenSecretTokenProvider` → `SupabaseStorage` → the
 /// four `SupabaseCashu*Storage` wrappers with `PassthroughProofEncryption`
 /// (the production composition until the encryption layer ships).
+// See `fetch_account_summaries`: `Arc<SupabaseStorage>` is mandated by
+// the `SupabaseCashu*Storage::new` public API, not a free choice.
 #[cfg(target_arch = "wasm32")]
+#[allow(clippy::arc_with_non_send_sync)]
 async fn fetch_pending_state(
     config: &AppConfig,
     user_id: Uuid,

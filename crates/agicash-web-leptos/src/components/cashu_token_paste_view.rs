@@ -670,18 +670,16 @@ struct AccountMintUrl {
 /// mints itself regardless.
 #[cfg(target_arch = "wasm32")]
 async fn fetch_mint_known(config: &AppConfig, mint_url: &str) -> bool {
-    let wallet = match agicash_wasm::AgicashWasmWallet::new(
+    let Ok(wallet) = agicash_wasm::AgicashWasmWallet::new(
         config.opensecret_base_url.clone(),
         config.opensecret_client_id.to_string(),
         config.supabase_url.clone(),
         config.supabase_anon_key.clone(),
-    ) {
-        Ok(w) => w,
-        Err(_) => return true,
+    ) else {
+        return true;
     };
-    let js = match wallet.list_accounts().await {
-        Ok(v) => v,
-        Err(_) => return true,
+    let Ok(js) = wallet.list_accounts().await else {
+        return true;
     };
     let accounts: Vec<AccountMintUrl> = match serde_wasm_bindgen::from_value(js) {
         Ok(a) => a,

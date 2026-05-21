@@ -1110,14 +1110,13 @@ fn js_err_string(e: &wasm_bindgen::JsValue) -> String {
 async fn poll_claim_once(config: &AppConfig, swap_id: &str) -> ClaimPoll {
     #[cfg(target_arch = "wasm32")]
     {
-        let wallet = match agicash_wasm::AgicashWasmWallet::new(
+        let Ok(wallet) = agicash_wasm::AgicashWasmWallet::new(
             config.opensecret_base_url.clone(),
             config.opensecret_client_id.to_string(),
             config.supabase_url.clone(),
             config.supabase_anon_key.clone(),
-        ) {
-            Ok(w) => w,
-            Err(_) => return ClaimPoll::Pending,
+        ) else {
+            return ClaimPoll::Pending;
         };
         match wallet.check_send_swap_claimed(swap_id.to_string()).await {
             Ok(status) => match status.state {
