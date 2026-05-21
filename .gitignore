@@ -28,6 +28,8 @@ result-*
 # Claude Code
 .claude/settings.local.json
 .claude/worktrees/
+/.claude/cdk-mintd-install/
+/.claude/scheduled_tasks.lock
 
 # Local SSL certificates
 /certs/*
@@ -62,3 +64,19 @@ result-*
 /ios/**/build
 /ios/**/*.xcodeproj
 /ios/**/DerivedData
+
+# JS / Web app leftovers (from TS-app branches; not tracked on agicash-rs)
+node_modules/
+/build/
+/packages/
+/.react-router/
+/playwright-report/
+/test-results/
+
+# devenv (companion to existing .direnv/)
+/.devenv/
+.devenv.flake.nix
+.devenv.*.nix
+
+# Local dev artifacts
+/android/Agicash/app/src/main/res/raw/local_dev_ca.pem
