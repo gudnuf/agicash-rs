@@ -106,6 +106,39 @@ fn account_list_help_works() {
 }
 
 #[test]
+fn decode_help_states_it_is_offline() {
+    // `decode` is the standout offline utility — its help must say so,
+    // and it must document an `input` argument.
+    let text = help_text(&["decode", "--help"]);
+    assert!(
+        text.to_lowercase().contains("offline"),
+        "decode --help must state it is offline:\n{text}",
+    );
+    assert!(
+        text.contains("input"),
+        "decode --help must document the `input` argument:\n{text}",
+    );
+}
+
+#[test]
+fn mint_help_lists_both_add_and_list() {
+    let text = help_text(&["mint", "--help"]);
+    assert!(
+        text.contains("add") && text.contains("list"),
+        "mint --help should list both `add` and `list`:\n{text}",
+    );
+}
+
+#[test]
+fn account_help_lists_info_subcommand() {
+    let text = help_text(&["account", "--help"]);
+    assert!(
+        text.contains("info"),
+        "account --help should list the `info` subcommand:\n{text}",
+    );
+}
+
+#[test]
 fn account_list_without_session_exits_three_and_emits_json_error() {
     // "No session present" exit-code contract. Two paths exercise this test:
     //
@@ -179,14 +212,17 @@ fn account_list_without_session_exits_three_and_emits_json_error() {
 /// Every existing leaf command, addressed by its full path.
 const LEAF_COMMANDS: &[&[&str]] = &[
     &["version"],
+    &["decode"],
     &["auth", "login"],
     &["auth", "signup"],
     &["auth", "guest"],
     &["auth", "logout"],
     &["auth", "status"],
     &["account", "list"],
+    &["account", "info"],
     &["account", "default"],
     &["mint", "add"],
+    &["mint", "list"],
     &["balance"],
     &["receive", "token"],
     &["receive", "lightning"],
@@ -223,7 +259,7 @@ fn top_level_help_has_orientation_banner() {
 fn top_level_help_is_a_terse_map() {
     let text = help_text(&["--help"]);
     for group in [
-        "version", "auth", "account", "mint", "balance", "receive", "send",
+        "version", "decode", "auth", "account", "mint", "balance", "receive", "send",
     ] {
         assert!(
             text.contains(group),

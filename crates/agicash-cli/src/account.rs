@@ -46,6 +46,38 @@ pub async fn cmd_list(deps: &CliDeps) -> Result<(), AccountCmdError> {
     Ok(())
 }
 
+/// `account info <ID>` — detail for a single account.
+///
+/// A read sibling of `account list` / `account default`. Resolves the
+/// account through the same ownership-scoped `list_accounts` path
+/// `cmd_set_default` uses (the `UserStorage::get_account` trait method is
+/// not user-scoped), so it emits the identical raw `Account` JSON shape
+/// `account list` produces and a foreign account id surfaces as
+/// `not-found` (exit 4) rather than leaking another user's row.
+pub async fn cmd_info(deps: &CliDeps, id_str: &str) -> Result<(), AccountCmdError> {
+    let session = deps
+        .keyring
+        .load()
+        .await?
+        .ok_or(AccountCmdError::NotLoggedIn)?;
+    let user_id = UserId::from(session.user_id);
+
+    let parsed = Uuid::parse_str(id_str).map_err(|_| AccountCmdError::InvalidId(id_str.into()))?;
+    let account_id = AccountId::from(parsed);
+
+    let accounts = deps.user_storage.list_accounts(user_id).await?;
+    let account = accounts
+        .into_iter()
+        .find(|a| a.id == account_id)
+        .ok_or(AccountCmdError::NotFound(account_id))?;
+
+    println!(
+        "{}",
+        serde_json::to_string(&account).expect("serialize account")
+    );
+    Ok(())
+}
+
 pub async fn cmd_set_default(deps: &CliDeps, id_str: &str) -> Result<(), AccountCmdError> {
     let session = deps
         .keyring

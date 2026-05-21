@@ -83,6 +83,27 @@ rate provider is down).\n\nEXIT CODES\n  0  success\n  1  storage/network error\
         #[arg(long)]
         account: Option<String>,
     },
+    /// Decode a Cashu token, BOLT-11 invoice, or Lightning Address.
+    #[command(
+        long_about = "Decode and inspect a Cashu token (`cashuA…`/`cashuB…`), a \
+BOLT-11 Lightning invoice, or a LUD-16 Lightning Address. Offline — no session, \
+no network, no mint round-trip. The input type is auto-detected. Use it to \
+inspect an artifact before acting on it.",
+        after_long_help = "EXAMPLE\n  $ agicash decode cashuBo2Ftd…\n  \
+{\"artifact\":\"cashu-token\",\"version\":4,\"mint_url\":\"…\",\"amount\":\"100\",\
+\"unit\":\"sat\",\"proof_count\":3,\"memo\":\"…\"}\n\n  \
+artifact  `cashu-token`, `bolt11-invoice`, or `lightning-address`.\n  \
+amount    summed offline from the proofs (token) or the invoice amount;\n  \
+          omitted for an amountless invoice.\n  \
+proof_count / payee / expiry / …  fields vary by artifact type.\n\n\
+EXIT CODES\n  0  success\n  1  unrecognized input, or a malformed token /\n  \
+   invoice / address\n\nSEE ALSO\n  agicash receive token, agicash send lightning"
+    )]
+    Decode {
+        /// The string to decode: a `cashuA…`/`cashuB…` token, a `lnbc…`
+        /// BOLT-11 invoice, or a `user@domain` Lightning Address.
+        input: String,
+    },
     /// Receive funds into a Cashu account.
     #[command(
         long_about = "Receive funds into a Cashu account — either by claiming a \
@@ -477,6 +498,25 @@ SEE ALSO\n  agicash account list"
         /// Account ID (UUID) to make the default for its currency.
         id: String,
     },
+    /// Show detail for a single account.
+    #[command(
+        long_about = "Show the full record for one account by its id — currency, \
+type, mint URL and the raw account row. Requires a session; the account must \
+belong to the signed-in user.",
+        after_long_help = "EXAMPLE\n  $ agicash account info \
+11111111-2222-3333-4444-555555555555\n  \
+{\"id\":\"…\",\"user_id\":\"…\",\"name\":\"testnut\",\"type\":\"cashu\",\
+\"currency\":\"BTC\",\"details\":{\"mint_url\":\"…\"}}\n\n  \
+The raw `wallet.accounts` row — same shape as one entry of\n  \
+`account list`. `details` carries account-type-specific fields.\n\n\
+EXIT CODES\n  0  success\n  1  storage/network error\n  \
+2  malformed account id (not a UUID)\n  3  not authenticated\n  \
+4  account not found\n\nSEE ALSO\n  agicash account list, agicash balance"
+    )]
+    Info {
+        /// Account ID (UUID) to inspect.
+        id: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -507,6 +547,20 @@ SEE ALSO\n  agicash account list, agicash balance"
         #[arg(long, value_enum, default_value = "BTC")]
         currency: Currency,
     },
+    /// List configured Cashu mints.
+    #[command(
+        long_about = "List every Cashu mint the current user has an account with. \
+Mints are grouped by URL; each carries the accounts provisioned against it. \
+Requires a session.",
+        after_long_help = "EXAMPLE\n  $ agicash mint list\n  \
+[{\"mint_url\":\"https://testnut.cashu.space\",\"mint_name\":\"testnut\",\
+\"accounts\":[{\"id\":\"…\",\"currency\":\"BTC\",\"balance\":\"1200\"}]}]\n\n  \
+JSON array, one object per mint. `accounts` lists every account (one\n  \
+per currency) backed by that mint — empty array if none.\n\n\
+EXIT CODES\n  0  success\n  1  storage/network error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash mint add, agicash balance"
+    )]
+    List,
 }
 
 #[cfg(test)]
@@ -582,7 +636,7 @@ mod tests {
                 AccountCommand::Default { id } => {
                     assert_eq!(id, "00000000-0000-0000-0000-000000000000");
                 }
-                other @ AccountCommand::List => panic!("unexpected: {other:?}"),
+                other => panic!("unexpected: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }
@@ -598,6 +652,7 @@ mod tests {
                     assert_eq!(url, "https://testnut.cashu.space");
                     assert_eq!(currency, Currency::Btc);
                 }
+                other @ MintCommand::List => panic!("unexpected: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }
@@ -617,6 +672,7 @@ mod tests {
         match cli.cmd {
             Some(Command::Mint(m)) => match m.cmd {
                 MintCommand::Add { currency, .. } => assert_eq!(currency, Currency::Usd),
+                other @ MintCommand::List => panic!("unexpected: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }
@@ -923,6 +979,59 @@ mod tests {
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_decode_with_input() {
+        let cli = Cli::try_parse_from(["agicash", "decode", "cashuBabc"]).unwrap();
+        match cli.cmd {
+            Some(Command::Decode { input }) => assert_eq!(input, "cashuBabc"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_requires_an_input_arg() {
+        let res = Cli::try_parse_from(["agicash", "decode"]);
+        assert!(res.is_err(), "decode without an input should be rejected");
+    }
+
+    #[test]
+    fn parses_mint_list() {
+        let cli = Cli::try_parse_from(["agicash", "mint", "list"]).unwrap();
+        match cli.cmd {
+            Some(Command::Mint(m)) => assert!(matches!(m.cmd, MintCommand::List)),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_account_info_with_id() {
+        let cli = Cli::try_parse_from([
+            "agicash",
+            "account",
+            "info",
+            "11111111-2222-3333-4444-555555555555",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Command::Account(a)) => match a.cmd {
+                AccountCommand::Info { id } => {
+                    assert_eq!(id, "11111111-2222-3333-4444-555555555555");
+                }
+                other => panic!("unexpected account subcommand: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_info_requires_an_id_arg() {
+        let res = Cli::try_parse_from(["agicash", "account", "info"]);
+        assert!(
+            res.is_err(),
+            "account info without an id should be rejected"
+        );
     }
 
     #[test]

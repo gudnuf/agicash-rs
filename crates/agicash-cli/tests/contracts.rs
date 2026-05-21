@@ -98,6 +98,11 @@ mod gated {
         // --- classify_error: receive ---
         "invalid-token",
         "no-matching-account",
+        // --- classify_error: decode (offline, code-1 input errors) ---
+        // `invalid-token` / `invalid-lightning-address` are shared with
+        // the receive / lnurl classifiers above.
+        "unrecognized-input",
+        "invalid-invoice",
         // --- classify_error: send (token + lightning) ---
         "account-ambiguous",
         "invalid-account-id",
@@ -305,11 +310,13 @@ mod gated {
         }
 
         // ---- 7. `mint add testnut` → status=added, account_id present. ----
+        // The account_id is captured for the `account info` check below.
         let ma = session
             .cmd()
             .args(["mint", "add", TEST_MINT_URL])
             .output()
             .expect("spawn agicash mint add");
+        let mut added_account_id: Option<String> = None;
         if !ma.status.success() {
             failures.push(format!(
                 "mint add: nonzero exit; stderr={}",
@@ -322,14 +329,87 @@ mod gated {
                     if j.get("status").and_then(|v| v.as_str()) != Some("added") {
                         failures.push(format!("mint add: expected status=added; got {j}"));
                     }
-                    if j.get("account_id").and_then(|v| v.as_str()).is_none() {
-                        failures.push(format!("mint add: missing account_id; got {j}"));
+                    match j.get("account_id").and_then(|v| v.as_str()) {
+                        Some(id) => added_account_id = Some(id.to_string()),
+                        None => failures.push(format!("mint add: missing account_id; got {j}")),
                     }
                     if j.get("mint_url").and_then(|v| v.as_str()).is_none() {
                         failures.push(format!("mint add: missing mint_url; got {j}"));
                     }
                 }
                 Err(e) => failures.push(format!("mint add: not JSON ({e}): {s}")),
+            }
+        }
+
+        // ---- 7b. `mint list` → JSON array, the added mint present. ----
+        let ml = session
+            .cmd()
+            .args(["mint", "list"])
+            .output()
+            .expect("spawn agicash mint list");
+        if !ml.status.success() {
+            failures.push(format!(
+                "mint list: nonzero exit; stderr={}",
+                String::from_utf8_lossy(&ml.stderr),
+            ));
+        } else {
+            let s = String::from_utf8_lossy(&ml.stdout).into_owned();
+            match serde_json::from_str::<Value>(s.trim()) {
+                Ok(j) => match j.as_array() {
+                    None => failures.push(format!("mint list: expected array; got {j}")),
+                    Some(arr) => {
+                        if arr.is_empty() {
+                            failures.push(format!(
+                                "mint list: expected the added mint; got empty array"
+                            ));
+                        }
+                        for entry in arr {
+                            for required in ["mint_url", "mint_name", "accounts"] {
+                                if entry.get(required).is_none() {
+                                    failures.push(format!(
+                                        "mint list entry missing `{required}`: {entry}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => failures.push(format!("mint list: not JSON ({e}): {s}")),
+            }
+        }
+
+        // ---- 7c. `account info <id>` → JSON object for the added account. ----
+        if let Some(id) = &added_account_id {
+            let ai = session
+                .cmd()
+                .args(["account", "info", id])
+                .output()
+                .expect("spawn agicash account info");
+            if !ai.status.success() {
+                failures.push(format!(
+                    "account info: nonzero exit; stderr={}",
+                    String::from_utf8_lossy(&ai.stderr),
+                ));
+            } else {
+                let s = String::from_utf8_lossy(&ai.stdout).into_owned();
+                match serde_json::from_str::<Value>(s.trim()) {
+                    Ok(j) => {
+                        if !j.is_object() {
+                            failures.push(format!("account info: expected object; got {j}"));
+                        }
+                        if j.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
+                            failures.push(format!("account info: expected id={id}; got {j}"));
+                        }
+                        // `account_type` serializes as `type` (serde
+                        // rename on `Account`).
+                        for required in ["id", "currency", "type", "name"] {
+                            if j.get(required).is_none() {
+                                failures.push(format!("account info missing `{required}`: {j}"));
+                            }
+                        }
+                    }
+                    Err(e) => failures.push(format!("account info: not JSON ({e}): {s}")),
+                }
             }
         }
 
@@ -444,6 +524,12 @@ mod gated {
                 &["receive", "lightning", "100"],
                 "not-logged-in",
             ),
+            ("mint list (no session)", &["mint", "list"], "not-logged-in"),
+            (
+                "account info (no session)",
+                &["account", "info", "11111111-2222-3333-4444-555555555555"],
+                "not-logged-in",
+            ),
         ];
 
         let mut failures: Vec<String> = Vec::new();
@@ -506,6 +592,18 @@ mod gated {
                 // resolves the target account first and surfaces
                 // `no-matching-account` before consulting balances.
                 "no-matching-account",
+            ),
+            (
+                // Malformed UUID → parser-post-validation rejects it.
+                "account info malformed id",
+                &["account", "info", "not-a-uuid"],
+                "invalid-argument",
+            ),
+            (
+                // Well-formed UUID that no account matches → not-found.
+                "account info unknown id",
+                &["account", "info", "00000000-0000-0000-0000-000000000000"],
+                "not-found",
             ),
         ];
 

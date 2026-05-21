@@ -87,6 +87,18 @@ pub async fn cmd_mint_add(
     Ok(())
 }
 
+/// `mint list` — list every configured Cashu mint.
+///
+/// Wraps [`WalletClient::list_mints`], which groups the user's Cashu
+/// accounts by mint URL. The facade's `MintSummary` is already
+/// `Serialize`, so it is emitted verbatim — a JSON array, one object per
+/// mint (`mint_url`, `mint_name`, `accounts`).
+pub async fn cmd_mint_list(deps: &CliDeps) -> Result<(), MintCmdError> {
+    let mints = deps.wallet.list_mints().await.map_err(map_mint_err)?;
+    print_json(&mints);
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct BalanceEntry {
     account_id: String,

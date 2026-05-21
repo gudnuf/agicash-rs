@@ -2,6 +2,7 @@ mod account;
 mod auth;
 mod cli;
 mod composition;
+mod decode;
 mod mint;
 mod receive;
 mod receive_lightning;
@@ -15,6 +16,7 @@ use agicash_traits::{AuthError, StorageError};
 use clap::Parser;
 use cli::{AccountCommand, AuthCommand, Cli, Command, MintCommand, ReceiveCommand, SendCommand};
 use composition::{build_deps, rehydrate_session};
+use decode::DecodeCmdError;
 use mint::MintCmdError;
 use receive::ReceiveCmdError;
 use receive_lightning::ReceiveLightningCmdError;
@@ -120,6 +122,16 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             SendCmdError::Auth(inner) => classify_auth(inner),
         };
     }
+    if let Some(dec_err) = e.downcast_ref::<DecodeCmdError>() {
+        // `decode` is offline: every failure is a code-1 input error.
+        // It never produces auth-required (3) or not-found (4).
+        return match dec_err {
+            DecodeCmdError::Unrecognized => ("unrecognized-input", 1),
+            DecodeCmdError::InvalidToken(_) => ("invalid-token", 1),
+            DecodeCmdError::InvalidInvoice(_) => ("invalid-invoice", 1),
+            DecodeCmdError::InvalidLightningAddress(_) => ("invalid-lightning-address", 1),
+        };
+    }
     if let Some(auth) = e.downcast_ref::<AuthError>() {
         return classify_auth(auth);
     }
@@ -210,6 +222,13 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `decode` is offline — no session, no env, no network. Handle it
+    // before building deps so it works with zero configuration.
+    if let Some(Command::Decode { input }) = &args.cmd {
+        decode::cmd_decode(input)?;
+        return Ok(());
+    }
+
     // Single composition root: the `WalletClient` facade via
     // `from_config` (+ the CLI-shell-resident keyring & thin
     // UserStorage handle), all wired from one endpoint config.
@@ -223,7 +242,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let _ = rehydrate_session(&deps).await;
 
     match args.cmd {
-        Some(Command::Version) => unreachable!("handled above"),
+        Some(Command::Version | Command::Decode { .. }) => unreachable!("handled above"),
         Some(Command::Auth(a)) => match a.cmd {
             AuthCommand::Guest => auth::cmd_guest(&deps).await?,
             AuthCommand::Login { email } => auth::cmd_login(&deps, email).await?,
@@ -233,6 +252,9 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         Some(Command::Account(a)) => match a.cmd {
             AccountCommand::List => account::cmd_list(&deps).await?,
+            AccountCommand::Info { id } => {
+                account::cmd_info(&deps, &id).await?;
+            }
             AccountCommand::Default { id } => {
                 account::cmd_set_default(&deps, &id).await?;
             }
@@ -240,6 +262,9 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Mint(m)) => match m.cmd {
             MintCommand::Add { url, currency } => {
                 mint::cmd_mint_add(&deps, &url, currency.into()).await?;
+            }
+            MintCommand::List => {
+                mint::cmd_mint_list(&deps).await?;
             }
         },
         Some(Command::Balance { account: _ }) => {
