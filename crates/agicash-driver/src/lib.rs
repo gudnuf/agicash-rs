@@ -51,7 +51,12 @@
 pub mod error;
 pub mod report;
 pub mod sweep;
+pub mod task;
 
 pub use error::{ClassifiedError, ErrorClass};
 pub use report::{RowKind, RowOutcome, SweepReport};
 pub use sweep::{run_sweep, run_sweep_with_config, RetryConfig};
+pub use task::{
+    DriverConfig, DriverHandle, ResumptionDriver, Sweeper, SweeperBounds, TriggerReason,
+    WalletClientSweeper, DEFAULT_FALLBACK_TICK,
+};
