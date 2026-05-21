@@ -1778,6 +1778,14 @@ fn send_swap_error_to_ffi(e: agicash_cashu::SendSwapError) -> FfiError {
         SendSwapError::DleqVerificationFailed(inner) => {
             FfiError::internal(format!("DLEQ verification failed: {inner}"))
         }
+        // `reverse()` delegates to a compensating receive swap; the inner
+        // `ReceiveSwapError`'s Display already carries the real cause
+        // (token-parse / mint / storage / DLEQ). Funnel it through
+        // Internal with a `reverse failed:` prefix — same idiom as the
+        // sibling `#[from]`-wrapping arms above, and faithful to the FFI
+        // convention of routing `ReceiveSwapError` through Internal with
+        // a discriminator-bearing message.
+        SendSwapError::Reverse(inner) => FfiError::internal(format!("reverse failed: {inner}")),
     }
 }
 
