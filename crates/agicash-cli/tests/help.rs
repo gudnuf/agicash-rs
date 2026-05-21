@@ -1,6 +1,20 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// Run `agicash <args...>` and return stdout as a `String`, asserting the
+/// command exited successfully. Used by the help-tree snapshot tests.
+fn help_text(args: &[&str]) -> String {
+    let out = Command::cargo_bin("agicash")
+        .unwrap()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).expect("help output is UTF-8")
+}
+
 #[test]
 fn help_flag_prints_usage_and_exits_zero() {
     Command::cargo_bin("agicash")
@@ -148,5 +162,228 @@ fn account_list_without_session_exits_three_and_emits_json_error() {
         parsed.pointer("/error/code").and_then(|v| v.as_str()),
         Some("not-logged-in"),
         "unexpected error body: {parsed}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Help-tree snapshot tests
+//
+// These guard the progressive-disclosure structure and the leaf-help house
+// template (Description / Arguments / Example / Exit codes / See also). They
+// double as a token-efficiency guard: any unexpected growth in help text
+// shows up as a line-count ceiling breach. `insta` is not a workspace
+// dependency, so these are plain string-assertion snapshots — they pin the
+// *shape*, not byte-for-byte text.
+// ---------------------------------------------------------------------------
+
+/// Every existing leaf command, addressed by its full path.
+const LEAF_COMMANDS: &[&[&str]] = &[
+    &["version"],
+    &["auth", "login"],
+    &["auth", "signup"],
+    &["auth", "guest"],
+    &["auth", "logout"],
+    &["auth", "status"],
+    &["account", "list"],
+    &["account", "default"],
+    &["mint", "add"],
+    &["balance"],
+    &["receive", "token"],
+    &["receive", "lightning"],
+    &["receive", "lightning-complete"],
+    &["send", "token"],
+    &["send", "lightning"],
+    &["send", "lightning-complete"],
+    &["send", "lightning-address"],
+];
+
+/// Top-level `--help` carries the orientation banner: output contract,
+/// exit codes, getting started, discovery.
+#[test]
+fn top_level_help_has_orientation_banner() {
+    let text = help_text(&["--help"]);
+    for marker in [
+        "OUTPUT CONTRACT",
+        "EXIT CODES",
+        "GETTING STARTED",
+        "DISCOVERY",
+        "agicash auth login",
+        "<command> --help",
+    ] {
+        assert!(
+            text.contains(marker),
+            "top-level --help missing orientation marker `{marker}`:\n{text}",
+        );
+    }
+}
+
+/// `agicash --help` stays a terse map: one line per command group, and the
+/// whole page stays small enough to be cheap for an agent to read.
+#[test]
+fn top_level_help_is_a_terse_map() {
+    let text = help_text(&["--help"]);
+    for group in [
+        "version", "auth", "account", "mint", "balance", "receive", "send",
+    ] {
+        assert!(
+            text.contains(group),
+            "top-level --help missing command group `{group}`",
+        );
+    }
+    // Token-bloat guard: the top-level page is the most-read help in the
+    // tree; keep it lean. Generous ceiling — a real regression blows past.
+    let lines = text.lines().count();
+    assert!(
+        lines < 60,
+        "top-level --help grew to {lines} lines (ceiling 60) — token bloat?\n{text}",
+    );
+}
+
+/// Each command *group* gains a `long_about` richer than its one-line
+/// `about` — progressive disclosure between level 1 and level 2.
+#[test]
+fn group_help_drills_in_past_the_one_liner() {
+    for group in [["auth"], ["account"], ["mint"], ["receive"], ["send"]] {
+        let mut args: Vec<&str> = group.to_vec();
+        args.push("--help");
+        let text = help_text(&args);
+        assert!(
+            text.contains("--help` for detail"),
+            "group `{}` --help lacks a drill-in long_about:\n{text}",
+            group[0],
+        );
+    }
+}
+
+/// Every existing leaf command follows the 5-part house template.
+#[test]
+fn every_leaf_follows_the_house_template() {
+    for leaf in LEAF_COMMANDS {
+        let mut args: Vec<&str> = leaf.to_vec();
+        args.push("--help");
+        let text = help_text(&args);
+        let path = leaf.join(" ");
+        // Example block: one concrete invocation + its literal JSON.
+        assert!(
+            text.contains("EXAMPLE"),
+            "leaf `{path}` --help missing EXAMPLE block:\n{text}",
+        );
+        // Exit-codes block.
+        assert!(
+            text.contains("EXIT CODES"),
+            "leaf `{path}` --help missing EXIT CODES block:\n{text}",
+        );
+        // See-also block.
+        assert!(
+            text.contains("SEE ALSO"),
+            "leaf `{path}` --help missing SEE ALSO block:\n{text}",
+        );
+        // Token-bloat guard: one example, no padding — a leaf page stays
+        // compact. A generous ceiling that a real regression breaches.
+        let lines = text.lines().count();
+        assert!(
+            lines < 70,
+            "leaf `{path}` --help grew to {lines} lines (ceiling 70) — token bloat?\n{text}",
+        );
+    }
+}
+
+/// Every argument and flag on every leaf carries a non-empty help string.
+/// Specifically pins the fix for the two previously blank `send
+/// lightning-complete` arguments (`--poll-ms`, `--timeout-s`).
+#[test]
+fn no_leaf_argument_has_blank_help() {
+    for leaf in LEAF_COMMANDS {
+        let mut args: Vec<&str> = leaf.to_vec();
+        args.push("--help");
+        let text = help_text(&args);
+        let path = leaf.join(" ");
+        // In clap's long help, an arg with help text renders the flag on
+        // one line and the help indented on the next. A blank-help arg
+        // renders the flag with nothing under it. Scan: every line that
+        // introduces a flag/arg must be followed by an indented help line.
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let is_flag_line = trimmed.starts_with("--") || trimmed.starts_with('<');
+            if !is_flag_line {
+                continue;
+            }
+            let next = lines.get(i + 1).map_or("", |s| s.trim());
+            assert!(
+                !next.is_empty(),
+                "leaf `{path}` --help: argument line `{trimmed}` has blank help text",
+            );
+        }
+    }
+}
+
+/// `send lightning-complete` specifically — its two previously help-less
+/// arguments must now describe themselves.
+#[test]
+fn send_lightning_complete_args_are_documented() {
+    let text = help_text(&["send", "lightning-complete", "--help"]);
+    assert!(
+        text.contains("--poll-ms") && text.contains("Polling interval"),
+        "send lightning-complete --poll-ms still undocumented:\n{text}",
+    );
+    assert!(
+        text.contains("--timeout-s") && text.contains("timeout in seconds"),
+        "send lightning-complete --timeout-s still undocumented:\n{text}",
+    );
+}
+
+/// `ValueEnum` arguments surface their valid values in `--help`.
+#[test]
+fn value_enum_args_show_possible_values() {
+    let token = help_text(&["send", "token", "--help"]);
+    assert!(
+        token.contains("Possible values:") && token.contains("3:") && token.contains("4:"),
+        "send token --help does not list token-version possible values:\n{token}",
+    );
+    let mint = help_text(&["mint", "add", "--help"]);
+    assert!(
+        mint.contains("Possible values:") && mint.contains("BTC:") && mint.contains("USD:"),
+        "mint add --help does not list currency possible values:\n{mint}",
+    );
+}
+
+/// The two-tier help works: `-h` is the terse scan, `--help` the full
+/// page. `-h` must be strictly shorter than `--help` for a leaf with an
+/// `after_long_help` block.
+#[test]
+fn dash_h_is_terser_than_double_dash_help() {
+    let short = help_text(&["send", "token", "-h"]);
+    let long = help_text(&["send", "token", "--help"]);
+    assert!(
+        short.len() < long.len(),
+        "`send token -h` ({} bytes) should be shorter than `--help` ({} bytes)",
+        short.len(),
+        long.len(),
+    );
+    // The terse tier omits the after_long_help block...
+    assert!(
+        !short.contains("EXAMPLE"),
+        "`-h` should not render the full EXAMPLE block:\n{short}",
+    );
+    // ...while the full tier includes it.
+    assert!(
+        long.contains("EXAMPLE"),
+        "`--help` should render the EXAMPLE block:\n{long}",
+    );
+}
+
+/// Spot-check `-h` at the top level: terse `about`, no banner.
+#[test]
+fn top_level_dash_h_omits_the_banner() {
+    let short = help_text(&["-h"]);
+    let long = help_text(&["--help"]);
+    assert!(
+        !short.contains("OUTPUT CONTRACT"),
+        "top-level `-h` should not render the orientation banner:\n{short}",
+    );
+    assert!(
+        long.contains("OUTPUT CONTRACT"),
+        "top-level `--help` must render the orientation banner",
     );
 }
