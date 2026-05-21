@@ -13,11 +13,10 @@ use agicash_domain::Currency;
 use agicash_traits::{AuthError, StorageError};
 use agicash_wallet::WalletError;
 use serde::Serialize;
-use std::str::FromStr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MintCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
     #[error("invalid mint URL: {0}")]
     InvalidUrl(String),
@@ -71,11 +70,8 @@ struct MintAddOutput<'a> {
 pub async fn cmd_mint_add(
     deps: &CliDeps,
     url: &str,
-    currency_str: &str,
+    currency: Currency,
 ) -> Result<(), MintCmdError> {
-    let currency = Currency::from_str(currency_str)
-        .map_err(|_| MintCmdError::UnsupportedCurrency(currency_str.to_string()))?;
-
     let summary = deps
         .wallet
         .add_mint(url.to_string(), currency)

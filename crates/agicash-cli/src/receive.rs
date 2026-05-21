@@ -14,7 +14,7 @@ use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
     #[error("invalid token: {0}")]
     InvalidToken(String),

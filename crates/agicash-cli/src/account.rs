@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AccountCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
     #[error("invalid account id (expected UUID): {0}")]
     InvalidId(String),

@@ -101,7 +101,6 @@ mod gated {
         // --- classify_error: send (token + lightning) ---
         "account-ambiguous",
         "invalid-account-id",
-        "unsupported-token-version",
         "token-encode-error",
         "insufficient-balance",
         "amount-too-small",

@@ -19,16 +19,14 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
-    #[error("no matching account")]
+    #[error("no matching account — run `agicash mint add` first")]
     NoMatchingAccount,
     #[error("account ambiguous — pass --account <id>")]
     AccountAmbiguous,
     #[error("invalid account id: {0}")]
     InvalidAccountId(String),
-    #[error("unsupported token version: {0}")]
-    UnsupportedTokenVersion(u8),
     #[error("token encode error: {0}")]
     TokenEncode(String),
     #[error("insufficient balance: {0}")]
@@ -110,17 +108,13 @@ async fn mint_url_for(deps: &CliDeps, account_id: AccountId) -> Result<String, S
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn cmd_send(
     deps: &CliDeps,
     amount: u64,
     account: Option<String>,
-    token_version: u8,
+    token_version: TokenVersion,
     dry_run: bool,
 ) -> Result<(), SendCmdError> {
-    if token_version != 3 && token_version != 4 {
-        return Err(SendCmdError::UnsupportedTokenVersion(token_version));
-    }
     let account_id = parse_account(account.as_deref())?;
 
     // Cashu token send always settles a BTC Cashu account in the prior
@@ -153,14 +147,9 @@ pub async fn cmd_send(
         return Ok(());
     }
 
-    let tv = if token_version == 3 {
-        TokenVersion::V3
-    } else {
-        TokenVersion::V4
-    };
     let receipt = deps
         .wallet
-        .send_token(account_id, amount_money, tv)
+        .send_token(account_id, amount_money, token_version)
         .await
         .map_err(map_err)?;
 

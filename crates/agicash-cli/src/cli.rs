@@ -1,10 +1,37 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Top-level orientation banner. Stated once — the one piece of contract an
+/// agent cannot derive from the command tree itself.
+const TOP_BANNER: &str = "\
+OUTPUT CONTRACT
+  Success: exactly one JSON line on stdout, exit 0.
+  Failure: {\"error\":{\"code\":\"…\",\"message\":\"…\"}} on stderr, non-zero exit.
+
+EXIT CODES
+  0  success
+  1  error (network, mint, storage, …)
+  2  bad arguments (rejected by the parser)
+  3  auth required (no session — run `agicash auth login`)
+  4  not found
+
+GETTING STARTED
+  Most commands need a session. Run `agicash auth login` or
+  `agicash auth guest` first.
+
+DISCOVERY
+  Drill into any command with `<command> --help`. Use `-h` for a terse
+  scan, `--help` for the full page.";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "agicash",
     version,
-    about = "Agicash CLI — self-custody Bitcoin wallet (JSON output)"
+    about = "Agicash CLI — self-custody Bitcoin wallet (JSON output)",
+    long_about = "Agicash CLI — a self-custody Cashu Bitcoin wallet driven entirely \
+through JSON.\n\nEvery command prints exactly one JSON line on success and a \
+structured JSON error on failure. The CLI is designed as an agent surface: walk \
+the command tree with `--help` to learn each operation without trial and error.",
+    after_long_help = TOP_BANNER
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -14,26 +41,103 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Print the SDK version.
+    #[command(
+        long_about = "Print the agicash SDK version. Offline, no session required.",
+        after_long_help = "EXAMPLE\n  $ agicash version\n  {\"version\":\"0.1.0\"}\n\n  \
+version  the agicash-cli package version (semver).\n\nEXIT CODES\n  0  success\n\n\
+SEE ALSO\n  agicash --help"
+    )]
     Version,
     /// Authentication and session management.
+    #[command(long_about = "Authentication and session management. The session is \
+persisted across processes (OS keyring where available), so `auth login` once \
+then run other commands freely. Run `agicash auth <sub> --help` for detail.")]
     Auth(AuthArgs),
     /// Accounts (cashu and spark) for the current user.
+    #[command(
+        long_about = "Inspect and configure the current user's accounts (cashu and \
+spark). Requires a session. Run `agicash account <sub> --help` for detail."
+    )]
     Account(AccountArgs),
     /// Manage Cashu mints.
+    #[command(
+        long_about = "Manage Cashu mints. Adding a mint creates an account backed \
+by it; an account is required before you can receive or send. Run \
+`agicash mint <sub> --help` for detail."
+    )]
     Mint(MintArgs),
     /// Show balance for all accounts (or a specific account).
+    #[command(
+        long_about = "Show the spendable balance of every account, or one account \
+when `--account` is given. Requires a session.",
+        after_long_help = "EXAMPLE\n  $ agicash balance\n  \
+[{\"account_id\":\"…\",\"name\":\"testnut\",\"currency\":\"BTC\",\"balance\":\"1200\",\"unit\":\"sat\"}]\n\n  \
+JSON array, one object per account. `balance` is in the smallest unit\n  \
+(`sat` for BTC, `cent` for USD). Non-BTC accounts also carry a\n  \
+`btc_equivalent` / `rate_btc` pair (or `btc_equivalent_error` if the\n  \
+rate provider is down).\n\nEXIT CODES\n  0  success\n  1  storage/network error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash account list, agicash mint add"
+    )]
     Balance {
-        /// Show balance for a specific account ID only.
+        /// Show balance for a specific account ID only (UUID).
         #[arg(long)]
         account: Option<String>,
     },
-    /// Receive funds into a Cashu account — either by claiming a Cashu
-    /// token (NUT-03 swap) or by issuing a Lightning invoice (NUT-04
-    /// mint quote).
+    /// Receive funds into a Cashu account.
+    #[command(
+        long_about = "Receive funds into a Cashu account — either by claiming a \
+Cashu token (NUT-03 swap) or by issuing a Lightning invoice (NUT-04 mint quote). \
+Run `agicash receive <sub> --help` for detail."
+    )]
     Receive(ReceiveArgs),
-    /// Send funds out of a Cashu account — either by producing a Cashu
-    /// token (NUT-03 swap) or by paying a BOLT-11 invoice (NUT-05 melt).
+    /// Send funds out of a Cashu account.
+    #[command(
+        long_about = "Send funds out of a Cashu account — produce a Cashu token \
+(NUT-03 swap), pay a BOLT-11 invoice (NUT-05 melt), or pay a Lightning Address. \
+Run `agicash send <sub> --help` for detail."
+    )]
     Send(SendArgs),
+}
+
+/// Cashu token serialization format. Maps to `agicash_wallet::TokenVersion`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenVersion {
+    /// V3 — legacy JSON encoding (`cashuA…`).
+    #[value(name = "3")]
+    V3,
+    /// V4 — compact CBOR encoding (`cashuB…`), the default.
+    #[value(name = "4")]
+    V4,
+}
+
+impl From<TokenVersion> for agicash_wallet::TokenVersion {
+    fn from(v: TokenVersion) -> Self {
+        match v {
+            TokenVersion::V3 => agicash_wallet::TokenVersion::V3,
+            TokenVersion::V4 => agicash_wallet::TokenVersion::V4,
+        }
+    }
+}
+
+/// Currency selector for CLI arguments. Restricted to the two end-user
+/// currencies; maps to `agicash_domain::Currency`.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Currency {
+    /// Bitcoin — amounts in sats.
+    #[value(name = "BTC", alias = "btc")]
+    Btc,
+    /// US dollar — amounts in cents.
+    #[value(name = "USD", alias = "usd")]
+    Usd,
+}
+
+impl From<Currency> for agicash_domain::Currency {
+    fn from(c: Currency) -> Self {
+        match c {
+            Currency::Btc => agicash_domain::Currency::Btc,
+            Currency::Usd => agicash_domain::Currency::Usd,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -45,79 +149,135 @@ pub struct SendArgs {
 #[derive(Subcommand, Debug)]
 pub enum SendCommand {
     /// Produce a Cashu token from the account (NUT-03 send-swap).
+    #[command(
+        long_about = "Produce a Cashu token by swapping proofs out of a BTC Cashu \
+account (NUT-03). The printed `token` string is bearer value — anyone who has it \
+can claim it. Use `--dry-run` to preview the fee before committing.",
+        after_long_help = "EXAMPLE\n  $ agicash send token 100\n  \
+{\"status\":\"sent\",\"token\":\"cashuB…\",\"amount\":\"100\",\"fee\":\"0\",\"unit\":\"sat\",\
+\"currency\":\"BTC\",\"account_id\":\"…\",\"mint_url\":\"…\",\"swap_id\":\"…\",\"token_hash\":\"…\"}\n\n  \
+token       the encoded bearer token — hand this to the recipient.\n  \
+amount/fee  amount sent and mint fee, in `unit`.\n  \
+token_hash  stable id for this token (idempotency / lookup).\n\n\
+EXIT CODES\n  0  success\n  1  insufficient balance, mint or storage error\n  \
+2  bad arguments (e.g. invalid --token-version)\n  3  not authenticated\n\n\
+SEE ALSO\n  agicash receive token, agicash balance"
+    )]
     Token {
-        /// Amount to send in the account's unit (sats for BTC accounts,
-        /// cents for USD).
+        /// Amount to send, in sats.
         amount: u64,
-        /// Account ID to send from. If omitted, the only Cashu account
-        /// is used; if multiple Cashu accounts exist, this is required.
+        /// Account ID to send from (UUID). Omit to use the only Cashu
+        /// account; required when several exist.
         #[arg(long)]
         account: Option<String>,
         /// Token format version: 4 (CBOR, default) or 3 (legacy JSON).
-        #[arg(long, default_value_t = 4)]
-        token_version: u8,
-        /// Show preview without persisting or producing a token.
+        #[arg(long, value_enum, default_value = "4")]
+        token_version: TokenVersion,
+        /// Preview the fee without persisting or producing a token.
         #[arg(long)]
         dry_run: bool,
     },
     /// Pay a BOLT-11 invoice via NUT-05 melt.
+    #[command(
+        long_about = "Pay a BOLT-11 Lightning invoice by melting Cashu proofs \
+(NUT-05). The invoice must carry an amount. The command begins the melt then \
+polls until it settles; use `--dry-run` to preview the fee first.",
+        after_long_help = "EXAMPLE\n  $ agicash send lightning lnbc1u1p…\n  \
+{\"status\":\"paid\",\"quote_id\":\"…\",\"amount\":\"100\",\"lightning_fee\":\"1\",\
+\"cashu_fee\":\"0\",\"total_fee\":\"1\",\"amount_spent\":\"101\",\"payment_preimage\":\"…\",\
+\"account_id\":\"…\",\"payment_hash\":\"…\"}\n\n  \
+status            `paid`, `failed`, or `timed-out`.\n  \
+payment_preimage  proof of payment (present only on `paid`).\n  \
+quote_id          melt-quote id — pass to `send lightning-complete` to\n  \
+                  resume a `timed-out` or in-flight payment.\n\n\
+EXIT CODES\n  0  success (incl. `failed`/`timed-out` outcomes)\n  \
+1  insufficient balance, mint or network error\n  3  not authenticated\n\n\
+SEE ALSO\n  agicash send lightning-complete, agicash send lightning-address"
+    )]
     Lightning {
-        /// BOLT-11 invoice to pay (must include amount).
+        /// BOLT-11 invoice to pay (must include an amount).
         invoice: String,
-        /// Account ID to send from. If omitted, the only Cashu account
-        /// is used; if multiple Cashu accounts exist, this is required.
+        /// Account ID to send from (UUID). Omit to use the only Cashu
+        /// account; required when several exist.
         #[arg(long)]
         account: Option<String>,
-        /// Show preview without persisting or paying.
+        /// Preview the fee without persisting or paying.
         #[arg(long)]
         dry_run: bool,
-        /// If set, request the melt quote and exit; call
-        /// `agicash send lightning-complete <quote_id>` later to finish.
+        /// Begin the melt and return without waiting; resume later with
+        /// `agicash send lightning-complete <quote_id>`.
         #[arg(long)]
         no_wait: bool,
-        /// Polling interval in milliseconds.
+        /// Polling interval in milliseconds while the melt is in flight.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
-        /// Overall timeout in seconds.
+        /// Overall timeout in seconds before reporting `timed-out`.
         #[arg(long, default_value_t = 300)]
         timeout_s: u64,
     },
-    /// Finish a previously-initiated Lightning send (used with `--no-wait`).
+    /// Finish a previously-initiated Lightning send.
+    #[command(
+        long_about = "Resume an in-flight Lightning send by its melt-quote id — \
+used after `send lightning --no-wait` or to retry a `timed-out` payment. \
+Reconcile-aware: it polls the existing quote, it never re-pays.",
+        after_long_help = "EXAMPLE\n  $ agicash send lightning-complete \
+11111111-2222-3333-4444-555555555555\n  \
+{\"status\":\"paid\",\"quote_id\":\"…\",\"amount\":\"100\",\"total_fee\":\"1\",\
+\"payment_preimage\":\"…\",\"account_id\":\"…\",\"payment_hash\":\"…\"}\n\n  \
+status  `paid`, `failed`, or `timed-out` — same shape as `send lightning`.\n\n\
+EXIT CODES\n  0  success (incl. `failed`/`timed-out` outcomes)\n  \
+1  invalid quote id, mint or network error\n  3  not authenticated\n\n\
+SEE ALSO\n  agicash send lightning"
+    )]
     LightningComplete {
-        /// The DB quote id (UUID) returned by `send lightning --no-wait`.
+        /// The melt-quote id (UUID) returned by `send lightning --no-wait`.
         quote_id: String,
+        /// Polling interval in milliseconds while the melt is in flight.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
+        /// Overall timeout in seconds before reporting `timed-out`.
         #[arg(long, default_value_t = 30)]
         timeout_s: u64,
     },
-    /// Pay a LUD-16 Lightning Address (`user@domain`) by resolving the
-    /// well-known endpoint client-side, fetching a BOLT-11 invoice, then
-    /// running the regular NUT-05 melt flow.
+    /// Pay a LUD-16 Lightning Address (`user@domain`).
+    #[command(
+        long_about = "Pay a LUD-16 Lightning Address (`user@domain`). The CLI \
+resolves the address's well-known endpoint, fetches a BOLT-11 invoice for the \
+requested amount, then runs the regular NUT-05 melt flow.",
+        after_long_help = "EXAMPLE\n  $ agicash send lightning-address \
+alice@walletofsatoshi.com 100\n  \
+{\"status\":\"paid\",\"quote_id\":\"…\",\"amount\":\"100\",\"total_fee\":\"1\",\
+\"payment_preimage\":\"…\",\"account_id\":\"…\",\"payment_hash\":\"…\"}\n\n  \
+The command first prints `resolved` and `invoice-fetched` lines, then the\n  \
+melt outcome (`paid`/`failed`/`timed-out`) — same shape as `send lightning`.\n\n\
+EXIT CODES\n  0  success (incl. `failed`/`timed-out` outcomes)\n  \
+1  address resolution, insufficient balance or network error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash send lightning"
+    )]
     LightningAddress {
         /// LUD-16 address, e.g. `alice@walletofsatoshi.com`.
         address: String,
-        /// Amount to send in sats. Converted to msats for the LUD-06 callback.
+        /// Amount to send, in sats.
         amount: u64,
-        /// Account ID to send from. If omitted, the only Cashu account
-        /// is used; if multiple Cashu accounts exist, this is required.
+        /// Account ID to send from (UUID). Omit to use the only Cashu
+        /// account; required when several exist.
         #[arg(long)]
         account: Option<String>,
-        /// Optional comment to send with the LUD-12 callback (if the
-        /// remote advertises `commentAllowed`).
+        /// Comment for the LUD-12 callback (used only if the remote
+        /// advertises `commentAllowed`).
         #[arg(long)]
         comment: Option<String>,
-        /// Show preview without persisting or paying.
+        /// Preview the fee without persisting or paying.
         #[arg(long)]
         dry_run: bool,
-        /// If set, request the melt quote and exit; call
-        /// `agicash send lightning-complete <quote_id>` later to finish.
+        /// Begin the melt and return without waiting; resume later with
+        /// `agicash send lightning-complete <quote_id>`.
         #[arg(long)]
         no_wait: bool,
-        /// Polling interval in milliseconds.
+        /// Polling interval in milliseconds while the melt is in flight.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
-        /// Overall timeout in seconds.
+        /// Overall timeout in seconds before reporting `timed-out`.
         #[arg(long, default_value_t = 300)]
         timeout_s: u64,
     },
@@ -132,46 +292,83 @@ pub struct ReceiveArgs {
 #[derive(Subcommand, Debug)]
 pub enum ReceiveCommand {
     /// Claim a Cashu token (NUT-03 swap).
+    #[command(
+        long_about = "Claim a Cashu token into the matching account by swapping \
+its proofs (NUT-03). The token's mint must already have an account — run \
+`agicash mint add` first if it does not. Idempotent: re-claiming an \
+already-spent token reports `already-claimed`.",
+        after_long_help = "EXAMPLE\n  $ agicash receive token cashuBo2F0…\n  \
+{\"status\":\"received\",\"amount\":\"100\",\"fee\":\"0\",\"unit\":\"sat\",\
+\"currency\":\"BTC\",\"account_id\":\"…\",\"mint_url\":\"…\",\"token_hash\":\"…\"}\n\n  \
+status      `received`, `already-claimed`, `already-failed`, or `pending`.\n  \
+amount/fee  amount credited and mint fee, in `unit`.\n\n\
+EXIT CODES\n  0  success\n  1  invalid token, no matching account, mint error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash send token, agicash balance"
+    )]
     Token {
-        /// Encoded Cashu token (`cashuA...` V3 or `cashuB...` V4).
+        /// Encoded Cashu token (`cashuA…` V3 or `cashuB…` V4).
         token: String,
     },
-    /// Receive sats via Lightning: request a NUT-04 mint quote from the
-    /// chosen account's mint, then mint proofs once the invoice is paid.
+    /// Receive sats via a Lightning invoice (NUT-04 mint quote).
+    #[command(
+        long_about = "Receive funds over Lightning: request a NUT-04 mint quote, \
+print the invoice for the payer, then mint proofs once it is paid. By default \
+the command polls until the invoice settles; pass `--no-wait` to print the \
+invoice and exit.",
+        after_long_help = "EXAMPLE\n  $ agicash receive lightning 100\n  \
+{\"status\":\"quote-issued\",\"quote_id\":\"…\",\"invoice\":\"lnbc1u1p…\",\
+\"payment_hash\":\"…\",\"amount\":\"100\",\"unit\":\"sat\",\"currency\":\"BTC\",\
+\"expires_at\":\"…\",\"account_id\":\"…\"}\n  …then `{\"status\":\"received\",…}` once paid.\n\n  \
+invoice   give this BOLT-11 string to the payer.\n  \
+quote_id  pass to `receive lightning-complete` to finish after `--no-wait`.\n\n\
+EXIT CODES\n  0  success\n  1  no matching account, amount too small, mint error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash receive lightning-complete"
+    )]
     Lightning {
-        /// Amount to receive in the account's unit (sats for BTC,
+        /// Amount to receive, in the account's unit (sats for BTC,
         /// cents for USD).
         amount: u64,
-        /// Account ID to receive into. If omitted, the only Cashu account
-        /// for the user matching `--currency` is used; if multiple, this
-        /// is required.
+        /// Account ID to receive into (UUID). Omit to use the only Cashu
+        /// account matching `--currency`; required when several exist.
         #[arg(long)]
         account: Option<String>,
-        /// Currency code (BTC default; USD for usd-unit mints).
-        #[arg(long, default_value = "BTC")]
-        currency: String,
+        /// Currency of the account to receive into.
+        #[arg(long, value_enum, default_value = "BTC")]
+        currency: Currency,
         /// Optional memo to attach to the mint quote.
         #[arg(long)]
         description: Option<String>,
-        /// If set, print the invoice + quote id and exit without polling.
-        /// Call `agicash receive lightning-complete <quote_id>` later.
+        /// Print the invoice + quote id and exit without polling; resume
+        /// later with `agicash receive lightning-complete <quote_id>`.
         #[arg(long)]
         no_wait: bool,
-        /// Polling interval in milliseconds.
+        /// Polling interval in milliseconds while the invoice is unpaid.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
-        /// Overall timeout in seconds.
+        /// Overall timeout in seconds before reporting `timed-out`.
         #[arg(long, default_value_t = 300)]
         timeout_s: u64,
     },
-    /// Finish a previously-created Lightning receive (used with `--no-wait`).
+    /// Finish a previously-created Lightning receive.
+    #[command(
+        long_about = "Finish a Lightning receive by its quote id — used after \
+`receive lightning --no-wait`. Polls the quote; once the invoice is paid it \
+mints the proofs and credits the account.",
+        after_long_help = "EXAMPLE\n  $ agicash receive lightning-complete \
+11111111-2222-3333-4444-555555555555\n  \
+{\"status\":\"received\",\"amount\":\"100\",\"fee\":\"0\",\"unit\":\"sat\",\
+\"currency\":\"BTC\",\"account_id\":\"…\",\"quote_id\":\"…\",\"payment_hash\":\"…\"}\n\n  \
+status  `received`, `timed-out`, or `already-failed`.\n\n\
+EXIT CODES\n  0  success\n  1  invalid/unpaid quote, mint error\n  \
+3  not authenticated\n\nSEE ALSO\n  agicash receive lightning"
+    )]
     LightningComplete {
-        /// The DB quote id (UUID) returned by `receive lightning --no-wait`.
+        /// The quote id (UUID) returned by `receive lightning --no-wait`.
         quote_id: String,
-        /// Polling interval in milliseconds (when the quote is still UNPAID).
+        /// Polling interval in milliseconds while the invoice is unpaid.
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
-        /// Overall timeout in seconds (when the quote is still UNPAID).
+        /// Overall timeout in seconds before reporting `timed-out`.
         #[arg(long, default_value_t = 30)]
         timeout_s: u64,
     },
@@ -185,22 +382,63 @@ pub struct AuthArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
-    /// Sign in with an email and password (password prompted on stdin).
+    /// Sign in with an email and password.
+    #[command(
+        long_about = "Sign in with an existing email + password account. The \
+password is read from stdin (never passed as an argument). The session is \
+persisted so subsequent commands inherit it.",
+        after_long_help = "EXAMPLE\n  $ agicash auth login alice@example.com\n  \
+Password: ********\n  {\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n\
+EXIT CODES\n  0  success\n  1  network or backend error\n  \
+3  bad credentials / unauthenticated\n\nSEE ALSO\n  agicash auth signup, agicash auth guest"
+    )]
     Login {
-        /// Email address.
+        /// Email address of the account.
         email: String,
     },
-    /// Register a new email + password user (password prompted on stdin)
-    /// and sign in.
+    /// Register a new email + password user and sign in.
+    #[command(
+        long_about = "Register a new email + password user and sign in. The \
+password is prompted twice on stdin and must be at least 8 characters.",
+        after_long_help = "EXAMPLE\n  $ agicash auth signup alice@example.com\n  \
+Password: ********\n  Confirm password: ********\n  \
+{\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n\
+EXIT CODES\n  0  success\n  1  passwords mismatch, too short, or backend error\n  \
+3  unauthenticated\n\nSEE ALSO\n  agicash auth login, agicash auth guest"
+    )]
     Signup {
-        /// Email address.
+        /// Email address for the new account.
         email: String,
     },
     /// Register and sign in as an anonymous guest user.
+    #[command(
+        long_about = "Register and sign in as an anonymous guest user — no email, \
+no password. The fastest way to get a usable session for testing.",
+        after_long_help = "EXAMPLE\n  $ agicash auth guest\n  \
+{\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":true}\n\n\
+EXIT CODES\n  0  success\n  1  network or backend error\n\n\
+SEE ALSO\n  agicash auth login, agicash auth status"
+    )]
     Guest,
     /// Clear the local session.
+    #[command(
+        long_about = "Clear the local session and best-effort sign out on the \
+server. Idempotent — running it without an active session succeeds.",
+        after_long_help = "EXAMPLE\n  $ agicash auth logout\n  \
+{\"status\":\"signed-out\"}\n\n  status  `signed-out`, or `not-logged-in` if no \
+session was present.\n\nEXIT CODES\n  0  success\n\n\
+SEE ALSO\n  agicash auth login, agicash auth status"
+    )]
     Logout,
-    /// Report whether a session is active, and if so, the user id.
+    /// Report whether a session is active.
+    #[command(
+        long_about = "Report whether a session is currently active and, if so, \
+the signed-in user id. Never fails on a missing session.",
+        after_long_help = "EXAMPLE\n  $ agicash auth status\n  \
+{\"logged_in\":true,\"user_id\":\"…\"}\n\n  When logged out: \
+{\"logged_in\":false}\n\nEXIT CODES\n  0  success\n\n\
+SEE ALSO\n  agicash auth login, agicash auth logout"
+    )]
     Status,
 }
 
@@ -213,11 +451,30 @@ pub struct AccountArgs {
 #[derive(Subcommand, Debug)]
 pub enum AccountCommand {
     /// List active accounts for the current user.
+    #[command(
+        long_about = "List every active account for the signed-in user, with its \
+id, currency, mint and default flags. Requires a session.",
+        after_long_help = "EXAMPLE\n  $ agicash account list\n  \
+[{\"id\":\"…\",\"name\":\"testnut\",\"currency\":\"BTC\",\"mint_url\":\"…\"}]\n\n  \
+JSON array, one object per account. Use an `id` from here as the\n  \
+`--account` argument elsewhere.\n\nEXIT CODES\n  0  success\n  \
+1  storage/network error\n  3  not authenticated\n\n\
+SEE ALSO\n  agicash account default, agicash balance"
+    )]
     List,
-    /// Set the per-currency default account. Currency is inferred from
-    /// the account row (BTC -> `default_btc_account_id`, USD -> ditto).
+    /// Set the per-currency default account.
+    #[command(
+        long_about = "Set the default account for its currency. The currency is \
+inferred from the account row (a BTC account sets the BTC default, a USD account \
+the USD default). Requires a session.",
+        after_long_help = "EXAMPLE\n  $ agicash account default \
+11111111-2222-3333-4444-555555555555\n  {\"id\":\"…\",\"default_btc_account_id\":\"…\"}\n\n\
+EXIT CODES\n  0  success\n  2  malformed account id (not a UUID)\n  \
+3  not authenticated\n  4  account not found\n\n\
+SEE ALSO\n  agicash account list"
+    )]
     Default {
-        /// Account ID (UUID).
+        /// Account ID (UUID) to make the default for its currency.
         id: String,
     },
 }
@@ -231,12 +488,24 @@ pub struct MintArgs {
 #[derive(Subcommand, Debug)]
 pub enum MintCommand {
     /// Add a Cashu mint and create an account for it.
+    #[command(
+        long_about = "Add a Cashu mint and create an account backed by it. The \
+mint is reached for NUT-06 discovery, so it must be online. An account is a \
+prerequisite for receiving or sending — add a mint before anything else.",
+        after_long_help = "EXAMPLE\n  $ agicash mint add https://testnut.cashu.space\n  \
+{\"status\":\"added\",\"account_id\":\"…\",\"mint_name\":\"testnut\",\
+\"mint_url\":\"https://testnut.cashu.space\"}\n\n  \
+account_id  the new account — use as `--account` elsewhere.\n\n\
+EXIT CODES\n  0  success\n  1  invalid URL, mint unreachable, mint error\n  \
+2  invalid --currency\n  3  not authenticated\n\n\
+SEE ALSO\n  agicash account list, agicash balance"
+    )]
     Add {
         /// Mint URL, e.g. <https://testnut.cashu.space>
         url: String,
-        /// Currency code (BTC or USD; default BTC).
-        #[arg(long, default_value = "BTC")]
-        currency: String,
+        /// Currency of the account to create for this mint.
+        #[arg(long, value_enum, default_value = "BTC")]
+        currency: Currency,
     },
 }
 
@@ -327,7 +596,7 @@ mod tests {
             Some(Command::Mint(m)) => match m.cmd {
                 MintCommand::Add { url, currency } => {
                     assert_eq!(url, "https://testnut.cashu.space");
-                    assert_eq!(currency, "BTC");
+                    assert_eq!(currency, Currency::Btc);
                 }
             },
             other => panic!("unexpected: {other:?}"),
@@ -347,10 +616,24 @@ mod tests {
         .unwrap();
         match cli.cmd {
             Some(Command::Mint(m)) => match m.cmd {
-                MintCommand::Add { currency, .. } => assert_eq!(currency, "USD"),
+                MintCommand::Add { currency, .. } => assert_eq!(currency, Currency::Usd),
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn mint_add_rejects_unknown_currency() {
+        // ValueEnum now rejects bad currency values at parse time (exit 2).
+        let res = Cli::try_parse_from([
+            "agicash",
+            "mint",
+            "add",
+            "https://example.com",
+            "--currency",
+            "EUR",
+        ]);
+        assert!(res.is_err(), "EUR is not a valid currency");
     }
 
     #[test]
@@ -406,7 +689,7 @@ mod tests {
                 } => {
                     assert_eq!(amount, 100);
                     assert!(account.is_none());
-                    assert_eq!(currency, "BTC");
+                    assert_eq!(currency, Currency::Btc);
                     assert!(!no_wait);
                 }
                 other => panic!("unexpected receive subcommand: {other:?}"),
@@ -437,7 +720,7 @@ mod tests {
                 } => {
                     assert_eq!(amount, 100);
                     assert!(no_wait);
-                    assert_eq!(currency, "USD");
+                    assert_eq!(currency, Currency::Usd);
                 }
                 other => panic!("unexpected receive subcommand: {other:?}"),
             },
@@ -478,7 +761,7 @@ mod tests {
                 } => {
                     assert_eq!(amount, 100);
                     assert!(account.is_none());
-                    assert_eq!(token_version, 4);
+                    assert_eq!(token_version, TokenVersion::V4);
                     assert!(!dry_run);
                 }
                 other => panic!("unexpected send subcommand: {other:?}"),
@@ -523,11 +806,20 @@ mod tests {
             .unwrap();
         match cli.cmd {
             Some(Command::Send(s)) => match s.cmd {
-                SendCommand::Token { token_version, .. } => assert_eq!(token_version, 3),
+                SendCommand::Token { token_version, .. } => {
+                    assert_eq!(token_version, TokenVersion::V3);
+                }
                 other => panic!("unexpected send subcommand: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn send_token_rejects_bad_token_version() {
+        // ValueEnum now rejects bad token-version values at parse time (exit 2).
+        let res = Cli::try_parse_from(["agicash", "send", "token", "100", "--token-version", "5"]);
+        assert!(res.is_err(), "5 is not a valid token version");
     }
 
     #[test]

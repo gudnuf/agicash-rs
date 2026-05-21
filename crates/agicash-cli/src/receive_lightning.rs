@@ -18,15 +18,14 @@ use agicash_wallet::{
 };
 use rust_decimal::Decimal;
 use serde::Serialize;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveLightningCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
-    #[error("no matching account")]
+    #[error("no matching account — run `agicash mint add` first")]
     NoMatchingAccount,
     #[error("account ambiguous — pass --account <id>")]
     AccountAmbiguous,
@@ -34,8 +33,6 @@ pub enum ReceiveLightningCmdError {
     InvalidAccountId(String),
     #[error("invalid quote id: {0}")]
     InvalidQuoteId(String),
-    #[error("unsupported currency: {0}")]
-    UnsupportedCurrency(String),
     #[error("amount too small")]
     AmountTooSmall,
     #[error("quote not paid yet")]
@@ -111,19 +108,17 @@ pub async fn cmd_receive_lightning(
     deps: &CliDeps,
     amount: u64,
     account: Option<String>,
-    currency: String,
+    currency: Currency,
     description: Option<String>,
     no_wait: bool,
     poll_ms: u64,
     timeout_s: u64,
 ) -> Result<(), ReceiveLightningCmdError> {
-    let currency_enum = Currency::from_str(&currency)
-        .map_err(|_| ReceiveLightningCmdError::UnsupportedCurrency(currency.clone()))?;
-    let unit = unit_for_currency(currency_enum);
+    let unit = unit_for_currency(currency);
     if amount == 0 {
         return Err(ReceiveLightningCmdError::AmountTooSmall);
     }
-    let amount_money = Money::new(Decimal::from(amount), currency_enum, unit);
+    let amount_money = Money::new(Decimal::from(amount), currency, unit);
     let account_id = parse_account(account.as_deref())?;
     // `description` is accepted for CLI back-compat. The facade
     // `quote_receive_lightning` does not take a memo (the prior CLI
@@ -137,7 +132,7 @@ pub async fn cmd_receive_lightning(
         .await
         .map_err(map_err)?;
 
-    print_quote_issued(&handle, currency_enum);
+    print_quote_issued(&handle);
 
     if no_wait {
         return Ok(());
@@ -236,7 +231,7 @@ async fn poll_then_complete(
     Ok(())
 }
 
-fn print_quote_issued(handle: &ReceiveLightningHandle, _currency: Currency) {
+fn print_quote_issued(handle: &ReceiveLightningHandle) {
     let body = QuoteIssuedOutput {
         status: "quote-issued",
         quote_id: handle.quote_id.to_string(),

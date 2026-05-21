@@ -42,8 +42,16 @@ struct ErrorOutput<'a> {
 /// Map a boxed CLI error to (error code, exit code).
 ///
 /// Exit codes:
-///   - `3` for "auth required" conditions (no session, unauthenticated)
-///   - `1` for everything else
+///   - `1` error — network, mint, storage, encoding and other runtime
+///     failures with no more specific code.
+///   - `2` bad arguments — a value the parser rejected. Argument parsing
+///     is handled by clap before `run` is reached, so this code is
+///     emitted here only for post-parse argument validation (e.g. a
+///     malformed UUID passed to `account default`).
+///   - `3` auth required — no session present or the session is
+///     unauthenticated; the fix is `agicash auth login`.
+///   - `4` not found — the addressed resource (e.g. an account id) does
+///     not exist.
 fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) {
     if let Some(acc) = e.downcast_ref::<AccountCmdError>() {
         return match acc {
@@ -83,7 +91,6 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             ReceiveLightningCmdError::AccountAmbiguous => ("account-ambiguous", 1),
             ReceiveLightningCmdError::InvalidAccountId(_) => ("invalid-account-id", 1),
             ReceiveLightningCmdError::InvalidQuoteId(_) => ("invalid-quote-id", 1),
-            ReceiveLightningCmdError::UnsupportedCurrency(_) => ("unsupported-currency", 1),
             ReceiveLightningCmdError::AmountTooSmall => ("amount-too-small", 1),
             ReceiveLightningCmdError::QuoteNotPaid => ("quote-not-paid", 1),
             ReceiveLightningCmdError::Quote(_) => ("mint-error", 1),
@@ -106,7 +113,6 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             SendCmdError::NoMatchingAccount => ("no-matching-account", 1),
             SendCmdError::AccountAmbiguous => ("account-ambiguous", 1),
             SendCmdError::InvalidAccountId(_) => ("invalid-account-id", 1),
-            SendCmdError::UnsupportedTokenVersion(_) => ("unsupported-token-version", 1),
             SendCmdError::TokenEncode(_) => ("token-encode-error", 1),
             SendCmdError::InsufficientBalance(_) => ("insufficient-balance", 1),
             SendCmdError::Send(_) => ("mint-error", 1),
@@ -233,7 +239,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         Some(Command::Mint(m)) => match m.cmd {
             MintCommand::Add { url, currency } => {
-                mint::cmd_mint_add(&deps, &url, &currency).await?;
+                mint::cmd_mint_add(&deps, &url, currency.into()).await?;
             }
         },
         Some(Command::Balance { account: _ }) => {
@@ -256,7 +262,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &deps,
                     amount,
                     account,
-                    currency,
+                    currency.into(),
                     description,
                     no_wait,
                     poll_ms,
@@ -282,7 +288,7 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token_version,
                 dry_run,
             } => {
-                send::cmd_send(&deps, amount, account, token_version, dry_run).await?;
+                send::cmd_send(&deps, amount, account, token_version.into(), dry_run).await?;
             }
             SendCommand::Lightning {
                 invoice,

@@ -34,9 +34,9 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendLightningCmdError {
-    #[error("not logged in")]
+    #[error("not authenticated; run `agicash auth login`")]
     NotLoggedIn,
-    #[error("no matching account")]
+    #[error("no matching account — run `agicash mint add` first")]
     NoMatchingAccount,
     #[error("account ambiguous — pass --account <id>")]
     AccountAmbiguous,
