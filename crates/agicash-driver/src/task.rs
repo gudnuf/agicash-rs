@@ -457,29 +457,11 @@ async fn run_task<S: Sweeper + 'static>(
     config: DriverConfig,
     shared: Arc<Shared>,
 ) {
-    use futures_util::StreamExt;
-
     let mut rx = rx;
     let mut waker_rx = shared.waker.new_receiver();
 
-    // Native-only fallback-tick interval. Lane C swaps for the wasm
-    // timer primitive. We *create* the interval up front even if
-    // `fallback_tick == None`; the `tick()` branch is then disabled
-    // by branching on `Option`. (`Option<Interval>` would be tidier
-    // but `tokio::select!`'s arm gating works on bool guards, so a
-    // dummy never-fires interval is simplest.)
     #[cfg(not(target_arch = "wasm32"))]
-    let mut tick = match config.fallback_tick {
-        Some(period) => {
-            let mut iv = tokio::time::interval(period);
-            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume the immediate first tick — we don't want the
-            // very-first interval tick to race the initial sweep.
-            iv.tick().await;
-            Some(iv)
-        }
-        None => None,
-    };
+    let mut tick = make_fallback_tick(config.fallback_tick).await;
 
     // Track realtime-connection status so we can suppress the
     // fallback tick while Subscribed (the dead-socket backstop is
@@ -489,71 +471,16 @@ async fn run_task<S: Sweeper + 'static>(
     let mut connected = false;
 
     while !shared.stop.load(Ordering::Acquire) {
-        // 1. If a trigger is pending, run a sweep (and handle the
-        //    dirty-bit re-run via the atomic swap).
+        // 0. Drain any queued realtime events synchronously — see
+        //    `drain_realtime_events` doc for the coalescing rationale.
+        drain_realtime_events(&mut rx, &shared, &mut connected);
+
+        // 1. If a trigger is pending, run a sweep.
         if shared.pending.load(Ordering::Acquire) {
-            // Snapshot + clear pending BEFORE the sweep starts. Any
-            // trigger that arrives DURING the sweep re-sets pending
-            // — that becomes the coalesced re-run on the next loop
-            // iteration. This is the §3 single-in-flight latch.
-            shared.pending.store(false, Ordering::Release);
-
-            // Run the sweep. The loop is unbreakable: a sweep error
-            // is logged and we continue. The one exception is
-            // `Unauthenticated`, which sets the `paused` flag — the
-            // task stops firing sweeps until a foreground notify
-            // clears it.
-            //
-            // NOTE: `pending` cleared *before* the await. If a
-            // trigger fires during the await it will set `pending`
-            // back to true; we'll loop and run another sweep. This
-            // is the "at most one re-run after the in-flight one"
-            // §3 discipline — N concurrent triggers collapse to one
-            // sweep + at most one re-run.
-            let result = sweeper.sweep(config.retry).await;
-            shared.sweep_count.fetch_add(1, Ordering::Release);
-
-            match result {
-                Ok(report) => {
-                    tracing::debug!(
-                        target: "agicash_driver::task",
-                        rows_seen = report.rows_seen,
-                        advanced = report.advanced,
-                        no_op = report.no_op,
-                        failed = report.failed,
-                        "sweep complete"
-                    );
-                }
-                Err(WalletError::Unauthenticated) => {
-                    // The wallet is logged out. Pause the loop —
-                    // re-firing on every trigger would just produce
-                    // a stream of `Unauthenticated`s in the log.
-                    // Resume when `notify_foreground()` is called
-                    // (the user-came-back signal — they may have
-                    // re-signed-in).
-                    tracing::info!(
-                        target: "agicash_driver::task",
-                        "sweep returned Unauthenticated; pausing until foreground edge"
-                    );
-                    shared.paused.store(true, Ordering::Release);
-                }
-                Err(e) => {
-                    // Any other error — log + continue. The loop
-                    // never dies on a single failed sweep.
-                    tracing::warn!(
-                        target: "agicash_driver::task",
-                        error = %e,
-                        "sweep failed; will retry on next trigger"
-                    );
-                    // Brief backoff so a persistent failure doesn't
-                    // hot-spin if triggers keep firing.
-                    #[cfg(not(target_arch = "wasm32"))]
-                    tokio::time::sleep(config.error_backoff).await;
-                }
-            }
-            // After a sweep, check if any new trigger arrived during
-            // it (the dirty bit). If so, loop and sweep again — but
-            // mark it as `Coalesced` for observability.
+            run_one_sweep(sweeper.as_ref(), &config, &shared).await;
+            // Dirty bit: a trigger that arrived during the sweep
+            // already set `pending=true`; the next loop iteration
+            // will run the coalesced re-run. Mark for observability.
             if shared.pending.load(Ordering::Acquire) {
                 shared
                     .reasons_seen
@@ -562,55 +489,17 @@ async fn run_task<S: Sweeper + 'static>(
             continue;
         }
 
-        // 2. No pending trigger — park on the broadcast / waker /
-        //    fallback tick / stop signal.
-
+        // 2. No pending trigger — park on broadcast / waker / fallback
+        //    tick / stop.
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            // tokio::select! over: realtime broadcast / waker pulse /
-            // fallback tick / stop wake.
-            let tick_fut = async {
-                if let Some(iv) = tick.as_mut() {
-                    iv.tick().await;
-                } else {
-                    // Never resolves — fallback tick disabled.
-                    std::future::pending::<()>().await;
-                }
-            };
-            tokio::select! {
-                biased;
-                // Wake-on-stop. The `notify_foreground` / `mark`
-                // path pulses the same waker, so this also catches
-                // foreground edges that arrived between the loop
-                // top check and entering the select.
-                _ = waker_rx.next() => {
-                    // Loop: top will re-check `pending` / `stop`.
-                }
-                ev = rx.next() => {
-                    match ev {
-                        Some(ev) => handle_realtime_event(ev, &shared, &mut connected),
-                        None => {
-                            // Broadcast sender dropped — the realtime
-                            // service is gone. Wait for stop / waker;
-                            // the task otherwise has nothing to do.
-                            tracing::debug!(
-                                target: "agicash_driver::task",
-                                "realtime broadcast closed; driver continues on waker triggers only"
-                            );
-                        }
-                    }
-                }
-                () = tick_fut => {
-                    // Fallback tick fired. If realtime is currently
-                    // Subscribed, this is the suppressed-while-
-                    // connected case — do NOT mark a trigger. The
-                    // tick exists ONLY as a dead-socket backstop.
-                    if !connected && !shared.paused.load(Ordering::Acquire) {
-                        shared.mark(TriggerReason::FallbackTick);
-                    }
-                }
-            }
-        }
+        park_for_next_trigger(
+            &mut rx,
+            &mut waker_rx,
+            tick.as_mut(),
+            &shared,
+            &mut connected,
+        )
+        .await;
         #[cfg(target_arch = "wasm32")]
         {
             // Lane C will replace this with a wasm select primitive.
@@ -622,6 +511,145 @@ async fn run_task<S: Sweeper + 'static>(
         }
     }
     tracing::debug!(target: "agicash_driver::task", "trigger task exiting");
+}
+
+/// Build the (optional) fallback-tick interval. Native-only — Lane C
+/// provides the wasm timer primitive.
+#[cfg(not(target_arch = "wasm32"))]
+async fn make_fallback_tick(period: Option<Duration>) -> Option<tokio::time::Interval> {
+    let period = period?;
+    let mut iv = tokio::time::interval(period);
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick — we don't want the very-first
+    // interval tick to race the initial sweep.
+    iv.tick().await;
+    Some(iv)
+}
+
+/// Drain every event currently in the broadcast queue without
+/// awaiting. This is the coalescing multiplier: if a burst of N
+/// events landed in the broadcast queue between iterations, draining
+/// them all here OR's their effects into ONE `pending` flag — one
+/// sweep covers all of them. Without this, each event in the queue
+/// would cycle one trip through the loop and produce its own sweep
+/// call.
+fn drain_realtime_events(
+    rx: &mut async_broadcast::Receiver<WalletRealtimeEvent>,
+    shared: &Shared,
+    connected: &mut bool,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => handle_realtime_event(ev, shared, connected),
+            Err(async_broadcast::TryRecvError::Empty) => break,
+            Err(async_broadcast::TryRecvError::Overflowed(_)) => {
+                // Events dropped by the overflow=true broadcast. Treat
+                // as a "rows may have changed" signal: mark a generic
+                // trigger so a sweep catches up.
+                if !shared.paused.load(Ordering::Acquire) {
+                    shared.mark(TriggerReason::RealtimeEvent);
+                }
+            }
+            Err(async_broadcast::TryRecvError::Closed) => {
+                // Sender dropped. Continue without it — the task still
+                // serves waker triggers (stop, foreground notify).
+                break;
+            }
+        }
+    }
+}
+
+/// Run one sweep, classify the result, and update shared state.
+/// `pending` is cleared BEFORE the sweep starts so a trigger arriving
+/// DURING the sweep re-sets it — that becomes the §3 dirty-bit
+/// re-run on the next loop iteration.
+async fn run_one_sweep<S: Sweeper + ?Sized>(sweeper: &S, config: &DriverConfig, shared: &Shared) {
+    shared.pending.store(false, Ordering::Release);
+    let result = sweeper.sweep(config.retry).await;
+    shared.sweep_count.fetch_add(1, Ordering::Release);
+
+    match result {
+        Ok(report) => {
+            tracing::debug!(
+                target: "agicash_driver::task",
+                rows_seen = report.rows_seen,
+                advanced = report.advanced,
+                no_op = report.no_op,
+                failed = report.failed,
+                "sweep complete"
+            );
+        }
+        Err(WalletError::Unauthenticated) => {
+            // Logged-out: pause the loop. Resume on the next
+            // `notify_foreground()` (the user-came-back signal —
+            // likely they re-signed-in).
+            tracing::info!(
+                target: "agicash_driver::task",
+                "sweep returned Unauthenticated; pausing until foreground edge"
+            );
+            shared.paused.store(true, Ordering::Release);
+        }
+        Err(e) => {
+            // Any other error — log + continue. The loop never dies
+            // on a single failed sweep.
+            tracing::warn!(
+                target: "agicash_driver::task",
+                error = %e,
+                "sweep failed; will retry on next trigger"
+            );
+            // Brief backoff so a persistent failure doesn't hot-spin
+            // if triggers keep firing.
+            #[cfg(not(target_arch = "wasm32"))]
+            tokio::time::sleep(config.error_backoff).await;
+        }
+    }
+}
+
+/// Park on the next of: a waker pulse (stop / foreground), a realtime
+/// event, a fallback tick. Native-only — Lane C provides the wasm
+/// select primitive.
+#[cfg(not(target_arch = "wasm32"))]
+async fn park_for_next_trigger(
+    rx: &mut async_broadcast::Receiver<WalletRealtimeEvent>,
+    waker_rx: &mut async_broadcast::Receiver<()>,
+    tick: Option<&mut tokio::time::Interval>,
+    shared: &Shared,
+    connected: &mut bool,
+) {
+    use futures_util::StreamExt;
+    let tick_fut = async {
+        if let Some(iv) = tick {
+            iv.tick().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = waker_rx.next() => {
+            // Loop top will re-check `pending` / `stop`.
+        }
+        ev = rx.next() => {
+            match ev {
+                Some(ev) => handle_realtime_event(ev, shared, connected),
+                None => {
+                    tracing::debug!(
+                        target: "agicash_driver::task",
+                        "realtime broadcast closed; driver continues on waker triggers only"
+                    );
+                }
+            }
+        }
+        () = tick_fut => {
+            // Fallback tick fired. If realtime is currently Subscribed,
+            // this is the suppressed-while-connected case — do NOT
+            // mark a trigger. The tick exists ONLY as a dead-socket
+            // backstop.
+            if !*connected && !shared.paused.load(Ordering::Acquire) {
+                shared.mark(TriggerReason::FallbackTick);
+            }
+        }
+    }
 }
 
 /// Inspect a `WalletRealtimeEvent` and decide whether it should mark
