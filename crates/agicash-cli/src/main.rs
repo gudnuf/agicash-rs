@@ -13,6 +13,7 @@ mod send_lightning_address;
 use account::AccountCmdError;
 use agicash_lightning_address::LightningAddressError;
 use agicash_traits::{AuthError, StorageError};
+use auth::AuthCmdError;
 use clap::Parser;
 use cli::{AccountCommand, AuthCommand, Cli, Command, MintCommand, ReceiveCommand, SendCommand};
 use composition::{build_deps, rehydrate_session};
@@ -46,15 +47,35 @@ struct ErrorOutput<'a> {
 /// Exit codes:
 ///   - `1` error — network, mint, storage, encoding and other runtime
 ///     failures with no more specific code.
-///   - `2` bad arguments — a value the parser rejected. Argument parsing
-///     is handled by clap before `run` is reached, so this code is
-///     emitted here only for post-parse argument validation (e.g. a
-///     malformed UUID passed to `account default`).
+///   - `2` bad arguments — a value the parser rejected, OR a usage
+///     condition the caller can self-correct by re-invoking. clap rejects
+///     most bad arguments before `run` is reached; this code is emitted
+///     here for post-parse argument validation (e.g. a malformed UUID
+///     passed to `account default`) and for `interactive-input-required`
+///     (re-invoke `auth login`/`signup` with `--password-stdin`).
 ///   - `3` auth required — no session present or the session is
 ///     unauthenticated; the fix is `agicash auth login`.
 ///   - `4` not found — the addressed resource (e.g. an account id) does
 ///     not exist.
 fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) {
+    if let Some(auth_cmd) = e.downcast_ref::<AuthCmdError>() {
+        return match auth_cmd {
+            // No terminal and `--password-stdin` not passed. A usage
+            // condition the agent can self-correct by re-invoking with
+            // the flag, hence exit 2 (bad arguments) — NOT exit 1 generic
+            // and NOT `internal-error` (the old crash code).
+            AuthCmdError::InteractiveInputRequired => ("interactive-input-required", 2),
+            // Verbatim the pre-fix codes for these two: the bare
+            // `rpassword` read failure and the signup confirm-mismatch /
+            // too-short conditions previously surfaced as
+            // `AuthError::Internal` → (`internal-error`, 1). Preserved so
+            // the `auth signup` help's "exit 1" claim stays accurate.
+            AuthCmdError::ReadPassword(_)
+            | AuthCmdError::PasswordMismatch
+            | AuthCmdError::PasswordTooShort => ("internal-error", 1),
+            AuthCmdError::Auth(inner) => classify_auth(inner),
+        };
+    }
     if let Some(acc) = e.downcast_ref::<AccountCmdError>() {
         return match acc {
             AccountCmdError::NotLoggedIn => ("not-logged-in", 3),
@@ -245,8 +266,14 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Version | Command::Decode { .. }) => unreachable!("handled above"),
         Some(Command::Auth(a)) => match a.cmd {
             AuthCommand::Guest => auth::cmd_guest(&deps).await?,
-            AuthCommand::Login { email } => auth::cmd_login(&deps, email).await?,
-            AuthCommand::Signup { email } => auth::cmd_signup(&deps, email).await?,
+            AuthCommand::Login {
+                email,
+                password_stdin,
+            } => auth::cmd_login(&deps, email, password_stdin).await?,
+            AuthCommand::Signup {
+                email,
+                password_stdin,
+            } => auth::cmd_signup(&deps, email, password_stdin).await?,
             AuthCommand::Logout => auth::cmd_logout(&deps).await?,
             AuthCommand::Status => auth::cmd_status(&deps).await?,
         },

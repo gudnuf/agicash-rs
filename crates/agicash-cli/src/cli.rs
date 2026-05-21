@@ -406,30 +406,65 @@ pub enum AuthCommand {
     /// Sign in with an email and password.
     #[command(
         long_about = "Sign in with an existing email + password account. The \
-password is read from stdin (never passed as an argument). The session is \
-persisted so subsequent commands inherit it.",
-        after_long_help = "EXAMPLE\n  $ agicash auth login alice@example.com\n  \
-Password: ********\n  {\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n\
+session is persisted so subsequent commands inherit it.\n\nThe password is \
+never an argument or env var (those leak via `ps` / `/proc`). Two ways to \
+supply it:\n  - interactive: omit `--password-stdin`; run with a terminal and \
+you are prompted (echo off).\n  - non-interactive: pass `--password-stdin` and \
+pipe the password as one line on stdin — required for agents and scripts (no \
+terminal). Without `--password-stdin` and without a terminal the command fails \
+fast with `interactive-input-required` (exit 2).",
+        after_long_help = "EXAMPLE\n  # interactive (human at a terminal)\n  \
+$ agicash auth login alice@example.com\n  Password: ********\n  \
+{\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n  \
+# non-interactive (agent / script)\n  \
+$ printf %s \"$pw\" | agicash auth login alice@example.com --password-stdin\n  \
+{\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n\
 EXIT CODES\n  0  success\n  1  network or backend error\n  \
-3  bad credentials / unauthenticated\n\nSEE ALSO\n  agicash auth signup, agicash auth guest"
+2  no terminal and --password-stdin not passed (interactive-input-required)\n  \
+3  bad credentials / unauthenticated\n\n\
+SEE ALSO\n  agicash auth signup, agicash auth guest"
     )]
     Login {
         /// Email address of the account.
         email: String,
+        /// Read the password from stdin (one line on fd 0) instead of
+        /// prompting on the terminal. Required for non-interactive use
+        /// (agents, scripts) — there is no terminal to prompt on. The
+        /// password is never accepted as an argument or env var.
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Register a new email + password user and sign in.
     #[command(
         long_about = "Register a new email + password user and sign in. The \
-password is prompted twice on stdin and must be at least 8 characters.",
-        after_long_help = "EXAMPLE\n  $ agicash auth signup alice@example.com\n  \
-Password: ********\n  Confirm password: ********\n  \
+password must be at least 8 characters.\n\nThe password is never an argument \
+or env var (those leak via `ps` / `/proc`). Two ways to supply it:\n  - \
+interactive: omit `--password-stdin`; run with a terminal and you are prompted \
+twice (password + confirm, echo off).\n  - non-interactive: pass \
+`--password-stdin` and pipe the password as one line on stdin — read once, the \
+confirm prompt is skipped. Required for agents and scripts (no terminal). \
+Without `--password-stdin` and without a terminal the command fails fast with \
+`interactive-input-required` (exit 2).",
+        after_long_help = "EXAMPLE\n  # interactive (human at a terminal)\n  \
+$ agicash auth signup alice@example.com\n  Password: ********\n  \
+Confirm password: ********\n  {\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n  \
+# non-interactive (agent / script)\n  \
+$ printf %s \"$pw\" | agicash auth signup alice@example.com --password-stdin\n  \
 {\"status\":\"signed-in\",\"user_id\":\"…\",\"guest\":false}\n\n\
 EXIT CODES\n  0  success\n  1  passwords mismatch, too short, or backend error\n  \
+2  no terminal and --password-stdin not passed (interactive-input-required)\n  \
 3  unauthenticated\n\nSEE ALSO\n  agicash auth login, agicash auth guest"
     )]
     Signup {
         /// Email address for the new account.
         email: String,
+        /// Read the password from stdin (one line on fd 0) instead of
+        /// prompting on the terminal. Read once — the interactive confirm
+        /// prompt is skipped. Required for non-interactive use (agents,
+        /// scripts). The password is never accepted as an argument or env
+        /// var.
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// Register and sign in as an anonymous guest user.
     #[command(
@@ -582,11 +617,92 @@ mod tests {
         let cli = Cli::try_parse_from(["agicash", "auth", "login", "alice@example.com"]).unwrap();
         match cli.cmd {
             Some(Command::Auth(a)) => match a.cmd {
-                AuthCommand::Login { email } => assert_eq!(email, "alice@example.com"),
+                AuthCommand::Login {
+                    email,
+                    password_stdin,
+                } => {
+                    assert_eq!(email, "alice@example.com");
+                    // Default: prompt interactively, do not read stdin.
+                    assert!(!password_stdin);
+                }
                 other => panic!("unexpected auth subcommand: {other:?}"),
             },
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_auth_login_with_password_stdin() {
+        // The parser must accept `--password-stdin` on `auth login`. This
+        // is the non-interactive entry point for agents — if the flag is
+        // not recognized, the no-TTY auth path has no escape hatch.
+        let cli = Cli::try_parse_from([
+            "agicash",
+            "auth",
+            "login",
+            "alice@example.com",
+            "--password-stdin",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Command::Auth(a)) => match a.cmd {
+                AuthCommand::Login {
+                    email,
+                    password_stdin,
+                } => {
+                    assert_eq!(email, "alice@example.com");
+                    assert!(password_stdin, "--password-stdin should set the flag");
+                }
+                other => panic!("unexpected auth subcommand: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_signup_with_password_stdin() {
+        // `auth signup` must accept `--password-stdin` too — same
+        // non-interactive contract as `auth login`.
+        let cli = Cli::try_parse_from([
+            "agicash",
+            "auth",
+            "signup",
+            "bob@example.com",
+            "--password-stdin",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Command::Auth(a)) => match a.cmd {
+                AuthCommand::Signup {
+                    email,
+                    password_stdin,
+                } => {
+                    assert_eq!(email, "bob@example.com");
+                    assert!(password_stdin, "--password-stdin should set the flag");
+                }
+                other => panic!("unexpected auth subcommand: {other:?}"),
+            },
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_login_rejects_password_as_argument() {
+        // A password must NEVER be an argv value (it leaks in `ps`).
+        // `--password-stdin` is a boolean flag; clap must reject anyone
+        // who tries `--password-stdin <value>` or a `--password <value>`.
+        assert!(
+            Cli::try_parse_from([
+                "agicash",
+                "auth",
+                "login",
+                "alice@example.com",
+                "--password",
+                "hunter2",
+            ])
+            .is_err(),
+            "`--password <value>` must not be a recognized argument",
+        );
     }
 
     #[test]
