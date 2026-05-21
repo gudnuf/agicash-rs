@@ -166,6 +166,7 @@ dependencies = [
  "agicash-traits",
  "agicash-wallet",
  "async-trait",
+ "cdk",
  "chrono",
  "rust_decimal",
  "thiserror 2.0.18",

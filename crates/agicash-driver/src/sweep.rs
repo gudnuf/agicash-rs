@@ -78,10 +78,11 @@ pub async fn run_sweep_with_config(
     Ok(sweep_snapshot(client, snapshot, cfg).await)
 }
 
-/// Visible for tests: dispatch over an already-fetched snapshot. Lets a
-/// test inject specific rows without driving the four storage `list_*`
-/// methods.
-pub(crate) async fn sweep_snapshot(
+/// Visible for tests + Lane B: dispatch over an already-fetched
+/// snapshot. Lets a test inject specific rows without driving the
+/// four storage `list_*` methods; Lane B (the trigger task) reuses it
+/// when a realtime `Event` already implies a specific row to act on.
+pub async fn sweep_snapshot(
     client: &WalletClient,
     snapshot: PendingStateSnapshot,
     cfg: RetryConfig,

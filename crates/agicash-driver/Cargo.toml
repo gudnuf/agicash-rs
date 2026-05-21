@@ -24,6 +24,7 @@ agicash-money = { path = "../agicash-money" }
 agicash-testing = { path = "../agicash-testing" }
 agicash-traits = { path = "../agicash-traits" }
 async-trait = { workspace = true }
+cdk = { workspace = true }
 rust_decimal = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync"] }
 

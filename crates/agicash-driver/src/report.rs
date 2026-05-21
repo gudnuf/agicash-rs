@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::error::ClassifiedError;
 
 /// Which kind of row a per-row outcome refers to. Lets a caller assert
-/// "the send_swap DRAFT row I seeded advanced" without re-fetching.
+/// "the `send_swap` DRAFT row I seeded advanced" without re-fetching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
     SendSwapDraft,
