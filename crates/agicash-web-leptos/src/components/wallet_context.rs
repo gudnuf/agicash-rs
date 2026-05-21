@@ -128,6 +128,44 @@ pub struct AccountSummary {
     pub balance: u64,
 }
 
+/// One in-flight money-state row, flattened to the `(id, state)` pair
+/// the view layer needs to reconcile a stale "waiting…" list.
+///
+/// The full money/proof payload stays in the storage layer — a consumer
+/// that wants detail re-fetches by `id`. This summary only answers
+/// *which* rows are still in flight and *what state* they are in, which
+/// is all the realtime-reconnect catch-up needs (slice 12e Lane 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingItem {
+    /// Row identity — UUID (mint/melt quote, send swap) or token hash
+    /// (receive swap), stringified.
+    pub id: String,
+    /// Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` / …).
+    pub state: String,
+}
+
+/// The signed-in user's full in-flight money state — every pending /
+/// unresolved row across the four Cashu money flows, fetched in one
+/// shot on a realtime (re)connect (slice 12e Lane 3, Gap-D).
+///
+/// The realtime channel ships no replay: a pending Lightning receive /
+/// unresolved send that resolves during a disconnect window leaves a
+/// stale "waiting…" row until the user navigates away. On every
+/// `Connected` the pump refetches this so the view can reconcile.
+/// An empty `Vec` is the canonical "nothing in flight" state. Mirrors
+/// the facade `agicash_wallet::PendingStateSnapshot`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingStateSummary {
+    /// UNPAID / PAID mint quotes — Lightning receives still in flight.
+    pub mint_quotes: Vec<PendingItem>,
+    /// PENDING receive swaps — inbound Cashu tokens still being claimed.
+    pub receive_swaps: Vec<PendingItem>,
+    /// UNPAID / PENDING melt quotes — Lightning sends still in flight.
+    pub melt_quotes: Vec<PendingItem>,
+    /// DRAFT / PENDING send swaps — outbound tokens not yet claimed.
+    pub send_swaps: Vec<PendingItem>,
+}
+
 /// Cross-page wallet view-model. Provide once at the App root; consumers
 /// pull it out via `expect_context::<WalletData>()`.
 #[derive(Clone, Debug)]
@@ -138,6 +176,14 @@ pub struct WalletData {
     /// Account list keyed by load state. `Ready(vec![])` is the
     /// canonical empty-wallet state.
     pub accounts: RwSignal<LoadState<Vec<AccountSummary>>>,
+    /// The user's in-flight money state (pending receives / unresolved
+    /// sends), refetched on every realtime (re)connect — the no-replay
+    /// catch-up that clears stale "waiting…" rows (slice 12e Lane 3,
+    /// Gap-D). `Idle` until the first `Connected`; `Ready(default)` is
+    /// the canonical "nothing in flight" state. Nothing renders off this
+    /// signal yet — landing it reactively is enough this lane; UI
+    /// consumption is a follow-up.
+    pub pending_state: RwSignal<LoadState<PendingStateSummary>>,
     /// Live realtime channel status. Drives the
     /// [`crate::components::RealtimeStatusBanner`] (Reconnecting / lost-
     /// connection affordance). Updated by the pump in
@@ -181,6 +227,7 @@ impl WalletData {
         Self {
             user_id: RwSignal::new(None),
             accounts: RwSignal::new(LoadState::Idle),
+            pending_state: RwSignal::new(LoadState::Idle),
             realtime_status: RwSignal::new(RealtimeStatus::Idle),
             // `new_local`: thread-pinned storage for the non-`Send`
             // wasm transport handles inside `WalletRealtimeService`.
@@ -219,6 +266,7 @@ impl WalletData {
         self.teardown_realtime();
         self.user_id.set(None);
         self.accounts.set(LoadState::Idle);
+        self.pending_state.set(LoadState::Idle);
     }
 
     /// Best-effort retry after a `TerminalError` (the `JoinRejected` /
@@ -394,6 +442,102 @@ impl WalletData {
         });
     }
 
+    /// Handle one realtime `Connected` event (the (re)connect catch-up).
+    ///
+    /// The realtime channel ships **no replay** (spec §5.5): everything
+    /// that landed while the socket was down has to be refetched. This
+    /// runs both halves of that catch-up:
+    ///
+    /// - [`Self::refresh_with_config`] in background/SWR mode — the
+    ///   accounts + balance (the pre-slice-12e behaviour);
+    /// - [`Self::refresh_pending_state`] — the in-flight money state
+    ///   (slice 12e Lane 3, Gap-D), so a pending receive / unresolved
+    ///   send that resolved during the disconnect window no longer
+    ///   leaves a stale "waiting…" row.
+    ///
+    /// Factored out of the `start_realtime` pump so the catch-up is one
+    /// named, self-documenting unit rather than two bare calls buried in
+    /// a match arm.
+    pub fn on_realtime_connected(&self, config: Option<AppConfig>) {
+        self.clone().refresh_with_config(config.clone(), true);
+        self.clone().refresh_pending_state(config);
+    }
+
+    /// Realtime-(re)connect catch-up: refetch the user's in-flight money
+    /// state into [`Self::pending_state`] (slice 12e Lane 3, Gap-D).
+    ///
+    /// The realtime channel ships no replay, so on every `Connected` the
+    /// pump runs this alongside the accounts [`Self::refresh_with_config`]
+    /// — a pending Lightning receive / unresolved send that resolved
+    /// during the disconnect window leaves a stale "waiting…" row
+    /// otherwise. Pure storage reads scoped to the signed-in user; the
+    /// facade `WalletClient::refresh_pending_state()` shape, against the
+    /// `agicash-cashu` storage traits the Leptos crate already links.
+    ///
+    /// **Always background / SWR**: a refetch failure is non-fatal — the
+    /// last good `pending_state` (or `Idle`) stays, the next reconnect
+    /// retries. It never flips the signal to `Loading` (no spinner) and
+    /// never surfaces an error screen; the accounts refresh already owns
+    /// the user-visible failure path. Nothing renders off the signal yet
+    /// — landing it reactively is enough this lane.
+    //
+    // `config` is moved into the spawned future on wasm (the build that
+    // ships); the native test build cfg's that block out, so to clippy
+    // it then looks pass-by-value-but-unused. Allow it there only —
+    // same shape as `refresh_with_config`.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::needless_pass_by_value, unused_variables)
+    )]
+    pub fn refresh_pending_state(self, config: Option<AppConfig>) {
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(config) = config else {
+                // No config → realtime can't auth anyway; the
+                // accounts refresh logs the same condition.
+                return;
+            };
+            let uid = match load_session_user_id().await {
+                Ok(Some(uid)) => uid,
+                Ok(None) => {
+                    // Signed out — nothing in flight to catch up.
+                    self.pending_state
+                        .set(LoadState::Ready(PendingStateSummary::default()));
+                    return;
+                }
+                Err(e) => {
+                    leptos::logging::log!(
+                        "refresh_pending_state: session load failed \
+                         (non-fatal, retries next reconnect): {e}"
+                    );
+                    return;
+                }
+            };
+            match fetch_pending_state(&config, uid).await {
+                Ok(summary) => {
+                    self.pending_state.set(LoadState::Ready(summary));
+                }
+                Err(e) => {
+                    // Non-fatal: keep the last snapshot (SWR), the
+                    // next reconnect retries. The accounts refresh
+                    // owns the user-visible error path.
+                    leptos::logging::log!(
+                        "refresh_pending_state: fetch failed (non-fatal, \
+                         retries next reconnect): {e}"
+                    );
+                }
+            }
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        leptos::task::spawn_local(async move {
+            // Native: no browser / no storage stack — settle into the
+            // canonical empty state so view tests see the steady shape.
+            self.pending_state
+                .set(LoadState::Ready(PendingStateSummary::default()));
+        });
+    }
+
     /// Wire the realtime reactivity source: a single Supabase-Realtime
     /// subscription (the all-Rust `agicash-realtime` crate, linked
     /// directly — no FFI) drives the balance refresh. This **replaces**
@@ -564,8 +708,10 @@ impl WalletData {
                         let mut rx = service_for_pump.subscribe();
                         loop {
                             match futures_util::StreamExt::next(&mut rx).await {
-                                Some(WalletRealtimeEvent::Connected)
-                                | Some(WalletRealtimeEvent::Event(_)) => {
+                                Some(WalletRealtimeEvent::Connected) => {
+                                    wallet.on_realtime_connected(Some(config.clone()));
+                                }
+                                Some(WalletRealtimeEvent::Event(_)) => {
                                     wallet
                                         .clone()
                                         .refresh_with_config(Some(config.clone()), true);
@@ -888,6 +1034,184 @@ async fn fetch_account_summaries(
     Ok(summaries)
 }
 
+/// Map each Cashu money-state enum to the uppercase string the DB
+/// `state` column + the realtime `on_event` payload use — so the
+/// summary the view reconciles is consistent with the wire shape.
+#[cfg(target_arch = "wasm32")]
+fn mint_quote_state_label(s: &agicash_cashu::CashuMintQuoteState) -> String {
+    use agicash_cashu::CashuMintQuoteState as S;
+    match s {
+        S::Unpaid => "UNPAID",
+        S::Paid { .. } => "PAID",
+        S::Completed { .. } => "COMPLETED",
+        S::Expired => "EXPIRED",
+        S::Failed { .. } => "FAILED",
+    }
+    .to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn receive_swap_state_label(s: &agicash_cashu::CashuReceiveSwapState) -> String {
+    use agicash_cashu::CashuReceiveSwapState as S;
+    match s {
+        S::Pending => "PENDING",
+        S::Completed => "COMPLETED",
+        S::Failed { .. } => "FAILED",
+    }
+    .to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn melt_quote_state_label(s: &agicash_cashu::CashuMeltQuoteState) -> String {
+    use agicash_cashu::CashuMeltQuoteState as S;
+    match s {
+        S::Unpaid => "UNPAID",
+        S::Pending => "PENDING",
+        S::Paid { .. } => "PAID",
+        S::Expired => "EXPIRED",
+        S::Failed { .. } => "FAILED",
+    }
+    .to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
+    use agicash_cashu::CashuSendSwapState as S;
+    match s {
+        S::Draft => "DRAFT",
+        S::Pending { .. } => "PENDING",
+        S::Completed { .. } => "COMPLETED",
+        S::Failed { .. } => "FAILED",
+        S::Reversed => "REVERSED",
+    }
+    .to_string()
+}
+
+/// Realtime-(re)connect catch-up: fetch the signed-in user's full
+/// in-flight money state from storage (slice 12e Lane 3, Gap-D).
+///
+/// Replicates `agicash_wallet::WalletClient::refresh_pending_state`
+/// against the four `agicash-cashu` storage traits the Leptos crate
+/// already links — building the heavyweight facade `WalletClient`
+/// (auth client + cashu provider + …) just for four `list_*` storage
+/// reads would be out of proportion to the catch-up. The four reads
+/// run concurrently; the first storage error short-circuits.
+///
+/// Storage construction mirrors `fetch_account_summaries`:
+/// session-seeded `OpenSecretTokenProvider` → `SupabaseStorage` → the
+/// four `SupabaseCashu*Storage` wrappers with `PassthroughProofEncryption`
+/// (the production composition until the encryption layer ships).
+#[cfg(target_arch = "wasm32")]
+async fn fetch_pending_state(
+    config: &AppConfig,
+    user_id: Uuid,
+) -> Result<PendingStateSummary, String> {
+    use std::sync::Arc;
+
+    use agicash_auth_opensecret::OpenSecretTokenProvider;
+    use agicash_cashu::{
+        CashuMeltQuoteStorage, CashuMintQuoteStorage, CashuReceiveSwapStorage, CashuSendSwapStorage,
+    };
+    use agicash_domain::UserId;
+    use agicash_storage_supabase::{
+        SupabaseCashuMeltQuoteStorage, SupabaseCashuMintQuoteStorage,
+        SupabaseCashuReceiveSwapStorage, SupabaseCashuSendSwapStorage, SupabaseStorage,
+        SupabaseStorageConfig,
+    };
+    use agicash_traits::{PassthroughProofEncryption, ProofEncryption, TokenProvider};
+
+    if config.supabase_anon_key.is_empty() {
+        return Err("Supabase anon key missing — pending-state catch-up skipped".to_string());
+    }
+
+    let client = session_seeded_opensecret_client(config).await?;
+    let tokens: Arc<dyn TokenProvider> = Arc::new(OpenSecretTokenProvider::new(client));
+
+    let storage = SupabaseStorage::new(
+        SupabaseStorageConfig {
+            url: config.supabase_url.clone(),
+            anon_key: config.supabase_anon_key.clone(),
+        },
+        tokens,
+    )
+    .map_err(|e| format!("build supabase storage: {e}"))?;
+    let storage_arc = Arc::new(storage);
+
+    let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
+    let mint_quote_storage =
+        SupabaseCashuMintQuoteStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
+    let receive_swap_storage =
+        SupabaseCashuReceiveSwapStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
+    let melt_quote_storage =
+        SupabaseCashuMeltQuoteStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
+    let send_swap_storage =
+        SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), Arc::clone(&encryption));
+
+    let uid = UserId::from(user_id);
+
+    // Four concurrent storage reads — no mint round-trip, idempotent.
+    // `try_join` here is `futures_util`'s (wasm has no tokio runtime);
+    // the first error short-circuits the whole snapshot.
+    let (mint_quotes, receive_swaps, melt_quotes, send_swaps) = futures_util::try_join!(
+        async {
+            mint_quote_storage
+                .list_pending_for_user(uid)
+                .await
+                .map_err(|e| format!("list_pending_mint_quotes: {e}"))
+        },
+        async {
+            receive_swap_storage
+                .list_pending_for_user(uid)
+                .await
+                .map_err(|e| format!("list_pending_receive_swaps: {e}"))
+        },
+        async {
+            melt_quote_storage
+                .list_unresolved_for_user(uid)
+                .await
+                .map_err(|e| format!("list_unresolved_melt_quotes: {e}"))
+        },
+        async {
+            send_swap_storage
+                .list_unresolved_for_user(uid)
+                .await
+                .map_err(|e| format!("list_unresolved_send_swaps: {e}"))
+        },
+    )?;
+
+    Ok(PendingStateSummary {
+        mint_quotes: mint_quotes
+            .iter()
+            .map(|q| PendingItem {
+                id: q.id.to_string(),
+                state: mint_quote_state_label(&q.state),
+            })
+            .collect(),
+        receive_swaps: receive_swaps
+            .iter()
+            .map(|sw| PendingItem {
+                // Receive-swap identity is its token_hash — no row UUID.
+                id: sw.token_hash.clone(),
+                state: receive_swap_state_label(&sw.state),
+            })
+            .collect(),
+        melt_quotes: melt_quotes
+            .iter()
+            .map(|q| PendingItem {
+                id: q.id.to_string(),
+                state: melt_quote_state_label(&q.state),
+            })
+            .collect(),
+        send_swaps: send_swaps
+            .iter()
+            .map(|sw| PendingItem {
+                id: sw.id.to_string(),
+                state: send_swap_state_label(&sw.state),
+            })
+            .collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1247,26 @@ mod tests {
             LoadState::Error(msg) => assert_eq!(msg, "boom"),
             _ => panic!("expected Error variant"),
         }
+    }
+
+    /// `PendingStateSummary::default()` is the canonical "nothing in
+    /// flight" state — all four lists empty (slice 12e Lane 3).
+    #[test]
+    fn pending_state_summary_default_is_all_empty() {
+        let p = PendingStateSummary::default();
+        assert!(p.mint_quotes.is_empty());
+        assert!(p.receive_swaps.is_empty());
+        assert!(p.melt_quotes.is_empty());
+        assert!(p.send_swaps.is_empty());
+    }
+
+    /// `pending_state` is a `LoadState<PendingStateSummary>` — `Idle`
+    /// is the pre-first-`Connected` shape the App root constructs.
+    #[test]
+    fn pending_state_load_state_idle_then_ready() {
+        let idle: LoadState<PendingStateSummary> = LoadState::default();
+        assert!(matches!(idle, LoadState::Idle));
+        let ready = LoadState::Ready(PendingStateSummary::default());
+        assert_eq!(ready.ready(), Some(&PendingStateSummary::default()));
     }
 }
