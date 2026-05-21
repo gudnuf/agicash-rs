@@ -145,6 +145,13 @@ impl WalletClientBuilder {
 
     /// Assemble the `WalletClient`. Fails with a `Validation` error if any
     /// required dep is missing — see module doc for the list.
+    // `WalletClient` and its service handles are stored as `Arc<dyn …>` /
+    // `Arc<T>` uniformly across native and wasm32. On wasm32 the inner
+    // storage/provider types are `!Send`/`!Sync` (single-threaded), but the
+    // `Arc` type is structural API surface — switching to `Rc` on wasm32
+    // would require cfg-gating every struct field and public signature.
+    // The `Arc` is deliberately uniform across cfgs; allow narrowly here.
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub fn build(self) -> Result<Arc<WalletClient>, WalletError> {
         let auth = self
             .auth
@@ -212,6 +219,10 @@ impl WalletClient {
     /// so the FFI shell can mirror the session slot into its own
     /// shell-resident plumbing (spec §6 platform-layer carve-out) without
     /// changing realtime/session behavior.
+    // See `build` above: `Arc` is the uniform handle type across native and
+    // wasm32; on wasm32 the inner types are `!Send`/`!Sync` but the `Arc`
+    // is structural API surface (this fn's return type is `Arc<…>`).
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub fn from_config(
         cfg: WalletConfig,
     ) -> Result<(Arc<WalletClient>, Arc<OpenSecretAuthClient>), WalletError> {

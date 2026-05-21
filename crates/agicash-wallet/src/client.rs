@@ -823,6 +823,12 @@ impl WalletClient {
     /// [`WalletError::Unauthenticated`] otherwise (verbatim the prior
     /// FFI `receive_flow` `Auth { UNAUTHENTICATED }` behavior — the FFI
     /// `convert::wallet_error_to_ffi` maps that 1:1).
+    // `seed_provider` is `Arc<dyn CashuSeedProvider>` — the uniform handle
+    // type `ReceiveFlowService::new` accepts across native and wasm32. On
+    // wasm32 the concrete `AuthClientSeedProvider` is `!Send`/`!Sync`, but
+    // the `Arc` is structural (the trait-object signature is the same on
+    // every target); `Rc` would require cfg-gating the service API.
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub async fn receive_flow(&self) -> Result<ReceiveFlowService, WalletError> {
         let session = self.require_session().await?;
         let seed_provider: Arc<dyn CashuSeedProvider> = Arc::new(AuthClientSeedProvider {
