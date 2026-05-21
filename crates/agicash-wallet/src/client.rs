@@ -1095,6 +1095,124 @@ impl WalletClient {
 }
 
 // ---------------------------------------------------------------------------
+// Resumption-driver hooks — additive facade methods consumed by
+// `agicash-driver`'s `run_sweep()` (the Rust port of React's
+// `useProcessXTasks`). Each takes a row id from a `PendingStateSnapshot`
+// and pushes the row forward by one machine step. They are thin wrappers
+// over the existing services — every guard (require_session, ownership,
+// account lookup, idempotency) is delegated to the same code paths the
+// in-flow methods use. **None of these ever call `initiate_melt`** — the
+// re-pay vector slice-29 §2.4 / `2026-05-21-resumption-driver-layer.md`
+// §6.2 is built around. Melt resumption goes only through
+// `poll_send_lightning` (which calls `melt_quote_service::poll_until_complete`).
+// ---------------------------------------------------------------------------
+impl WalletClient {
+    /// Resume a DRAFT send swap by re-firing
+    /// `send_swap_service::swap_for_proofs_to_send` against the existing
+    /// row. Idempotent on PENDING/COMPLETED/REVERSED (the service returns
+    /// `Ok(swap)` without touching the mint). Returns
+    /// `Err(WalletError::Cashu("invalid state transition ..."))` if the
+    /// row is in any other state — the driver classifies that as a
+    /// benign no-op (a concurrent writer already advanced the row).
+    pub async fn resume_send_swap_draft(
+        &self,
+        swap_id: Uuid,
+    ) -> Result<CashuSendSwap, WalletError> {
+        let session = self.require_session().await?;
+        let swap = self
+            .cashu_send_storage
+            .get(swap_id)
+            .await
+            .map_err(|e| match e {
+                agicash_cashu::SendSwapStorageError::NotFound => {
+                    WalletError::NotFound(format!("send swap {swap_id}"))
+                }
+                other => WalletError::Storage(format!("get send swap: {other}")),
+            })?;
+        if swap.user_id != session.user_id {
+            return Err(WalletError::NotFound(format!("send swap {swap_id}")));
+        }
+        let accounts = self.user_storage.list_accounts(session.user_id).await?;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == swap.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| WalletError::NotFound(format!("account {}", swap.account_id)))?
+            .clone();
+        let seed = self.auth.cashu_seed().await?;
+        Ok(self
+            .send_swap_service
+            .swap_for_proofs_to_send(&account, swap, &seed)
+            .await?)
+    }
+
+    /// Resume a PENDING receive swap by re-firing
+    /// `receive_swap_service::complete_swap` against the existing row.
+    /// Idempotent: the service returns
+    /// [`agicash_cashu::CompleteOutcome::AlreadyTerminal`] on COMPLETED /
+    /// FAILED rows without touching the mint.
+    ///
+    /// Takes the row by value (the receive-swap storage trait does not
+    /// expose a `get(id)`; the driver already has the row from
+    /// `refresh_pending_state` so no read is wasted).
+    pub async fn resume_receive_swap(
+        &self,
+        swap: CashuReceiveSwap,
+    ) -> Result<CompleteOutcome, WalletError> {
+        let session = self.require_session().await?;
+        if swap.user_id != session.user_id {
+            return Err(WalletError::NotFound(
+                "receive swap belongs to a different user".into(),
+            ));
+        }
+        let accounts = self.user_storage.list_accounts(session.user_id).await?;
+        let account = accounts
+            .iter()
+            .find(|a| a.id == swap.account_id && a.account_type == AccountType::Cashu)
+            .ok_or_else(|| WalletError::NotFound(format!("account {}", swap.account_id)))?
+            .clone();
+        let seed = self.auth.cashu_seed().await?;
+        Ok(self
+            .receive_swap_service
+            .complete_swap(&account, swap, &seed)
+            .await?)
+    }
+
+    /// Expire an UNPAID mint quote (driver TTL sweep). Idempotent on
+    /// already-EXPIRED rows; rejects non-UNPAID/non-EXPIRED with
+    /// `WalletError::Cashu("invalid state transition ...")` — which the
+    /// driver classifies as a benign no-op.
+    pub async fn expire_mint_quote(&self, quote_id: Uuid) -> Result<CashuMintQuote, WalletError> {
+        let session = self.require_session().await?;
+        let quote = self
+            .cashu_mint_quote_storage
+            .get(quote_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("get mint quote: {e}")))?;
+        if quote.user_id != session.user_id {
+            return Err(WalletError::NotFound(format!("mint quote {quote_id}")));
+        }
+        Ok(self.mint_quote_service.expire(&quote).await?)
+    }
+
+    /// Expire an UNPAID melt quote (driver TTL sweep). Idempotent on
+    /// already-EXPIRED rows. **Never** touches `initiate_melt` — expiry
+    /// is the only resumption action the driver takes on an UNPAID melt
+    /// quote (plan §2 note + §6.2).
+    pub async fn expire_melt_quote(&self, quote_id: Uuid) -> Result<CashuMeltQuote, WalletError> {
+        let session = self.require_session().await?;
+        let quote = self
+            .cashu_melt_quote_storage
+            .get(quote_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("get melt quote: {e}")))?;
+        if quote.user_id != session.user_id {
+            return Err(WalletError::NotFound(format!("melt quote {quote_id}")));
+        }
+        Ok(self.melt_quote_service.expire(&quote).await?)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pending-state catch-up (slice 12e Lane 3 / F15 — Gap-D)
 //
 // The realtime channel ships no replay (spec §5.5): on every (re)connect
