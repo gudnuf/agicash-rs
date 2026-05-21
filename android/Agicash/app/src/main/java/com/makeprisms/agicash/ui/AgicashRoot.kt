@@ -59,7 +59,16 @@ fun AgicashRoot(viewModel: WalletViewModel) {
 private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
     when (phase) {
         is WalletViewModel.Phase.SignedOut -> LoginScreen(viewModel)
-        is WalletViewModel.Phase.SignedIn -> SignedInShell(viewModel)
+        is WalletViewModel.Phase.SignedIn -> {
+            // Stack the realtime status banner above the signed-in tab
+            // shell. The banner uses `AnimatedVisibility` to occupy
+            // zero height when the channel is healthy, so SignedInShell
+            // measures identically to today on the happy path.
+            Column(Modifier.fillMaxSize()) {
+                RealtimeStatusBanner(viewModel)
+                Box(Modifier.weight(1f)) { SignedInShell(viewModel) }
+            }
+        }
         is WalletViewModel.Phase.Error -> ErrorView(viewModel, phase.message)
     }
 }

@@ -161,6 +161,29 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     private var realtimeStarted = false
 
     /**
+     * Latest realtime supervisor status forwarded by the Rust
+     * `on_status` callback. Defaults to `Idle` (the supervisor's
+     * pre-`start_wallet_events` state). Surfaces at the top of
+     * [com.makeprisms.agicash.ui.AgicashRoot] as a thin status banner —
+     * see [com.makeprisms.agicash.ui.RealtimeStatusBanner] for the
+     * status-to-visual mapping. Non-fatal: a status flip never escalates
+     * to [Phase.Error] — that path is reserved for the bootstrap-load
+     * surface only (see [refreshAccountsSuspending]).
+     */
+    private val _realtimeStatus = MutableStateFlow(RealtimeStatusFfi.IDLE)
+    val realtimeStatus: StateFlow<RealtimeStatusFfi> = _realtimeStatus.asStateFlow()
+
+    /**
+     * True while a user-initiated realtime retry round-trip is in
+     * flight (the `setRealtimeOnline(false)` then `(true)` pair below).
+     * The banner renders a small inline spinner on the tap target while
+     * this holds so a tap registers visually even if the supervisor
+     * takes a beat to flip status back to `Connecting`/`Subscribed`.
+     */
+    private val _realtimeRetryInFlight = MutableStateFlow(false)
+    val realtimeRetryInFlight: StateFlow<Boolean> = _realtimeRetryInFlight.asStateFlow()
+
+    /**
      * Observer wired to [ProcessLifecycleOwner] so a backgrounded app
      * tells the Rust realtime supervisor `setRealtimeActive(false)` —
      * the supervisor closes the socket + parks until `ON_START` fires
@@ -235,6 +258,14 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
 
         override fun onStatus(status: RealtimeStatusFfi) {
             android.util.Log.d("WalletViewModel", "realtime status: $status")
+            // Forward to the StateFlow read by the top-level
+            // RealtimeStatusBanner. Any non-terminal status implicitly
+            // resolves a user-initiated retry — the supervisor is making
+            // progress again, so stop showing the in-flight spinner.
+            _realtimeStatus.value = status
+            if (status != RealtimeStatusFfi.TERMINAL_ERROR) {
+                _realtimeRetryInFlight.value = false
+            }
         }
 
         override fun onError(message: String) {
@@ -377,6 +408,48 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             )
         } finally {
             realtimeStarted = false
+            // Reset banner state to the pre-subscription baseline so the
+            // next sign-in starts clean.
+            _realtimeStatus.value = RealtimeStatusFfi.IDLE
+            _realtimeRetryInFlight.value = false
+        }
+    }
+
+    /**
+     * User-initiated reconnect tap from the realtime status banner.
+     * Maps to `setRealtimeOnline(false)` then `(true)` — the
+     * supervisor's online-edge handler clears the latched `terminal`
+     * flag exactly on the false→true transition (see
+     * `agicash_realtime::service::WalletRealtimeService::set_online`),
+     * then wakes the parked supervisor. The next `on_status` callback
+     * flips [_realtimeStatus] back to `Connecting`/`Subscribed` and
+     * clears [_realtimeRetryInFlight].
+     *
+     * Safe to call on every status (the FFI is idempotent), but the
+     * banner only exposes this affordance on `TerminalError` so a user
+     * can't accidentally pump the supervisor mid-reconnect. Guarded by
+     * [_realtimeRetryInFlight] so a double-tap is a no-op.
+     */
+    fun retryRealtime() {
+        val w = wallet ?: return
+        if (_realtimeRetryInFlight.value) return
+        _realtimeRetryInFlight.value = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    w.setRealtimeOnline(false)
+                    w.setRealtimeOnline(true)
+                }
+            } catch (e: Throwable) {
+                // Best-effort: if the FFI rejected (e.g. nothing
+                // running), clear the in-flight flag so a future tap
+                // retries.
+                _realtimeRetryInFlight.value = false
+                android.util.Log.w(
+                    "WalletViewModel",
+                    "retryRealtime failed (ignored): ${e.message}",
+                )
+            }
         }
     }
 
