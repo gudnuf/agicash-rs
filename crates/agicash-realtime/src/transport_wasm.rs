@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
+#[derive(Default)]
 pub struct WasmTransport {
     ws: Option<WebSocket>,
     rx: Option<async_broadcast::Receiver<Result<WsFrame, TransportError>>>,
@@ -23,12 +24,6 @@ impl std::fmt::Debug for WasmTransport {
         f.debug_struct("WasmTransport")
             .field("connected", &self.ws.is_some())
             .finish_non_exhaustive()
-    }
-}
-
-impl Default for WasmTransport {
-    fn default() -> Self {
-        Self { ws: None, rx: None }
     }
 }
 

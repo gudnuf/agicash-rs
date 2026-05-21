@@ -418,10 +418,6 @@ impl WalletRealtimeService {
     ) -> Result<(), crate::RealtimeError> {
         use futures_util::future::{select, Either};
         use futures_util::StreamExt;
-        client.connect_and_join().await?;
-        // Fresh receiver from sender's current position — see
-        // `park_until_resume` for the rationale.
-        let mut stop_rx = self.stop_tx.new_receiver();
 
         // What the serve-vs-timer race resolved to. Computing this in an
         // inner scope lets the `client.serve_step()` borrow (held by the
@@ -434,6 +430,11 @@ impl WalletRealtimeService {
             Heartbeat,
             Stop,
         }
+
+        client.connect_and_join().await?;
+        // Fresh receiver from sender's current position — see
+        // `park_until_resume` for the rationale.
+        let mut stop_rx = self.stop_tx.new_receiver();
 
         loop {
             if self.stop.load(Ordering::Relaxed) {
@@ -448,8 +449,8 @@ impl WalletRealtimeService {
                 // future: the heap-pinned timer outlives the `.await`.
                 let timer = std::pin::pin!(async {
                     let sleep = Box::pin(wasm_sleep_ms(HEARTBEAT_MS));
-                    let stop = Box::pin(stop_rx.next());
-                    select(sleep, stop).await
+                    let stop_fut = Box::pin(stop_rx.next());
+                    select(sleep, stop_fut).await
                 });
                 match select(step, timer).await {
                     Either::Left((res, _)) => Tick::Served(res?),
