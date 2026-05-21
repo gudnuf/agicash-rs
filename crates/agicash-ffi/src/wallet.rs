@@ -1514,6 +1514,10 @@ impl AgicashWallet {
         // clone for the lifetime of the task.
         let listener: Arc<dyn crate::WalletEventListener> = Arc::from(listener);
         let svc_run = Arc::clone(&svc);
+        // The composed facade — the pump calls `refresh_pending_state()`
+        // on it after every `Connected` to run the no-replay catch-up
+        // (slice 12e Lane 3, Gap-D).
+        let facade = Arc::clone(&self.facade);
         let handle = tokio::spawn(async move {
             // Pump: drain the service's broadcast receiver and fan each
             // event out to the foreign listener via the FFI bridge.
@@ -1521,7 +1525,20 @@ impl AgicashWallet {
                 let listener = Arc::clone(&listener);
                 async move {
                     while let Ok(ev) = rx.recv().await {
+                        // A `Connected` (re)connect needs a pending-state
+                        // catch-up *after* `on_connected` fires — the
+                        // realtime channel ships no replay. Detect it
+                        // before the bridge consumes `ev`.
+                        let is_connected =
+                            matches!(ev, agicash_realtime::WalletRealtimeEvent::Connected);
                         crate::realtime::dispatch_realtime_event(listener.as_ref(), ev);
+                        if is_connected {
+                            crate::realtime::dispatch_pending_state_refresh(
+                                facade.as_ref(),
+                                listener.as_ref(),
+                            )
+                            .await;
+                        }
                     }
                 }
             };
@@ -2653,6 +2670,7 @@ mod tests {
             fn on_event(&self, _: String, _: String) {}
             fn on_status(&self, _: crate::RealtimeStatusFfi) {}
             fn on_error(&self, _: String) {}
+            fn on_pending_state_refreshed(&self, _: crate::PendingStateSnapshotFfi) {}
         }
         let cfg = fake_config();
         let w = AgicashWallet::new(
@@ -2724,6 +2742,7 @@ mod tests {
             events: Mutex<Vec<(String, String)>>,
             statuses: Mutex<Vec<crate::RealtimeStatusFfi>>,
             errors: Mutex<Vec<String>>,
+            pending_refreshes: Mutex<u32>,
         }
         impl crate::WalletEventListener for Recorder {
             fn on_connected(&self) {
@@ -2737,6 +2756,9 @@ mod tests {
             }
             fn on_error(&self, message: String) {
                 self.errors.lock().unwrap().push(message);
+            }
+            fn on_pending_state_refreshed(&self, _: crate::PendingStateSnapshotFfi) {
+                *self.pending_refreshes.lock().unwrap() += 1;
             }
         }
 
@@ -2769,6 +2791,11 @@ mod tests {
             vec![crate::RealtimeStatusFfi::Subscribed]
         );
         assert_eq!(*rec.errors.lock().unwrap(), vec!["boom".to_string()]);
+        // `dispatch_realtime_event` only fires the four base callbacks;
+        // the pending-state catch-up is the separate async
+        // `dispatch_pending_state_refresh` (needs a live facade), so the
+        // synchronous bridge must NOT touch `on_pending_state_refreshed`.
+        assert_eq!(*rec.pending_refreshes.lock().unwrap(), 0);
     }
 
     #[tokio::test]
