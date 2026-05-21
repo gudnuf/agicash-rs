@@ -68,6 +68,21 @@ pub trait CashuReceiveSwapStorage: CashuReceiveSwapStorageBounds {
         user_id: UserId,
         reason: &str,
     ) -> Result<CashuReceiveSwap, ReceiveSwapStorageError>;
+
+    /// List every PENDING receive swap for the given user — the rows the
+    /// wallet still needs to drive to completion (mint swap → COMPLETED)
+    /// or terminally fail.
+    ///
+    /// Mirrors the TS `CashuReceiveSwapRepository.getPending(userId)`
+    /// (`state == 'PENDING'`). Used by the facade's
+    /// `list_pending_receive_swaps` / `refresh_pending_state` to catch up
+    /// after a realtime reconnect (slice 12e Lane 3).
+    ///
+    /// Returns an empty `Vec` when the user has no in-flight receive swaps.
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuReceiveSwap>, ReceiveSwapStorageError>;
 }
 
 /// Input to [`CashuReceiveSwapStorage::create`].

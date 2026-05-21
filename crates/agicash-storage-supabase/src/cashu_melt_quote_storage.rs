@@ -501,6 +501,38 @@ impl CashuMeltQuoteStorage for SupabaseCashuMeltQuoteStorage {
             None => Ok(None),
         }
     }
+
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMeltQuote>, MeltQuoteStorageError> {
+        let client = self.base.authenticated_client().await.map_err(map_auth)?;
+        let response = client
+            .from("cashu_send_quotes")
+            .select("*")
+            .eq("user_id", user_id.to_string())
+            .in_("state", ["UNPAID", "PENDING"])
+            .execute()
+            .await
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("postgrest: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(MeltQuoteStorageError::Backend(format!(
+                "select cashu_send_quotes (unresolved for user): HTTP {status}: {text}"
+            )));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| MeltQuoteStorageError::Backend(format!("parse response: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.row_to_quote(row).await?);
+        }
+        Ok(out)
+    }
 }
 
 impl SupabaseCashuMeltQuoteStorage {

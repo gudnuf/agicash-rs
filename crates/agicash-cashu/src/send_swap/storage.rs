@@ -91,6 +91,22 @@ pub trait CashuSendSwapStorage: CashuSendSwapStorageBounds {
     /// `check_send_swap_claimed` path so the iOS app can poll a swap's
     /// claim state by id without holding the full row locally.
     async fn get(&self, swap_id: Uuid) -> Result<CashuSendSwap, SendSwapStorageError>;
+
+    /// List every DRAFT or PENDING send swap for the given user — the
+    /// rows the wallet still needs to drive to a terminal state
+    /// (COMPLETED / FAILED) via `check_send_token_claimed` or the input
+    /// swap orchestrator.
+    ///
+    /// Mirrors the TS `CashuSendSwapRepository.getUnresolved(userId)`
+    /// (`state IN ('DRAFT', 'PENDING')`). Used by the facade's
+    /// `list_unresolved_send_swaps` / `refresh_pending_state` to catch up
+    /// after a realtime reconnect (slice 12e Lane 3).
+    ///
+    /// Returns an empty `Vec` when the user has no in-flight send swaps.
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuSendSwap>, SendSwapStorageError>;
 }
 
 /// Input to [`CashuSendSwapStorage::create`].

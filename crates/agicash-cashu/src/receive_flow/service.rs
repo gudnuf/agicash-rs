@@ -659,6 +659,15 @@ mod tests {
         > {
             unreachable!()
         }
+        async fn list_pending_for_user(
+            &self,
+            _user_id: UserId,
+        ) -> Result<
+            Vec<crate::receive_swap::CashuReceiveSwap>,
+            crate::receive_swap::ReceiveSwapStorageError,
+        > {
+            unreachable!()
+        }
     }
 
     fn make_service(

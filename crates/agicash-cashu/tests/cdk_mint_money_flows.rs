@@ -362,6 +362,25 @@ mod e2e {
                 })
                 .cloned())
         }
+
+        async fn list_unresolved_for_user(
+            &self,
+            user_id: UserId,
+        ) -> Result<Vec<CashuMeltQuote>, MeltQuoteStorageError> {
+            Ok(self
+                .rows
+                .lock()
+                .values()
+                .filter(|q| {
+                    q.user_id == user_id
+                        && matches!(
+                            q.state,
+                            CashuMeltQuoteState::Unpaid | CashuMeltQuoteState::Pending
+                        )
+                })
+                .cloned()
+                .collect())
+        }
     }
 
     fn raw_client(url: &str) -> Arc<dyn MintConnector + Send + Sync> {

@@ -460,6 +460,41 @@ impl CashuSendSwapStorage for SupabaseCashuSendSwapStorage {
             .ok_or(SendSwapStorageError::NotFound)?;
         self.row_to_swap_with_extra_proofs(row, None).await
     }
+
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuSendSwap>, SendSwapStorageError> {
+        // Embed the joined `cashu_proofs` exactly like `get` so
+        // `row_to_swap_with_extra_proofs` can rebuild proofs_to_send /
+        // input_proofs without a second round trip.
+        let client = self.base.authenticated_client().await.map_err(map_auth)?;
+        let response = client
+            .from("cashu_send_swaps")
+            .select("*, cashu_proofs!cashu_send_swap_id(*)")
+            .eq("user_id", user_id.to_string())
+            .in_("state", ["DRAFT", "PENDING"])
+            .execute()
+            .await
+            .map_err(|e| SendSwapStorageError::Backend(format!("postgrest: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| SendSwapStorageError::Backend(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(SendSwapStorageError::Backend(format!(
+                "select cashu_send_swaps (unresolved for user): HTTP {status}: {text}"
+            )));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| SendSwapStorageError::Backend(format!("parse rows: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.row_to_swap_with_extra_proofs(row, None).await?);
+        }
+        Ok(out)
+    }
 }
 
 impl SupabaseCashuSendSwapStorage {

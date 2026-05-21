@@ -961,6 +961,12 @@ mod tests {
         async fn get(&self, _swap_id: Uuid) -> Result<CashuSendSwap, SendSwapStorageError> {
             unreachable!()
         }
+        async fn list_unresolved_for_user(
+            &self,
+            _user_id: agicash_domain::UserId,
+        ) -> Result<Vec<CashuSendSwap>, SendSwapStorageError> {
+            unreachable!()
+        }
     }
 
     /// Storage that records the last `complete`/`fail` call for assertion
@@ -1005,6 +1011,12 @@ mod tests {
             unreachable!()
         }
         async fn get(&self, _swap_id: Uuid) -> Result<CashuSendSwap, SendSwapStorageError> {
+            unreachable!()
+        }
+        async fn list_unresolved_for_user(
+            &self,
+            _user_id: agicash_domain::UserId,
+        ) -> Result<Vec<CashuSendSwap>, SendSwapStorageError> {
             unreachable!()
         }
     }

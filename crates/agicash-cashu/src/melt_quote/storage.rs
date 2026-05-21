@@ -86,6 +86,21 @@ pub trait CashuMeltQuoteStorage: CashuMeltQuoteStorageBounds {
         user_id: UserId,
         payment_hash: &str,
     ) -> Result<Option<CashuMeltQuote>, MeltQuoteStorageError>;
+
+    /// List every UNPAID or PENDING melt quote for the given user — the
+    /// rows the wallet still needs to drive to a terminal state (PAID /
+    /// EXPIRED / FAILED) via `poll_send_lightning`.
+    ///
+    /// Mirrors the TS `CashuSendQuoteRepository.getUnresolved(userId)`
+    /// (`state IN ('UNPAID', 'PENDING')`). Used by the facade's
+    /// `list_unresolved_melt_quotes` / `refresh_pending_state` to catch up
+    /// after a realtime reconnect (slice 12e Lane 3).
+    ///
+    /// Returns an empty `Vec` when the user has no in-flight melt quotes.
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMeltQuote>, MeltQuoteStorageError>;
 }
 
 /// Input to [`CashuMeltQuoteStorage::create`].

@@ -418,6 +418,38 @@ impl CashuMintQuoteStorage for SupabaseCashuMintQuoteStorage {
             .ok_or(MintQuoteStorageError::NotFound)?;
         self.row_to_quote(row).await
     }
+
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMintQuote>, MintQuoteStorageError> {
+        let client = self.base.authenticated_client().await.map_err(map_auth)?;
+        let response = client
+            .from("cashu_receive_quotes")
+            .select("*")
+            .eq("user_id", user_id.to_string())
+            .in_("state", ["UNPAID", "PAID"])
+            .execute()
+            .await
+            .map_err(|e| MintQuoteStorageError::Backend(format!("postgrest: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| MintQuoteStorageError::Backend(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(MintQuoteStorageError::Backend(format!(
+                "select cashu_receive_quotes (pending for user): HTTP {status}: {text}"
+            )));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| MintQuoteStorageError::Backend(format!("parse response: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.row_to_quote(row).await?);
+        }
+        Ok(out)
+    }
 }
 
 impl SupabaseCashuMintQuoteStorage {

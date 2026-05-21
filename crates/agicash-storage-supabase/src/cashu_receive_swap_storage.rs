@@ -310,6 +310,38 @@ impl CashuReceiveSwapStorage for SupabaseCashuReceiveSwapStorage {
             .map_err(|e| ReceiveSwapStorageError::Backend(format!("parse response: {e}")))?;
         self.row_to_swap(value).await
     }
+
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuReceiveSwap>, ReceiveSwapStorageError> {
+        let client = self.base.authenticated_client().await.map_err(map_auth)?;
+        let response = client
+            .from("cashu_receive_swaps")
+            .select("*")
+            .eq("user_id", user_id.to_string())
+            .eq("state", "PENDING")
+            .execute()
+            .await
+            .map_err(|e| ReceiveSwapStorageError::Backend(format!("postgrest: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ReceiveSwapStorageError::Backend(format!("read body: {e}")))?;
+        if !status.is_success() {
+            return Err(ReceiveSwapStorageError::Backend(format!(
+                "select cashu_receive_swaps (pending for user): HTTP {status}: {text}"
+            )));
+        }
+        let rows: Vec<Value> = serde_json::from_str(&text)
+            .map_err(|e| ReceiveSwapStorageError::Backend(format!("parse response: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.row_to_swap(row).await?);
+        }
+        Ok(out)
+    }
 }
 
 impl SupabaseCashuReceiveSwapStorage {

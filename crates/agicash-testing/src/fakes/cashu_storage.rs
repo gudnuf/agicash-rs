@@ -176,6 +176,21 @@ impl CashuReceiveSwapStorage for InMemoryReceiveSwapStorage {
         }
         Ok(swap.clone())
     }
+
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuReceiveSwap>, ReceiveSwapStorageError> {
+        let rows = self.rows.lock();
+        let uid = user_id.as_uuid();
+        Ok(rows
+            .values()
+            .filter(|s| {
+                s.user_id.as_uuid() == uid && matches!(s.state, CashuReceiveSwapState::Pending)
+            })
+            .cloned()
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +408,25 @@ impl CashuSendSwapStorage for InMemorySendSwapStorage {
             .cloned()
             .ok_or(SendSwapStorageError::NotFound)
     }
+
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuSendSwap>, SendSwapStorageError> {
+        let rows = self.rows.lock();
+        let uid = user_id.as_uuid();
+        Ok(rows
+            .values()
+            .filter(|s| {
+                s.user_id.as_uuid() == uid
+                    && matches!(
+                        s.state,
+                        CashuSendSwapState::Draft | CashuSendSwapState::Pending { .. }
+                    )
+            })
+            .cloned()
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +598,25 @@ impl CashuMintQuoteStorage for InMemoryMintQuoteStorage {
             .get(&quote_id)
             .cloned()
             .ok_or(MintQuoteStorageError::NotFound)
+    }
+
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMintQuote>, MintQuoteStorageError> {
+        let rows = self.rows.lock();
+        let uid = user_id.as_uuid();
+        Ok(rows
+            .values()
+            .filter(|q| {
+                q.user_id.as_uuid() == uid
+                    && matches!(
+                        q.state,
+                        CashuMintQuoteState::Unpaid | CashuMintQuoteState::Paid { .. }
+                    )
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -807,6 +860,24 @@ impl CashuMeltQuoteStorage for InMemoryMeltQuoteStorage {
                 q.user_id == user_id && q.payment_hash == payment_hash && is_active_state(&q.state)
             })
             .cloned())
+    }
+
+    async fn list_unresolved_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMeltQuote>, MeltQuoteStorageError> {
+        let rows = self.rows.lock();
+        Ok(rows
+            .values()
+            .filter(|q| {
+                q.user_id == user_id
+                    && matches!(
+                        q.state,
+                        CashuMeltQuoteState::Unpaid | CashuMeltQuoteState::Pending
+                    )
+            })
+            .cloned()
+            .collect())
     }
 }
 

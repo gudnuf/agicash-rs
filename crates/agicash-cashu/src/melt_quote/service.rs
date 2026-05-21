@@ -1017,6 +1017,12 @@ mod tests {
         ) -> Result<Option<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
             unreachable!()
         }
+        async fn list_unresolved_for_user(
+            &self,
+            _user_id: UserId,
+        ) -> Result<Vec<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
+        }
     }
 
     struct UnusedProvider;
@@ -1274,6 +1280,12 @@ mod tests {
             _payment_hash: &str,
         ) -> Result<Option<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
             Ok(self.existing.lock().unwrap().clone())
+        }
+        async fn list_unresolved_for_user(
+            &self,
+            _user_id: UserId,
+        ) -> Result<Vec<CashuMeltQuote>, super::super::storage::MeltQuoteStorageError> {
+            unreachable!()
         }
     }
 

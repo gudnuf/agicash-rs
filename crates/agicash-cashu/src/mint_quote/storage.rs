@@ -70,6 +70,21 @@ pub trait CashuMintQuoteStorage: CashuMintQuoteStorageBounds {
     /// Fetch a single quote by primary key. Returns
     /// [`MintQuoteStorageError::NotFound`] if absent.
     async fn get(&self, quote_id: Uuid) -> Result<CashuMintQuote, MintQuoteStorageError>;
+
+    /// List every UNPAID or PAID mint quote for the given user — the rows
+    /// the wallet still needs to chase via `poll_receive_lightning` until
+    /// they reach a terminal state (COMPLETED / EXPIRED / FAILED).
+    ///
+    /// Mirrors the TS `CashuReceiveQuoteRepository.getPending(userId)`
+    /// (`state IN ('UNPAID', 'PAID')`). Used by the facade's
+    /// `list_pending_mint_quotes` / `refresh_pending_state` to catch up
+    /// after a realtime reconnect (slice 12e Lane 3).
+    ///
+    /// Returns an empty `Vec` when the user has no in-flight mint quotes.
+    async fn list_pending_for_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<Vec<CashuMintQuote>, MintQuoteStorageError>;
 }
 
 /// Input to [`CashuMintQuoteStorage::create`].

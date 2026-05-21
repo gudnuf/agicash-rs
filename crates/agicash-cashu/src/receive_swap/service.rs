@@ -822,6 +822,12 @@ mod tests {
         ) -> Result<CashuReceiveSwap, super::super::storage::ReceiveSwapStorageError> {
             unreachable!()
         }
+        async fn list_pending_for_user(
+            &self,
+            _user_id: UserId,
+        ) -> Result<Vec<CashuReceiveSwap>, super::super::storage::ReceiveSwapStorageError> {
+            unreachable!()
+        }
     }
 
     /// Cashu provider stub. `wallet_for_account` is never reached because

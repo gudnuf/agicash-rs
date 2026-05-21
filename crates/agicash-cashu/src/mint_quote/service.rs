@@ -769,6 +769,12 @@ mod tests {
         ) -> Result<CashuMintQuote, super::super::storage::MintQuoteStorageError> {
             unreachable!()
         }
+        async fn list_pending_for_user(
+            &self,
+            _user_id: agicash_domain::UserId,
+        ) -> Result<Vec<CashuMintQuote>, super::super::storage::MintQuoteStorageError> {
+            unreachable!()
+        }
     }
 
     struct UnusedProvider;
