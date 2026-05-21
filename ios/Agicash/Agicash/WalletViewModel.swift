@@ -72,6 +72,23 @@ final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
     func onError(message: String) {
         Self.log.error("realtime error: \(message, privacy: .public)")
     }
+
+    /// In-flight money-state snapshot, refetched after an `onConnected`
+    /// (re)connect catch-up (slice 12e Lane 3, Gap-D). Logging-only for
+    /// now — mirrors the pre-banner state of `onStatus`. Wiring the
+    /// pending-list to UI (clearing stale "waiting…" rows) is a scoped
+    /// follow-up; until then this just records the four list counts.
+    func onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi) {
+        Self.log.info(
+            """
+            realtime pending-state refreshed — \
+            mintQuotes=\(snapshot.mintQuotes.count, privacy: .public) \
+            receiveSwaps=\(snapshot.receiveSwaps.count, privacy: .public) \
+            meltQuotes=\(snapshot.meltQuotes.count, privacy: .public) \
+            sendSwaps=\(snapshot.sendSwaps.count, privacy: .public)
+            """
+        )
+    }
 }
 
 /// Phase 1 wallet view model. Holds the `AgicashWallet` UniFFI handle, an

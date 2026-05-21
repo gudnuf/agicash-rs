@@ -3713,6 +3713,175 @@ public func FfiConverterTypeMintQuoteSnapshot_lower(_ value: MintQuoteSnapshot) 
 
 
 /**
+ * One in-flight (pending / unresolved) money-state row, flattened to
+ * the minimal `(id, state)` pair the FFI surface needs.
+ *
+ * The full money/proof payload stays Rust-internal — a client that
+ * wants the detail polls by `id` through the existing per-quote FFI
+ * methods (`poll_mint_quote`, `check_send_swap_claimed`, …). This
+ * record only has to tell the client *which* rows are still in flight
+ * and *what state* they are in, which is all the realtime-reconnect
+ * catch-up needs to refresh a stale "waiting…" list.
+ */
+public struct PendingItemFfi: Equatable, Hashable {
+    /**
+     * The row's primary-key UUID, stringified.
+     */
+    public var id: String
+    /**
+     * Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` /
+     * `DRAFT`).
+     */
+    public var state: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The row's primary-key UUID, stringified.
+         */id: String,
+        /**
+         * Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` /
+         * `DRAFT`).
+         */state: String) {
+        self.id = id
+        self.state = state
+    }
+
+
+}
+
+#if compiler(>=6)
+extension PendingItemFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingItemFfi: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingItemFfi {
+        return
+            try PendingItemFfi(
+                id: FfiConverterString.read(from: &buf),
+                state: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingItemFfi, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingItemFfi_lift(_ buf: RustBuffer) throws -> PendingItemFfi {
+    return try FfiConverterTypePendingItemFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingItemFfi_lower(_ value: PendingItemFfi) -> RustBuffer {
+    return FfiConverterTypePendingItemFfi.lower(value)
+}
+
+
+/**
+ * FFI projection of `agicash_wallet::PendingStateSnapshot` — every
+ * in-flight money-state row the signed-in user still owns, fetched in
+ * one shot on a realtime (re)connect (slice 12e Lane 3, Gap-D).
+ *
+ * Four flat lists keyed by money-flow kind. An empty list is the
+ * canonical "nothing in flight" state.
+ */
+public struct PendingStateSnapshotFfi: Equatable, Hashable {
+    /**
+     * UNPAID / PAID mint quotes — Lightning receives still in flight.
+     */
+    public var mintQuotes: [PendingItemFfi]
+    /**
+     * PENDING receive swaps — inbound Cashu tokens still being claimed.
+     */
+    public var receiveSwaps: [PendingItemFfi]
+    /**
+     * UNPAID / PENDING melt quotes — Lightning sends still in flight.
+     */
+    public var meltQuotes: [PendingItemFfi]
+    /**
+     * DRAFT / PENDING send swaps — outbound tokens not yet claimed.
+     */
+    public var sendSwaps: [PendingItemFfi]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * UNPAID / PAID mint quotes — Lightning receives still in flight.
+         */mintQuotes: [PendingItemFfi],
+        /**
+         * PENDING receive swaps — inbound Cashu tokens still being claimed.
+         */receiveSwaps: [PendingItemFfi],
+        /**
+         * UNPAID / PENDING melt quotes — Lightning sends still in flight.
+         */meltQuotes: [PendingItemFfi],
+        /**
+         * DRAFT / PENDING send swaps — outbound tokens not yet claimed.
+         */sendSwaps: [PendingItemFfi]) {
+        self.mintQuotes = mintQuotes
+        self.receiveSwaps = receiveSwaps
+        self.meltQuotes = meltQuotes
+        self.sendSwaps = sendSwaps
+    }
+
+
+}
+
+#if compiler(>=6)
+extension PendingStateSnapshotFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingStateSnapshotFfi: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingStateSnapshotFfi {
+        return
+            try PendingStateSnapshotFfi(
+                mintQuotes: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
+                receiveSwaps: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
+                meltQuotes: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
+                sendSwaps: FfiConverterSequenceTypePendingItemFfi.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingStateSnapshotFfi, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypePendingItemFfi.write(value.mintQuotes, into: &buf)
+        FfiConverterSequenceTypePendingItemFfi.write(value.receiveSwaps, into: &buf)
+        FfiConverterSequenceTypePendingItemFfi.write(value.meltQuotes, into: &buf)
+        FfiConverterSequenceTypePendingItemFfi.write(value.sendSwaps, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingStateSnapshotFfi_lift(_ buf: RustBuffer) throws -> PendingStateSnapshotFfi {
+    return try FfiConverterTypePendingStateSnapshotFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingStateSnapshotFfi_lower(_ value: PendingStateSnapshotFfi) -> RustBuffer {
+    return FfiConverterTypePendingStateSnapshotFfi.lower(value)
+}
+
+
+/**
  * FFI mirror of [`agicash_cashu::ReceiveFlowResult`]. Identical fields;
  * stringified for Swift codegen.
  */
@@ -5524,7 +5693,7 @@ public func FfiConverterTypeSendSwapClaimState_lower(_ value: SendSwapClaimState
  * supervisor task aborted) by
  * [`crate::AgicashWallet::stop_wallet_events`].
  *
- * All four methods are invoked from the realtime supervisor's tokio
+ * All methods are invoked from the realtime supervisor's tokio
  * task — never from the calling thread — so the foreign implementation
  * must be thread-safe. UniFFI enforces `Send + Sync` on the boxed
  * foreign object; the bridge additionally never re-enters the listener
@@ -5556,6 +5725,22 @@ public protocol WalletEventListener: AnyObject, Sendable {
      * Non-fatal/observability error string.
      */
     func onError(message: String)
+
+    /**
+     * The wallet's in-flight money state, refetched after an
+     * `on_connected` (re)connect catch-up (slice 12e Lane 3, Gap-D).
+     *
+     * Fired right after `on_connected` whenever the post-reconnect
+     * `refresh_pending_state()` succeeds — the platform uses it to
+     * clear stale "waiting…" rows that resolved while the channel was
+     * down. A `refresh_pending_state()` *failure* is swallowed (logged,
+     * non-fatal): the balance refetch in `on_connected` already keeps
+     * the UI alive, and the next reconnect retries. Until iOS/Android
+     * wire pending-list UI consumption (a follow-up), a logging-only
+     * stub here is acceptable — it mirrors the pre-banner state of the
+     * `on_status` callback.
+     */
+    func onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi)
 
 }
 
@@ -5668,6 +5853,30 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 }
                 return uniffiObj.onError(
                      message: try FfiConverterString.lift(message)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        onPendingStateRefreshed: { (
+            uniffiHandle: UInt64,
+            snapshot: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onPendingStateRefreshed(
+                     snapshot: try FfiConverterTypePendingStateSnapshotFfi_lift(snapshot)
                 )
             }
 
@@ -5838,6 +6047,31 @@ fileprivate struct FfiConverterSequenceTypeAccountFfi: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeAccountFfi.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePendingItemFfi: FfiConverterRustBuffer {
+    typealias SwiftType = [PendingItemFfi]
+
+    public static func write(_ value: [PendingItemFfi], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePendingItemFfi.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PendingItemFfi] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PendingItemFfi]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePendingItemFfi.read(from: &buf))
         }
         return seq
     }
@@ -6117,6 +6351,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_error() != 44003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_pending_state_refreshed() != 42166) {
         return InitializationResult.apiChecksumMismatch
     }
 
