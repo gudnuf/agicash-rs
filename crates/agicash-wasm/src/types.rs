@@ -5,7 +5,9 @@
 //! wasm-bindgen derives are confined to THIS module (spec §2: the
 //! shell-type definitions carry the binding derive; the *mappings* live
 //! in `convert.rs`). NOT uniffi — a parallel wasm-bindgen shell.
-#![cfg(target_arch = "wasm32")]
+//
+// The module declaration in `lib.rs` is already `#[cfg(target_arch =
+// "wasm32")]`-gated; no inner `#![cfg]` here (it would be a duplicate).
 
 use serde::Serialize;
 use wasm_bindgen::prelude::*;

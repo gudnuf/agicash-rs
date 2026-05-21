@@ -44,7 +44,13 @@ mod wasm_impl {
         /// shipped; the facade's InMemory choice is the construction
         /// default, exactly as the FFI uses InMemory + a shell-resident
         /// backend). No network I/O at construction.
+        // `opensecret_client_id` is only read via `.trim()` (the other
+        // three params are moved into `WalletConfig`). Kept as `String`
+        // for a uniform 4-`String` `#[wasm_bindgen(constructor)]`
+        // signature — JS marshals a string identically either way; a
+        // lone `&str` param would just be an inconsistent surface.
         #[wasm_bindgen(constructor)]
+        #[allow(clippy::needless_pass_by_value)]
         pub fn new(
             opensecret_url: String,
             opensecret_client_id: String,

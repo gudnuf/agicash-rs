@@ -3,7 +3,9 @@
 //! `crates/agicash-ffi/src/convert.rs` (`ffi::convert`, 12b-1 Task 4):
 //! same facade source types, same parse/`amount_to_money` semantics,
 //! `JsValue` instead of `FfiError` at the error boundary.
-#![cfg(target_arch = "wasm32")]
+//
+// The module declaration in `lib.rs` is already `#[cfg(target_arch =
+// "wasm32")]`-gated; no inner `#![cfg]` here (it would be a duplicate).
 
 use crate::types::AuthStatusWasm;
 use agicash_domain::{AccountId, Currency};
@@ -57,7 +59,14 @@ pub fn amount_to_money(amount: u64, currency: Currency) -> Money {
 /// this returns the real one). Structured-code granularity is NOT a
 /// 12d concern (it is 12b-2 for the FFI shell; the wasm shell mirrors
 /// today's string-funnel behavior).
+///
+/// Takes `WalletError` by value to mirror the FFI sibling
+/// `ffi::convert::wallet_error_to_ffi` and so it can be used as a bare
+/// fn-reference in `.map_err(wallet_error_to_js)` across the shell.
+/// Switching to `&WalletError` would force every call site into a
+/// closure — out of scope for this lint-cleanup pass.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn wallet_error_to_js(e: WalletError) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
