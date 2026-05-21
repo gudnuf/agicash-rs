@@ -165,6 +165,17 @@ pub struct AgicashWallet {
     /// the task is aborted (a bare `abort()` would drop the socket
     /// without a clean leave).
     realtime_service: Arc<RwLock<Option<Arc<agicash_realtime::WalletRealtimeService>>>>,
+    /// The resumption driver — Lane D wiring (plan 2026-05-21 §7). Folded
+    /// into the realtime lifecycle (`start_wallet_events` /
+    /// `stop_wallet_events`) so iOS/Android get recoverability without a
+    /// new `UniFFI` surface. Subscribes to the SAME realtime broadcast
+    /// `realtime_service` exposes; calls back into `facade` to re-fire
+    /// service methods on unresolved rows. Lives in lockstep with
+    /// `realtime_service`: populated when realtime starts, stopped +
+    /// dropped when realtime stops. `notify_foreground()` is fired from
+    /// `set_realtime_online(true)` / `set_realtime_active(true)` as the
+    /// React `refetchOnWindowFocus` analog.
+    driver_handle: Arc<RwLock<Option<Arc<agicash_driver::DriverHandle>>>>,
     /// The composed facade — THE single composition root for this
     /// binding shell. The delegated business methods route here; the
     /// shell-resident platform layer (the `OpenSecretClient` `client`
@@ -350,6 +361,7 @@ impl AgicashWallet {
             session_contract,
             realtime_task: Arc::new(RwLock::new(None)),
             realtime_service: Arc::new(RwLock::new(None)),
+            driver_handle: Arc::new(RwLock::new(None)),
             facade,
         }))
     }
@@ -1509,6 +1521,12 @@ impl AgicashWallet {
         ));
 
         let mut rx = svc.subscribe();
+        // Lane D: a SECOND subscriber for the resumption driver. Each
+        // `subscribe()` returns a fresh broadcast receiver, so the driver
+        // gets every event from this point on independently of the pump
+        // — coalesced + acted on (re-fires service methods on unresolved
+        // rows) rather than dispatched to the FFI listener.
+        let driver_rx = svc.subscribe();
         // `Box<dyn WalletEventListener>` is `Send + Sync` (UniFFI's
         // foreign shim); behind an `Arc` so the spawned pump owns a
         // clone for the lifetime of the task.
@@ -1549,6 +1567,26 @@ impl AgicashWallet {
             tokio::join!(svc_run.run(), pump);
         });
 
+        // Lane D: build the resumption driver alongside the realtime
+        // service. The sweeper wraps the same `facade` clone the pump
+        // uses (so `refresh_pending_state` reads + the re-fire actions
+        // hit the same `WalletClient`); the driver subscribes to the
+        // SAME realtime broadcast (`driver_rx`, captured above before
+        // the pump task moved its own receiver). `ResumptionDriver::new
+        // + .start()` is non-async and returns a `Send + Sync` handle
+        // we store behind an `Arc` so `set_realtime_online/active` can
+        // poke `notify_foreground()` without re-acquiring the realtime
+        // service slot.
+        let sweeper = Arc::new(agicash_driver::WalletClientSweeper::new(Arc::clone(
+            &self.facade,
+        )));
+        let driver = agicash_driver::ResumptionDriver::new(
+            sweeper,
+            driver_rx,
+            agicash_driver::DriverConfig::default(),
+        );
+        let new_driver_handle = Arc::new(driver.start());
+
         // Replace + abort any prior subscription.
         if let Some(old) = self.realtime_task.write().await.replace(handle) {
             old.abort();
@@ -1560,6 +1598,11 @@ impl AgicashWallet {
             .replace(Arc::clone(&svc))
         {
             old_svc.stop();
+        }
+        // Lane D: install the new driver handle, stopping any prior one
+        // in lockstep with the realtime service replacement above.
+        if let Some(old_driver) = self.driver_handle.write().await.replace(new_driver_handle) {
+            old_driver.stop();
         }
         Ok(())
     }
@@ -1574,6 +1617,13 @@ impl AgicashWallet {
         }
         if let Some(h) = self.realtime_task.write().await.take() {
             h.abort();
+        }
+        // Lane D: symmetric to `start_wallet_events` — stop + drop the
+        // resumption driver. `DriverHandle::stop()` is idempotent; the
+        // spawned task observes the stop flag at every loop iteration
+        // and exits cleanly.
+        if let Some(drv) = self.driver_handle.write().await.take() {
+            drv.stop();
         }
         Ok(())
     }
@@ -1597,6 +1647,21 @@ impl AgicashWallet {
         if let Some(svc) = self.realtime_service.read().await.as_ref() {
             svc.set_online(online);
         }
+        // Lane D: foreground edge → kick the resumption driver. We fire
+        // on EVERY `online=true` call (not just the rising edge): the
+        // driver's coalescing latch already collapses bursts, the
+        // `notify_foreground()` clears `paused` on every call (the
+        // desirable behavior — a re-online after a sign-out + sign-in
+        // SHOULD resume even if the FFI never observed a `false`), and
+        // tracking the previous value here would add an `AtomicBool` for
+        // no win the driver isn't already getting from coalescing. This
+        // is the React `refetchOnWindowFocus` analog: the focus event
+        // fires the refetch; React Query coalesces — same shape here.
+        if online {
+            if let Some(drv) = self.driver_handle.read().await.as_ref() {
+                drv.notify_foreground();
+            }
+        }
         Ok(())
     }
 
@@ -1611,6 +1676,15 @@ impl AgicashWallet {
     pub async fn set_realtime_active(&self, active: bool) -> Result<(), FfiError> {
         if let Some(svc) = self.realtime_service.read().await.as_ref() {
             svc.set_active(active);
+        }
+        // Lane D: foreground edge — same fire-every-true policy as
+        // `set_realtime_online` above (see that docstring for rationale).
+        // Mobile foregrounding (iOS scenePhase `.active`, Android
+        // `ON_START`) is the canonical `refetchOnWindowFocus` analog.
+        if active {
+            if let Some(drv) = self.driver_handle.read().await.as_ref() {
+                drv.notify_foreground();
+            }
         }
         Ok(())
     }
@@ -2731,6 +2805,152 @@ mod tests {
         w.set_realtime_online(false).await.expect("noop");
         w.set_realtime_active(true).await.expect("noop");
         w.set_realtime_active(false).await.expect("noop");
+    }
+
+    // ---- Lane D — resumption driver wiring ----
+    //
+    // `start_wallet_events` requires a live session + reachable
+    // OpenSecret/Supabase to construct a real `WalletRealtimeService`,
+    // so these tests install a fake driver into the slot directly
+    // (the wiring under test is the `set_realtime_*` → `notify_foreground`
+    // path + the symmetric `stop_wallet_events` → `stop` path; the
+    // construction-time `ResumptionDriver::new(...).start()` call is
+    // exercised by Lane B/C's own crate tests, which run against an
+    // in-process realtime broadcast).
+
+    /// A no-op `Sweeper` for the tests below — never errors, returns an
+    /// empty report. The driver itself decides when to call this; the
+    /// test only needs a real `DriverHandle` to assert against.
+    struct NoopSweeper;
+    #[async_trait::async_trait]
+    impl agicash_driver::Sweeper for NoopSweeper {
+        async fn sweep(
+            &self,
+            _cfg: agicash_driver::RetryConfig,
+        ) -> Result<agicash_driver::SweepReport, agicash_wallet::WalletError> {
+            Ok(agicash_driver::SweepReport::default())
+        }
+    }
+
+    /// Construct + start a real `DriverHandle` over a manually-created
+    /// broadcast channel. The channel sender is dropped on return — the
+    /// driver task observes a closed broadcast and keeps running on its
+    /// waker triggers (`stop` / `notify_foreground`), which is exactly
+    /// what these tests want to assert.
+    fn build_test_driver_handle() -> Arc<agicash_driver::DriverHandle> {
+        let (mut tx, rx) = async_broadcast::broadcast::<agicash_realtime::WalletRealtimeEvent>(16);
+        tx.set_overflow(true);
+        let sweeper = Arc::new(NoopSweeper);
+        let driver = agicash_driver::ResumptionDriver::new(
+            sweeper,
+            rx,
+            agicash_driver::DriverConfig::default(),
+        );
+        Arc::new(driver.start())
+    }
+
+    /// `set_realtime_online(true)` must pump a `Foreground` trigger
+    /// through to the installed driver — the React
+    /// `refetchOnWindowFocus` analog. `false` must NOT trigger (an
+    /// offline edge is the opposite of a focus).
+    #[tokio::test]
+    async fn set_realtime_online_true_notifies_driver_foreground() {
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+
+        let drv = build_test_driver_handle();
+        *w.driver_handle.write().await = Some(Arc::clone(&drv));
+
+        // Offline edge must not produce a Foreground.
+        w.set_realtime_online(false).await.expect("ok");
+        assert!(
+            !drv.has_seen(agicash_driver::TriggerReason::Foreground),
+            "offline edge MUST NOT mark Foreground"
+        );
+
+        // Online edge MUST produce a Foreground.
+        w.set_realtime_online(true).await.expect("ok");
+        assert!(
+            drv.has_seen(agicash_driver::TriggerReason::Foreground),
+            "online edge MUST mark Foreground"
+        );
+
+        drv.stop();
+    }
+
+    /// `set_realtime_active(true)` must pump a `Foreground` trigger
+    /// through to the installed driver — the canonical mobile-foreground
+    /// analog (iOS `scenePhase.active`, Android `ON_START`). `false`
+    /// (backgrounding) must NOT.
+    #[tokio::test]
+    async fn set_realtime_active_true_notifies_driver_foreground() {
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+
+        let drv = build_test_driver_handle();
+        *w.driver_handle.write().await = Some(Arc::clone(&drv));
+
+        w.set_realtime_active(false).await.expect("ok");
+        assert!(
+            !drv.has_seen(agicash_driver::TriggerReason::Foreground),
+            "backgrounding MUST NOT mark Foreground"
+        );
+
+        w.set_realtime_active(true).await.expect("ok");
+        assert!(
+            drv.has_seen(agicash_driver::TriggerReason::Foreground),
+            "foregrounding MUST mark Foreground"
+        );
+
+        drv.stop();
+    }
+
+    /// `stop_wallet_events` must stop AND drop the installed driver —
+    /// symmetric to `start_wallet_events`. Idempotent: a second call
+    /// with the slot already empty is a clean no-op.
+    #[tokio::test]
+    async fn stop_wallet_events_stops_and_drops_driver() {
+        let cfg = fake_config();
+        let w = AgicashWallet::new(
+            cfg.opensecret_url,
+            cfg.client_id,
+            cfg.supabase_url,
+            cfg.anon_key,
+        )
+        .expect("construct");
+
+        let drv = build_test_driver_handle();
+        // Hold a SECOND Arc to the same handle so we can observe
+        // `is_stopped()` after `stop_wallet_events` drops the slotted
+        // one. Without this, the only way to observe would be the
+        // shared atomic — which is what we WANT to assert.
+        *w.driver_handle.write().await = Some(Arc::clone(&drv));
+        assert!(!drv.is_stopped(), "fresh driver MUST not be stopped");
+
+        w.stop_wallet_events().await.expect("ok");
+        assert!(
+            drv.is_stopped(),
+            "stop_wallet_events MUST stop the installed driver"
+        );
+        assert!(
+            w.driver_handle.read().await.is_none(),
+            "stop_wallet_events MUST drop the slotted driver handle"
+        );
+
+        // Second call is a no-op.
+        w.stop_wallet_events().await.expect("ok");
     }
 
     /// Hermetic bridge smoke test: a fake `WalletEventListener` receives

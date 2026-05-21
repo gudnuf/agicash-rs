@@ -36,6 +36,7 @@ agicash-cashu = { path = "../agicash-cashu" }
 agicash-exchange-rate = { path = "../agicash-exchange-rate" }
 agicash-lightning-address = { path = "../agicash-lightning-address" }
 agicash-realtime = { path = "../agicash-realtime" }
+agicash-driver = { path = "../agicash-driver" }
 agicash-wallet = { path = "../agicash-wallet" }
 async-trait = { workspace = true }
 cdk = { workspace = true }
@@ -78,6 +79,11 @@ jni = "0.22"
 tracing-android = "0.2"
 
 [dev-dependencies]
+# Lane D tests construct a real `agicash_driver::DriverHandle` over a
+# manually-created `async_broadcast` channel. Production code doesn't
+# touch async-broadcast directly (the realtime service does that), so
+# it lives in dev-deps only.
+async-broadcast = { workspace = true }
 
 [lints]
 workspace = true
