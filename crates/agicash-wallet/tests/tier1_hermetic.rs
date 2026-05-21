@@ -124,3 +124,54 @@ async fn receive_flow_without_session_is_unauthenticated() {
     // Silence unused-import lints if the assert form changes.
     let _ = AccountId::new();
 }
+
+/// F15 Lane 3: `refresh_pending_state` is `require_session`-guarded —
+/// logged out it short-circuits to `Unauthenticated` before any of the
+/// four storage reads fire (the realtime-reconnect catch-up never runs
+/// for a signed-out wallet).
+#[tokio::test]
+async fn refresh_pending_state_without_session_is_unauthenticated() {
+    let tw = TestWallet::new();
+    let err = tw
+        .wallet()
+        .refresh_pending_state()
+        .await
+        .expect_err("logged-out refresh_pending_state must error");
+    assert!(
+        matches!(err, WalletError::Unauthenticated),
+        "expected Unauthenticated, got {err:?}"
+    );
+}
+
+/// F15 Lane 3: a logged-in wallet with nothing in flight gets an empty
+/// `PendingStateSnapshot` — `Vec::is_empty()` is the canonical "nothing
+/// pending" state, not an error. Proves the `tokio::try_join!` aggregator
+/// wires all four `list_*` reads through the real facade.
+#[tokio::test]
+async fn refresh_pending_state_empty_wallet_returns_empty_snapshot() {
+    let tw = TestWallet::logged_in();
+    let snapshot = tw
+        .wallet()
+        .refresh_pending_state()
+        .await
+        .expect("refresh_pending_state must succeed for a logged-in wallet");
+    assert!(snapshot.mint_quotes.is_empty(), "no mint quotes expected");
+    assert!(
+        snapshot.receive_swaps.is_empty(),
+        "no receive swaps expected"
+    );
+    assert!(snapshot.melt_quotes.is_empty(), "no melt quotes expected");
+    assert!(snapshot.send_swaps.is_empty(), "no send swaps expected");
+}
+
+/// F15 Lane 3: the per-list methods are individually `require_session`-
+/// guarded too, and return empty for a fresh logged-in wallet.
+#[tokio::test]
+async fn list_pending_methods_empty_for_fresh_logged_in_wallet() {
+    let tw = TestWallet::logged_in();
+    let w = tw.wallet();
+    assert!(w.list_pending_mint_quotes().await.unwrap().is_empty());
+    assert!(w.list_pending_receive_swaps().await.unwrap().is_empty());
+    assert!(w.list_unresolved_melt_quotes().await.unwrap().is_empty());
+    assert!(w.list_unresolved_send_swaps().await.unwrap().is_empty());
+}

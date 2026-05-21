@@ -189,6 +189,7 @@ impl WalletClientBuilder {
             auth,
             user_storage,
             cashu_provider,
+            cashu_receive_storage,
             cashu_send_storage,
             cashu_mint_quote_storage,
             cashu_melt_quote_storage,

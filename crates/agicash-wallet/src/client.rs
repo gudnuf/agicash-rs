@@ -14,16 +14,19 @@ use crate::auth::{AuthClient, Session};
 use crate::error::WalletError;
 use crate::types::{
     AccountSummary, AuthStatus, BalanceSummary, ExchangeRateSnapshot, MintSummary,
-    ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState, ReceiveReceipt,
-    ReceiveStatus, SendLightningQuote, SendLightningReceipt, SendLightningStatus, SendTokenQuote,
-    SendTokenReceipt, TokenVersion, Transaction, TransactionFilter, TransactionPage,
+    PendingStateSnapshot, ReceiveLightningHandle, ReceiveLightningSnapshot, ReceiveLightningState,
+    ReceiveReceipt, ReceiveStatus, SendLightningQuote, SendLightningReceipt, SendLightningStatus,
+    SendTokenQuote, SendTokenReceipt, TokenVersion, Transaction, TransactionFilter,
+    TransactionPage,
 };
 use agicash_cashu::{
-    add_mint_account, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
-    CashuMintQuoteService, CashuMintQuoteState, CashuMintQuoteStorage, CashuReceiveSwapService,
-    CashuReceiveSwapState, CashuSeedProvider, CashuSendSwapService, CashuSendSwapStorage,
-    CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError, ParsedToken,
-    ReceiveFlowError, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError, TokenProof,
+    add_mint_account, CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState,
+    CashuMeltQuoteStorage, CashuMintQuote, CashuMintQuoteService, CashuMintQuoteState,
+    CashuMintQuoteStorage, CashuReceiveSwap, CashuReceiveSwapService, CashuReceiveSwapState,
+    CashuReceiveSwapStorage, CashuSeedProvider, CashuSendSwap, CashuSendSwapService,
+    CashuSendSwapStorage, CompleteMintQuoteOutcome, CompleteOutcome, MeltOutcome, MeltQuoteError,
+    ParsedToken, ReceiveFlowError, ReceiveFlowService, ReceiveSwapError, ReceiveSwapStorageError,
+    TokenProof,
 };
 use agicash_domain::{Account, AccountId, AccountState, AccountType, Currency};
 use agicash_exchange_rate::ExchangeRateProvider;
@@ -46,6 +49,7 @@ pub struct WalletClient {
     pub(crate) auth: Arc<dyn AuthClient>,
     pub(crate) user_storage: Arc<dyn UserStorage>,
     pub(crate) cashu_provider: Arc<dyn CashuProvider>,
+    pub(crate) cashu_receive_storage: Arc<dyn CashuReceiveSwapStorage>,
     pub(crate) cashu_send_storage: Arc<dyn CashuSendSwapStorage>,
     pub(crate) cashu_mint_quote_storage: Arc<dyn CashuMintQuoteStorage>,
     pub(crate) cashu_melt_quote_storage: Arc<dyn CashuMeltQuoteStorage>,
@@ -999,6 +1003,89 @@ impl WalletClient {
         Err(WalletError::Unsupported(
             "subscribe: event bus ships in slice 11",
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pending-state catch-up (slice 12e Lane 3 / F15 — Gap-D)
+//
+// The realtime channel ships no replay (spec §5.5): on every (re)connect
+// a consumer must refetch the user's in-flight money-state rows or a
+// "waiting…" row that resolved during a disconnect window stays stale
+// until the user navigates away. These four `list_*` methods + the
+// `refresh_pending_state` aggregator are the catch-up surface every
+// client wires to its `on_connected` handler. They are pure storage
+// reads scoped to the signed-in user — no mint round-trip, idempotent,
+// safe to call as often as the realtime layer reconnects.
+// ---------------------------------------------------------------------------
+impl WalletClient {
+    /// List the signed-in user's UNPAID / PAID mint quotes — Lightning
+    /// receives the wallet still needs to chase to a terminal state.
+    pub async fn list_pending_mint_quotes(&self) -> Result<Vec<CashuMintQuote>, WalletError> {
+        let session = self.require_session().await?;
+        self.cashu_mint_quote_storage
+            .list_pending_for_user(session.user_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("list_pending_mint_quotes: {e}")))
+    }
+
+    /// List the signed-in user's PENDING receive swaps — inbound Cashu
+    /// tokens the wallet still needs to drive to COMPLETED.
+    pub async fn list_pending_receive_swaps(&self) -> Result<Vec<CashuReceiveSwap>, WalletError> {
+        let session = self.require_session().await?;
+        self.cashu_receive_storage
+            .list_pending_for_user(session.user_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("list_pending_receive_swaps: {e}")))
+    }
+
+    /// List the signed-in user's UNPAID / PENDING melt quotes —
+    /// Lightning sends still in flight.
+    pub async fn list_unresolved_melt_quotes(&self) -> Result<Vec<CashuMeltQuote>, WalletError> {
+        let session = self.require_session().await?;
+        self.cashu_melt_quote_storage
+            .list_unresolved_for_user(session.user_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("list_unresolved_melt_quotes: {e}")))
+    }
+
+    /// List the signed-in user's DRAFT / PENDING send swaps — outbound
+    /// Cashu tokens not yet claimed by the receiver.
+    pub async fn list_unresolved_send_swaps(&self) -> Result<Vec<CashuSendSwap>, WalletError> {
+        let session = self.require_session().await?;
+        self.cashu_send_storage
+            .list_unresolved_for_user(session.user_id)
+            .await
+            .map_err(|e| WalletError::Storage(format!("list_unresolved_send_swaps: {e}")))
+    }
+
+    /// Refetch the user's full in-flight money state in one call — the
+    /// realtime (re)connect catch-up surface (Gap-D).
+    ///
+    /// Bundles all four `list_*` results into a [`PendingStateSnapshot`].
+    /// The four reads are issued concurrently via `tokio::try_join!`;
+    /// they hit the same Supabase connection pool so parallelism is a
+    /// minor latency win, not load-bearing — the first storage error
+    /// short-circuits the whole snapshot.
+    ///
+    /// A consumer calls this on `RealtimeEvent::Connected` to clear
+    /// stale "waiting…" rows that resolved while the channel was down.
+    pub async fn refresh_pending_state(&self) -> Result<PendingStateSnapshot, WalletError> {
+        // `require_session` once up front so an unauthenticated call
+        // fails fast with `Unauthenticated`, not four times in parallel.
+        let _session = self.require_session().await?;
+        let (mint_quotes, receive_swaps, melt_quotes, send_swaps) = tokio::try_join!(
+            self.list_pending_mint_quotes(),
+            self.list_pending_receive_swaps(),
+            self.list_unresolved_melt_quotes(),
+            self.list_unresolved_send_swaps(),
+        )?;
+        Ok(PendingStateSnapshot {
+            mint_quotes,
+            receive_swaps,
+            melt_quotes,
+            send_swaps,
+        })
     }
 }
 

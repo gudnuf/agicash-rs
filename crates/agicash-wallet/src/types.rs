@@ -303,6 +303,30 @@ pub struct ExchangeRateSnapshot {
     pub rate: Decimal,
 }
 
+/// One-shot snapshot of every in-flight (pending / unresolved) money-state
+/// row the signed-in user still owns.
+///
+/// Returned by [`crate::WalletClient::refresh_pending_state`] — the
+/// catch-up surface a consumer calls on a realtime (re)connect to fix
+/// stale "waiting…" rows that resolved during a disconnect window
+/// (slice 12e Lane 3, Gap-D). Mirrors the React app's
+/// `useTrackWalletChanges` invalidation of the pending/unresolved
+/// react-query caches.
+///
+/// Each list is independently fetched from storage; an empty `Vec` is
+/// the canonical "nothing in flight" state, not an error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PendingStateSnapshot {
+    /// UNPAID / PAID mint quotes — Lightning receives still being chased.
+    pub mint_quotes: Vec<agicash_cashu::CashuMintQuote>,
+    /// PENDING receive swaps — inbound Cashu tokens still being claimed.
+    pub receive_swaps: Vec<agicash_cashu::CashuReceiveSwap>,
+    /// UNPAID / PENDING melt quotes — Lightning sends still in flight.
+    pub melt_quotes: Vec<agicash_cashu::CashuMeltQuote>,
+    /// DRAFT / PENDING send swaps — outbound Cashu tokens not yet claimed.
+    pub send_swaps: Vec<agicash_cashu::CashuSendSwap>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
