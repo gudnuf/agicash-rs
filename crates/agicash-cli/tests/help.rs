@@ -85,6 +85,57 @@ fn auth_login_help_requires_email_arg() {
         .stdout(predicate::str::contains("email"));
 }
 
+/// The help for `auth login` / `auth signup` must accurately describe
+/// password input. The leaf-help template's whole value is that an agent
+/// can trust it — a false claim is worse than no claim.
+///
+/// Pins the P0 fix: the pre-fix help carried the FALSE claim "The
+/// password is read from stdin (never passed as an argument)" — the
+/// password was NOT read from stdin, the bare `rpassword::prompt_password`
+/// forced `/dev/tty`. The corrected help documents `--password-stdin`,
+/// the `printf %s` pipe example, and the interactive-prompt path.
+#[test]
+fn auth_password_help_is_accurate_for_login_and_signup() {
+    for sub in ["login", "signup"] {
+        let text = help_text(&["auth", sub, "--help"]);
+
+        // The false claim must be gone.
+        assert!(
+            !text.contains("password is read from stdin (never passed as an argument)"),
+            "auth {sub} --help still carries the false stdin claim:\n{text}",
+        );
+
+        // It must document `--password-stdin` as the non-interactive path.
+        assert!(
+            text.contains("--password-stdin"),
+            "auth {sub} --help must document --password-stdin:\n{text}",
+        );
+
+        // It must carry the concrete pipe example an agent copies.
+        assert!(
+            text.contains("printf %s")
+                && text.contains(&format!(
+                    "agicash auth {sub} alice@example.com --password-stdin"
+                )),
+            "auth {sub} --help must show the `printf %s | … --password-stdin` example:\n{text}",
+        );
+
+        // It must still describe the interactive (terminal-prompt) path
+        // so a human is not told to pipe.
+        assert!(
+            text.to_lowercase().contains("interactive") && text.to_lowercase().contains("terminal"),
+            "auth {sub} --help must still describe the interactive path:\n{text}",
+        );
+
+        // The new exit-2 condition is documented in the EXIT CODES block.
+        assert!(
+            text.contains("interactive-input-required"),
+            "auth {sub} --help must document the interactive-input-required \
+             exit-2 condition:\n{text}",
+        );
+    }
+}
+
 #[test]
 fn account_help_lists_list_subcommand() {
     Command::cargo_bin("agicash")

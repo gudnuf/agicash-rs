@@ -112,6 +112,11 @@ mod gated {
         // --- classify_error: lightning receive ---
         "invalid-quote-id",
         "quote-not-paid",
+        // --- classify_error: auth (AuthCmdError) ---
+        // `auth login`/`signup` run with no TTY and no `--password-stdin`:
+        // a clean, self-correctable usage error (exit 2) — NOT the
+        // `internal-error` crash the bare `rpassword` call used to emit.
+        "interactive-input-required",
         // --- catch-all ---
         "unknown",
     ];
@@ -701,6 +706,99 @@ mod gated {
         );
     }
 
+    /// Non-interactive `auth login` / `auth signup` contract.
+    ///
+    /// This is the P0 the fix exists for: an agent has no controlling
+    /// terminal, so the CLI must NOT crash trying to open `/dev/tty`.
+    ///
+    /// Two paths, both exercised against the real binary in a no-TTY
+    /// subprocess (`assert_cmd` runs the child with `stdin = /dev/null`):
+    ///
+    ///   1. **No `--password-stdin`, no TTY** → a clean, typed
+    ///      `interactive-input-required` error on exit 2 — NOT the old
+    ///      `internal-error` crash ("Device not configured").
+    ///   2. **`--password-stdin`, password piped on fd 0** → the password
+    ///      IS read from the pipe and reaches the auth backend. We can't
+    ///      do a live round-trip without valid credentials, but a
+    ///      *backend / credentials* failure (not a TTY error) proves the
+    ///      password path worked end to end.
+    #[test]
+    fn noninteractive_auth_does_not_crash_on_missing_tty() {
+        if !env_ready() {
+            eprintln!("skipping: env vars not set");
+            return;
+        }
+        let session = TestSession::new("contracts-noninteractive-auth");
+        let mut failures: Vec<String> = Vec::new();
+
+        // --- 1. login, no flag, no TTY → interactive-input-required, exit 2.
+        for sub in ["login", "signup"] {
+            let out = session
+                .cmd()
+                .args(["auth", sub, "agent@example.com"])
+                .output()
+                .unwrap_or_else(|e| panic!("spawn auth {sub}: {e}"));
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if out.status.success() {
+                failures.push(format!("auth {sub} (no tty, no flag): expected failure"));
+                continue;
+            }
+            let code = extract_error_code(&format!("auth {sub}"), &stderr);
+            if code != "interactive-input-required" {
+                failures.push(format!(
+                    "auth {sub} (no tty, no flag): expected code \
+                     `interactive-input-required`, got `{code}`; stderr={stderr}",
+                ));
+            }
+            if out.status.code() != Some(2) {
+                failures.push(format!(
+                    "auth {sub} (no tty, no flag): expected exit 2, got {:?}; stderr={stderr}",
+                    out.status.code(),
+                ));
+            }
+        }
+
+        // --- 2. login --password-stdin: the password is read from fd 0
+        // and reaches the auth backend. The credentials are bogus, so we
+        // expect a backend/credentials error (network-error /
+        // auth-backend-error / unauthenticated) — crucially NOT
+        // `interactive-input-required` and NOT `internal-error`. Any of
+        // those backend codes proves the piped password traversed the
+        // whole path into `auth_login`.
+        let out = session
+            .cmd()
+            .args(["auth", "login", "agent@example.com", "--password-stdin"])
+            .write_stdin("definitely-the-wrong-password")
+            .output()
+            .expect("spawn auth login --password-stdin");
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if out.status.success() {
+            failures.push(
+                "auth login --password-stdin with bogus creds unexpectedly succeeded".to_string(),
+            );
+        } else {
+            let code = extract_error_code("auth login --password-stdin", &stderr);
+            if code == "interactive-input-required" {
+                failures.push(format!(
+                    "auth login --password-stdin still hit the no-input path \
+                     (flag not honored); stderr={stderr}",
+                ));
+            }
+            if code == "internal-error" {
+                failures.push(format!(
+                    "auth login --password-stdin produced `internal-error` \
+                     (the TTY crash) instead of reaching the backend; stderr={stderr}",
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "non-interactive auth contract failures:\n  - {}",
+            failures.join("\n  - "),
+        );
+    }
+
     /// Hermetic catalog sanity: ensures the allow-list mirrors every
     /// hardcoded code string in `agicash-cli/src/main.rs::classify_*`.
     /// If a worker adds a new variant + maps it to a new code without
@@ -805,5 +903,144 @@ fn contracts_skipped_without_features() {
          cargo test -p agicash-cli \
          --features real-mint-tests,real-supabase-tests,real-opensecret-tests \
          --test contracts"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hermetic non-interactive-auth contract.
+//
+// These run without any network feature flag: the no-TTY-no-flag refusal
+// fires inside `cmd_login`/`cmd_signup` *before* any backend call, so it
+// only needs `build_deps()` to succeed — which just parses stubbed env
+// vars (the same pattern as `help.rs`'s account-list test). This is the
+// P0 regression guard: an agent with no controlling terminal must get a
+// clean, typed, self-correctable error — never the old `internal-error`
+// crash from `rpassword` forcing `/dev/tty` open.
+// ---------------------------------------------------------------------------
+
+/// Stub env so `build_deps()` succeeds without a real backend. A unique
+/// keyring service id keeps the probe from touching a real session.
+fn hermetic_auth_cmd(label: &str) -> assert_cmd::Command {
+    let pid = std::process::id();
+    let mut c = assert_cmd::Command::cargo_bin("agicash").expect("binary `agicash` not built");
+    c.env(
+        "AGICASH_KEYRING_SERVICE",
+        format!("com.agicash.cli.test.{pid}.{label}"),
+    )
+    .env("SUPABASE_URL", "https://test.invalid")
+    .env("SUPABASE_ANON_KEY", "test-anon-key")
+    .env("OPENSECRET_BASE_URL", "https://does-not-resolve.invalid")
+    .env(
+        "OPENSECRET_CLIENT_ID",
+        "00000000-0000-0000-0000-000000000000",
+    );
+    c
+}
+
+/// Pull the JSON error body out of stderr (which may carry leading
+/// `note:` keyring-diagnostic lines on headless Linux CI).
+fn stderr_error_code(stderr: &str) -> serde_json::Value {
+    let json_line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("no JSON error line in stderr: {stderr}"));
+    serde_json::from_str(json_line.trim())
+        .unwrap_or_else(|e| panic!("error line was not valid JSON ({e}): {json_line}"))
+}
+
+/// `auth login` with no `--password-stdin` and no controlling terminal
+/// (`assert_cmd` runs the child with `stdin = /dev/null`) must NOT crash:
+/// it returns the typed `interactive-input-required` error on exit 2.
+#[test]
+fn auth_login_no_tty_no_flag_returns_interactive_input_required() {
+    let out = hermetic_auth_cmd("auth-login-no-tty")
+        .args(["auth", "login", "agent@example.com"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 for interactive-input-required, got {:?}; stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let parsed = stderr_error_code(&stderr);
+    assert_eq!(
+        parsed.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("interactive-input-required"),
+        "expected interactive-input-required, not a crash; got {parsed}",
+    );
+    // The old crash surfaced as `internal-error` — make sure it's gone.
+    assert_ne!(
+        parsed.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("internal-error"),
+        "no-TTY auth still crashes with internal-error: {parsed}",
+    );
+}
+
+/// Same contract for `auth signup` — it must not double-prompt and crash
+/// either; one clean refusal.
+#[test]
+fn auth_signup_no_tty_no_flag_returns_interactive_input_required() {
+    let out = hermetic_auth_cmd("auth-signup-no-tty")
+        .args(["auth", "signup", "agent@example.com"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let parsed = stderr_error_code(&stderr);
+    assert_eq!(
+        parsed.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("interactive-input-required"),
+        "expected interactive-input-required; got {parsed}",
+    );
+}
+
+/// `--password-stdin` makes the password travel on fd 0: the binary
+/// reads the piped line and proceeds PAST the TTY guard into the auth
+/// backend. With a bogus backend URL the failure is a *network* error —
+/// crucially NOT `interactive-input-required` (flag honored) and NOT
+/// `internal-error` (no TTY crash). That distinction proves the piped
+/// password reached `auth_login`.
+#[test]
+fn auth_login_password_stdin_reads_from_fd0_and_reaches_backend() {
+    let out = hermetic_auth_cmd("auth-login-password-stdin")
+        .args(["auth", "login", "agent@example.com", "--password-stdin"])
+        .write_stdin("a-piped-password")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let parsed = stderr_error_code(&stderr);
+    let code = parsed.pointer("/error/code").and_then(|v| v.as_str());
+    assert_ne!(
+        code,
+        Some("interactive-input-required"),
+        "--password-stdin was not honored — still hit the no-input path: {parsed}",
+    );
+    assert_ne!(
+        code,
+        Some("internal-error"),
+        "--password-stdin produced the TTY crash code instead of \
+         reaching the backend: {parsed}",
+    );
+    // Bogus OPENSECRET_BASE_URL → the password path completed and the
+    // backend handshake failed. The exact code is a backend/credentials
+    // class error (`network-error` / `auth-backend-error` /
+    // `unauthenticated`) — any of them proves the piped password
+    // traversed the whole path into `auth_login`.
+    assert!(
+        matches!(
+            code,
+            Some("network-error" | "auth-backend-error" | "unauthenticated")
+        ),
+        "expected a backend-class error (proving the password path \
+         completed), got {parsed}",
     );
 }
