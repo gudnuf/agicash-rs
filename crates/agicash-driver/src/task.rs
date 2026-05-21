@@ -219,6 +219,7 @@ struct Shared {
 }
 
 impl Shared {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn new() -> Self {
         let (mut waker, waker_rx) = async_broadcast::broadcast(1);
         waker.set_overflow(true);
@@ -364,7 +365,12 @@ impl std::fmt::Debug for DriverHandle {
 /// wasm-friendly timer). Wasm `cargo check` of this crate compiles
 /// because the spawn entry-point is gated.
 pub struct ResumptionDriver<S: Sweeper + 'static> {
+    // Lane B is native-only. On wasm32 these fields are held but
+    // unread; Lane C wires the `start()` entry-point that consumes
+    // them.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     sweeper: Arc<S>,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     rx: async_broadcast::Receiver<WalletRealtimeEvent>,
     config: DriverConfig,
     /// Set on the first `start()`; idempotent.
@@ -450,7 +456,10 @@ impl<S: Sweeper + 'static> ResumptionDriver<S> {
 ///
 /// Lane C will call this same `run_task` from the wasm `spawn_local`
 /// path — the *logic* is runtime-agnostic; only the spawn primitive +
-/// the interval timer are cfg-gated.
+/// the interval timer are cfg-gated. Until Lane C wires the wasm
+/// spawn entry-point this function is unused on `wasm32` (the
+/// `start()` method is `cfg(not(target_arch = "wasm32"))`).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 async fn run_task<S: Sweeper + 'static>(
     sweeper: Arc<S>,
     rx: async_broadcast::Receiver<WalletRealtimeEvent>,
@@ -533,6 +542,7 @@ async fn make_fallback_tick(period: Option<Duration>) -> Option<tokio::time::Int
 /// sweep covers all of them. Without this, each event in the queue
 /// would cycle one trip through the loop and produce its own sweep
 /// call.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn drain_realtime_events(
     rx: &mut async_broadcast::Receiver<WalletRealtimeEvent>,
     shared: &Shared,
@@ -563,6 +573,7 @@ fn drain_realtime_events(
 /// `pending` is cleared BEFORE the sweep starts so a trigger arriving
 /// DURING the sweep re-sets it — that becomes the §3 dirty-bit
 /// re-run on the next loop iteration.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 async fn run_one_sweep<S: Sweeper + ?Sized>(sweeper: &S, config: &DriverConfig, shared: &Shared) {
     shared.pending.store(false, Ordering::Release);
     let result = sweeper.sweep(config.retry).await;
@@ -655,6 +666,7 @@ async fn park_for_next_trigger(
 /// Inspect a `WalletRealtimeEvent` and decide whether it should mark
 /// a trigger. Pulled out so tests can drive it directly through a
 /// `(Sender, Receiver)` pair.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn handle_realtime_event(ev: WalletRealtimeEvent, shared: &Shared, connected: &mut bool) {
     match ev {
         WalletRealtimeEvent::Connected => {
@@ -694,6 +706,7 @@ fn handle_realtime_event(ev: WalletRealtimeEvent, shared: &Shared, connected: &m
 /// resumption store but is NOT a driver trigger — the driver only
 /// resolves the four state machines (`send_swap` / `receive_swap` /
 /// `mint_quote` / `melt_quote`).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn is_relevant_event(name: &str) -> bool {
     matches!(
         name,
