@@ -171,11 +171,14 @@ dependencies = [
  "cdk",
  "chrono",
  "futures-util",
+ "js-sys",
  "rust_decimal",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

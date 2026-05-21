@@ -358,19 +358,41 @@ where
     }
 }
 
-// Tiny cfg-split sleep — wasm32 has no `tokio::time::sleep`. Lane A is
-// native-tested; the wasm split is filled in by Lane C, but keeping the
-// fallback here means the `cargo check --target wasm32` step Lane C
-// adds won't have to refactor `retry()`.
+// Tiny cfg-split sleep — wasm32 has no `tokio::time::sleep`.
 #[cfg(not(target_arch = "wasm32"))]
 async fn sleep_for(d: Duration) {
     tokio::time::sleep(d).await;
 }
 
+// Wasm sleep: wraps the JS global `setTimeout` via `js-sys` +
+// `wasm-bindgen-futures`. Same primitive `agicash-realtime` settled
+// on (it deliberately avoids `gloo-timers` — we follow). Duplicate of
+// `task::wasm_sleep_ms`; pulled inline here so `retry()`'s sleep
+// actually sleeps on wasm. ~15 LOC of duplication is cheaper than a
+// pub module item to share across `sweep.rs` and `task.rs`.
 #[cfg(target_arch = "wasm32")]
-async fn sleep_for(_d: Duration) {
-    // Lane C replaces this with `gloo-timers::future::TimeoutFuture`.
-    // For Lane A's native test surface, this branch is never compiled.
+async fn sleep_for(d: Duration) {
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+    let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        if let Some(set_timeout) = set_timeout {
+            let cb = Closure::once_into_js(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+            let _ = set_timeout.call2(
+                &JsValue::NULL,
+                &cb,
+                #[allow(clippy::cast_precision_loss)]
+                &JsValue::from_f64(ms as f64),
+            );
+        } else {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
 /// The receive-swap "id" we surface in the report. The row is keyed in

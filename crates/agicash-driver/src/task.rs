@@ -53,10 +53,26 @@
 //!
 //! The *logic* (subscribe + match + coalesce + retry) is
 //! runtime-agnostic. Only the `spawn` primitive + the `interval`
-//! timer are gated `#[cfg(not(target_arch = "wasm32"))]` — Lane C
-//! swaps in `wasm_bindgen_futures::spawn_local` + a wasm timer.
-//! Wasm builds of this crate compile today (the `task` module's
-//! spawn entry-point is gated; tests are native-only).
+//! timer are cfg-gated.
+//!
+//! - **Native:** `tokio::spawn`, `tokio::time::interval`, types are
+//!   `Send`. The native `start()` is `#[cfg(not(target_arch =
+//!   "wasm32"))]`.
+//! - **Wasm:** `wasm_bindgen_futures::spawn_local`, a `wasm_sleep_ms`
+//!   future that wraps the JS global `setTimeout` via `js-sys` (the
+//!   same primitive `agicash-realtime` uses — we deliberately do NOT
+//!   pull `gloo-timers`). The wasm `start()` is
+//!   `#[cfg(target_arch = "wasm32")]`. The [`Sweeper`] trait's wasm
+//!   arm is `?Send` (see [`SweeperBounds`] below) so the boxed
+//!   sweeper crossing `spawn_local` is `!Send`-friendly — the wasm
+//!   transport stack is already `!Send` (`web_sys::WebSocket`) and
+//!   the realtime `BoxedTransport` follows the same shape.
+//!
+//! The [`DriverHandle`] type is **uniform across native + wasm** —
+//! the *bounds* on the inner `Arc<Shared>` differ per-target (native
+//! `Send + Sync` for `tokio::spawn`; wasm `?Send`), but the public
+//! API is identical so Lane D (FFI) and Lane E (Leptos) consume the
+//! same handle.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -219,7 +235,6 @@ struct Shared {
 }
 
 impl Shared {
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn new() -> Self {
         let (mut waker, waker_rx) = async_broadcast::broadcast(1);
         waker.set_overflow(true);
@@ -360,17 +375,18 @@ impl std::fmt::Debug for DriverHandle {
 ///   call is a no-op and returns the *existing* handle); and
 /// - returns a [`DriverHandle`] for the caller to control the task.
 ///
-/// **Native-only**: the spawn uses `tokio::spawn`. Lane C swaps for
-/// `wasm_bindgen_futures::spawn_local` (and the fallback tick for a
-/// wasm-friendly timer). Wasm `cargo check` of this crate compiles
-/// because the spawn entry-point is gated.
+/// The spawn primitive is cfg-gated:
+/// - native (`#[cfg(not(target_arch = "wasm32"))]`) uses `tokio::spawn`,
+///   producing a `Send + Sync` handle suitable for FFI;
+/// - wasm (`#[cfg(target_arch = "wasm32")]`) uses
+///   `wasm_bindgen_futures::spawn_local` — see [`Self::start`]
+///   (wasm arm) — and the fallback tick uses a `wasm_sleep_ms`-driven
+///   loop instead of `tokio::time::interval`.
+///
+/// The [`DriverHandle`] type is uniform across targets; Lane D (FFI)
+/// and Lane E (Leptos) consume the same handle.
 pub struct ResumptionDriver<S: Sweeper + 'static> {
-    // Lane B is native-only. On wasm32 these fields are held but
-    // unread; Lane C wires the `start()` entry-point that consumes
-    // them.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     sweeper: Arc<S>,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     rx: async_broadcast::Receiver<WalletRealtimeEvent>,
     config: DriverConfig,
     /// Set on the first `start()`; idempotent.
@@ -405,13 +421,14 @@ impl<S: Sweeper + 'static> ResumptionDriver<S> {
         }
     }
 
-    /// Spawn the trigger task. Idempotent: a second call is a no-op
-    /// and returns a *new* handle pointing at the *same* shared
-    /// state. The first `stop()` on any handle is the one that
-    /// counts.
+    /// Spawn the trigger task on native (`tokio::spawn`). Idempotent:
+    /// a second call is a no-op and returns a *new* handle pointing
+    /// at the *same* shared state. The first `stop()` on any handle
+    /// is the one that counts.
     ///
-    /// `#[cfg(not(target_arch = "wasm32"))]` — Lane C provides the
-    /// wasm variant (`spawn_local`).
+    /// The wasm twin (using `wasm_bindgen_futures::spawn_local`) is
+    /// just below — same signature, same idempotency contract, same
+    /// returned [`DriverHandle`] type.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start(&self) -> DriverHandle {
         let mut slot = self
@@ -448,18 +465,66 @@ impl<S: Sweeper + 'static> ResumptionDriver<S> {
         });
         handle
     }
+
+    /// Spawn the trigger task on wasm. Mirrors the native `start()`
+    /// shape exactly — idempotent, returns a fresh handle over the
+    /// same shared state on the second call. The only differences
+    /// are runtime-internal:
+    ///
+    /// - spawn primitive is `wasm_bindgen_futures::spawn_local` (NOT
+    ///   `leptos::task::spawn_local`, which panics before the Executor
+    ///   is set — see `feedback_leptos_spawn_local_gotchas`).
+    /// - the fallback-tick timer is a `wasm_sleep_ms`-driven loop
+    ///   (see [`run_task`] + [`park_for_next_trigger_wasm`]).
+    ///
+    /// The future spawned here is `!Send`-friendly (the [`Sweeper`]
+    /// trait's wasm arm is `?Send`), so a sweeper holding `web_sys`
+    /// values would compile here as well — same `?Send` boundary the
+    /// realtime crate established.
+    #[cfg(target_arch = "wasm32")]
+    pub fn start(&self) -> DriverHandle {
+        let mut slot = self
+            .handle
+            .lock()
+            .expect("ResumptionDriver handle slot poisoned");
+        if let Some(existing) = slot.as_ref() {
+            return DriverHandle {
+                shared: Arc::clone(&existing.shared),
+            };
+        }
+        let shared = Arc::new(Shared::new());
+        let handle = DriverHandle {
+            shared: Arc::clone(&shared),
+        };
+        let rx = self.rx.clone();
+        let sweeper = Arc::clone(&self.sweeper);
+        let config = self.config;
+        let shared_for_task = Arc::clone(&shared);
+
+        // Initial-start trigger BEFORE the spawn so the first poll of
+        // the spawned future sees at least one pending sweep request.
+        shared_for_task.mark(TriggerReason::InitialStart);
+
+        wasm_bindgen_futures::spawn_local(async move {
+            run_task(sweeper, rx, config, shared_for_task).await;
+        });
+
+        *slot = Some(DriverHandle {
+            shared: Arc::clone(&shared),
+        });
+        handle
+    }
 }
 
 /// The actual trigger-task body. Pulled out of `start()` so it can be
 /// driven directly by tests on a `LocalSet` if they want explicit
 /// control over the task lifecycle.
 ///
-/// Lane C will call this same `run_task` from the wasm `spawn_local`
-/// path — the *logic* is runtime-agnostic; only the spawn primitive +
-/// the interval timer are cfg-gated. Until Lane C wires the wasm
-/// spawn entry-point this function is unused on `wasm32` (the
-/// `start()` method is `cfg(not(target_arch = "wasm32"))`).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+/// The *logic* is runtime-agnostic; only the spawn primitive + the
+/// fallback timer / select are cfg-gated. The native path uses
+/// `tokio::time::interval` + `tokio::select!`; the wasm path uses
+/// `wasm_sleep_ms` + `futures_util::future::select` (mirrors
+/// `agicash-realtime::service::serve_with_heartbeat`).
 async fn run_task<S: Sweeper + 'static>(
     sweeper: Arc<S>,
     rx: async_broadcast::Receiver<WalletRealtimeEvent>,
@@ -510,14 +575,14 @@ async fn run_task<S: Sweeper + 'static>(
         )
         .await;
         #[cfg(target_arch = "wasm32")]
-        {
-            // Lane C will replace this with a wasm select primitive.
-            // For now (Lane B is native-only per §7) the task body
-            // is unreachable on wasm — `start()` is cfg-gated and
-            // there is no spawn entry-point.
-            let _ = (&mut rx, &mut waker_rx, &connected);
-            std::future::pending::<()>().await;
-        }
+        park_for_next_trigger_wasm(
+            &mut rx,
+            &mut waker_rx,
+            config.fallback_tick,
+            &shared,
+            &mut connected,
+        )
+        .await;
     }
     tracing::debug!(target: "agicash_driver::task", "trigger task exiting");
 }
@@ -542,7 +607,6 @@ async fn make_fallback_tick(period: Option<Duration>) -> Option<tokio::time::Int
 /// sweep covers all of them. Without this, each event in the queue
 /// would cycle one trip through the loop and produce its own sweep
 /// call.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn drain_realtime_events(
     rx: &mut async_broadcast::Receiver<WalletRealtimeEvent>,
     shared: &Shared,
@@ -573,7 +637,6 @@ fn drain_realtime_events(
 /// `pending` is cleared BEFORE the sweep starts so a trigger arriving
 /// DURING the sweep re-sets it — that becomes the §3 dirty-bit
 /// re-run on the next loop iteration.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 async fn run_one_sweep<S: Sweeper + ?Sized>(sweeper: &S, config: &DriverConfig, shared: &Shared) {
     shared.pending.store(false, Ordering::Release);
     let result = sweeper.sweep(config.retry).await;
@@ -612,6 +675,8 @@ async fn run_one_sweep<S: Sweeper + ?Sized>(sweeper: &S, config: &DriverConfig, 
             // if triggers keep firing.
             #[cfg(not(target_arch = "wasm32"))]
             tokio::time::sleep(config.error_backoff).await;
+            #[cfg(target_arch = "wasm32")]
+            wasm_sleep_ms(duration_to_ms(config.error_backoff)).await;
         }
     }
 }
@@ -663,10 +728,130 @@ async fn park_for_next_trigger(
     }
 }
 
+/// Park on the next of: a waker pulse (stop / foreground), a realtime
+/// event, a fallback tick — the wasm twin of [`park_for_next_trigger`].
+///
+/// Mirrors `agicash-realtime::service::serve_with_heartbeat`'s wasm
+/// arm: a `Tick` enum collapses the result of the futures race so the
+/// borrows used inside the race end *before* we touch shared state by
+/// `&mut` — `futures_util::future::select` does NOT drop the
+/// unselected future the way `tokio::select!` does. The fallback
+/// timer fires in a nested `select` against the waker so a `stop` /
+/// `notify_foreground` pulse pre-empts a long sleep.
+#[cfg(target_arch = "wasm32")]
+async fn park_for_next_trigger_wasm(
+    rx: &mut async_broadcast::Receiver<WalletRealtimeEvent>,
+    waker_rx: &mut async_broadcast::Receiver<()>,
+    fallback: Option<Duration>,
+    shared: &Shared,
+    connected: &mut bool,
+) {
+    use futures_util::future::{select, Either};
+    use futures_util::StreamExt;
+
+    enum Tick {
+        Waker,
+        Event(Option<WalletRealtimeEvent>),
+        FallbackElapsed,
+    }
+
+    // The waker is preferred: a `stop()` or `notify_foreground()`
+    // should win over a stale tick. `select` is not biased, but we
+    // race the waker against (event-vs-tick) so the waker side is
+    // observed at the same level as the merged inner future.
+    let tick = {
+        let waker_fut = std::pin::pin!(waker_rx.next());
+        let event_or_tick = std::pin::pin!(async {
+            let event_fut = std::pin::pin!(rx.next());
+            // The fallback-tick branch: if disabled, park forever.
+            // If enabled, sleep for the configured duration then
+            // resolve `FallbackElapsed`.
+            let tick_fut = std::pin::pin!(async {
+                match fallback {
+                    Some(d) => wasm_sleep_ms(duration_to_ms(d)).await,
+                    None => std::future::pending::<()>().await,
+                }
+            });
+            match select(event_fut, tick_fut).await {
+                Either::Left((ev, _)) => Tick::Event(ev),
+                Either::Right(((), _)) => Tick::FallbackElapsed,
+            }
+        });
+        match select(waker_fut, event_or_tick).await {
+            Either::Left(_) => Tick::Waker,
+            Either::Right((inner, _)) => inner,
+        }
+    };
+
+    match tick {
+        Tick::Waker => {
+            // Loop top will re-check `pending` / `stop`.
+        }
+        Tick::Event(Some(ev)) => handle_realtime_event(ev, shared, connected),
+        Tick::Event(None) => {
+            tracing::debug!(
+                target: "agicash_driver::task",
+                "realtime broadcast closed; driver continues on waker triggers only"
+            );
+        }
+        Tick::FallbackElapsed => {
+            // Same gate as the native `park_for_next_trigger` tick
+            // arm: suppress while Subscribed, suppress while paused.
+            if !*connected && !shared.paused.load(Ordering::Acquire) {
+                shared.mark(TriggerReason::FallbackTick);
+            }
+        }
+    }
+}
+
+/// Convert a `Duration` to whole milliseconds for the wasm timer.
+/// `Duration::as_millis()` is `u128`; the JS `setTimeout` takes a
+/// number we pass as `u64`. Saturate on overflow (a configured period
+/// > `u64::MAX` ms is nonsensical — over 580 million years).
+#[cfg(target_arch = "wasm32")]
+fn duration_to_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Wasm sleep with NO extra dependency: wraps the JS global
+/// `setTimeout` in a `js_sys::Promise` and awaits it via
+/// `wasm-bindgen-futures`. `setTimeout` is resolved off
+/// `js_sys::global()` by reflection so we need neither the `web-sys`
+/// `Window` feature nor `gloo-timers`. This is a deliberate duplicate
+/// (~20 LOC) of `agicash-realtime::service::wasm_sleep_ms`: lane
+/// discipline (plan §7) scopes this change to
+/// `crates/agicash-driver/**`, and a cross-crate helper export is a
+/// larger refactor than the cost of duplication.
+#[cfg(target_arch = "wasm32")]
+async fn wasm_sleep_ms(ms: u64) {
+    use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|v| v.dyn_into::<js_sys::Function>().ok());
+        if let Some(set_timeout) = set_timeout {
+            // Keep the resolver alive until the timer fires.
+            let cb = Closure::once_into_js(move || {
+                let _ = resolve.call0(&JsValue::NULL);
+            });
+            let _ = set_timeout.call2(
+                &JsValue::NULL,
+                &cb,
+                #[allow(clippy::cast_precision_loss)]
+                &JsValue::from_f64(ms as f64),
+            );
+        } else {
+            // No timer host (should not happen in a browser/worker):
+            // resolve immediately so the loop still makes progress.
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 /// Inspect a `WalletRealtimeEvent` and decide whether it should mark
 /// a trigger. Pulled out so tests can drive it directly through a
 /// `(Sender, Receiver)` pair.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn handle_realtime_event(ev: WalletRealtimeEvent, shared: &Shared, connected: &mut bool) {
     match ev {
         WalletRealtimeEvent::Connected => {
@@ -706,7 +891,6 @@ fn handle_realtime_event(ev: WalletRealtimeEvent, shared: &Shared, connected: &m
 /// resumption store but is NOT a driver trigger — the driver only
 /// resolves the four state machines (`send_swap` / `receive_swap` /
 /// `mint_quote` / `melt_quote`).
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn is_relevant_event(name: &str) -> bool {
     matches!(
         name,

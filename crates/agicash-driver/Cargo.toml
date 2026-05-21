@@ -22,6 +22,16 @@ uuid = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["time", "sync", "rt", "macros"] }
 
+# Wasm runtime split (Lane C). We deliberately do NOT pull `gloo-timers` —
+# `agicash-realtime` set the precedent of wrapping the JS global
+# `setTimeout` via `js-sys` + `wasm-bindgen-futures` (its `wasm_sleep_ms`
+# helper). We duplicate that ~20 LOC here rather than expose a helper
+# across crates (lane discipline §7: scope is `crates/agicash-driver/**`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { workspace = true }
+
 [dev-dependencies]
 agicash-domain = { path = "../agicash-domain" }
 agicash-money = { path = "../agicash-money" }
