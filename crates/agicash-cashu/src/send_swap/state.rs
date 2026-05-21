@@ -20,7 +20,15 @@
 //!
 //! Draft ──FailSwap──> SwapFailed ──> Failed (terminal)
 //! Pending ──CompleteSwap──> SwapCompleted ──> Completed (terminal)
+//! Pending ──ReverseSwap──> SwapReversed ──> Reversed (terminal)
 //! ```
+//!
+//! The `Pending → Reversed` transition mirrors TS
+//! `CashuSendSwapService.reverse` — the sender reclaims an unclaimed token
+//! by creating a compensating receive swap. The swap row itself is flipped
+//! to `REVERSED` server-side (the `complete_cashu_receive_swap` Postgres
+//! function does it when the reversing receive swap completes); the
+//! machine records that terminal transition via [`Event::SwapReversed`].
 
 use super::error::SendSwapError;
 use super::types::{CashuSendSwap, CashuSendSwapState};
@@ -83,6 +91,9 @@ pub enum Action {
     CompleteSwap,
     /// DRAFT → FAILED with `reason`.
     FailSwap { reason: String },
+    /// PENDING → REVERSED — the sender reclaims an unclaimed token by
+    /// creating a compensating receive swap over `proofs_to_send`.
+    ReverseSwap,
     /// Terminal — nothing more to do.
     None,
 }
@@ -114,6 +125,10 @@ pub enum Event {
     SwapCompleted(CashuSendSwap),
     /// Storage transitioned DRAFT → FAILED.
     SwapFailed(CashuSendSwap),
+    /// Storage transitioned PENDING → REVERSED — the compensating receive
+    /// swap completed and the `complete_cashu_receive_swap` RPC flipped the
+    /// send-swap row to REVERSED.
+    SwapReversed(CashuSendSwap),
 }
 
 impl SendSwapMachine {
@@ -248,6 +263,10 @@ impl SendSwapMachine {
             }
             (MachineState::Pending(_), Event::SwapCompleted(swap)) => {
                 self.state = MachineState::Completed(swap);
+                Ok(())
+            }
+            (MachineState::Pending(_), Event::SwapReversed(swap)) => {
+                self.state = MachineState::Reversed(swap);
                 Ok(())
             }
             (MachineState::Draft(_), Event::SwapFailed(swap)) => {
@@ -521,6 +540,39 @@ mod tests {
     fn applying_event_to_terminal_state_is_invalid() {
         let mut m = SendSwapMachine::from_existing(completed_swap());
         let err = m.apply(Event::SwapCompleted(completed_swap())).unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn reverse_swap_event_from_pending_transitions_to_reversed() {
+        let mut m = SendSwapMachine::from_existing(pending_swap());
+        m.apply(Event::SwapReversed(reversed_swap())).unwrap();
+        assert!(matches!(m.state(), MachineState::Reversed(_)));
+        assert!(m.is_terminal());
+        assert_eq!(m.next_action(), Action::None);
+    }
+
+    #[test]
+    fn reverse_swap_event_from_draft_is_invalid() {
+        let mut m = SendSwapMachine::from_existing(draft_swap());
+        let err = m.apply(Event::SwapReversed(reversed_swap())).unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn reverse_swap_event_from_completed_is_invalid() {
+        let mut m = SendSwapMachine::from_existing(completed_swap());
+        let err = m.apply(Event::SwapReversed(reversed_swap())).unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn reverse_swap_event_from_reversed_is_invalid() {
+        // The service short-circuits an already-REVERSED swap before
+        // touching the machine; applying the event to a Reversed machine
+        // is still rejected (terminal states accept no events).
+        let mut m = SendSwapMachine::from_existing(reversed_swap());
+        let err = m.apply(Event::SwapReversed(reversed_swap())).unwrap_err();
         assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
     }
 

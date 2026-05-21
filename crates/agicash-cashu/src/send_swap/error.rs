@@ -6,6 +6,7 @@
 
 use super::storage::SendSwapStorageError;
 use crate::dleq::DleqVerificationError;
+use crate::receive_swap::ReceiveSwapError;
 use agicash_traits::CashuProviderError;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +44,12 @@ pub enum SendSwapError {
     /// signature. Mint is malicious or compromised.
     #[error("DLEQ verification failed: {0}")]
     DleqVerificationFailed(#[from] DleqVerificationError),
+
+    /// The compensating receive swap that drives a `reverse()` failed.
+    /// Wraps the receive-side error so the original cause is preserved
+    /// (mirrors TS `reverse()` delegating to `cashuReceiveSwapService`).
+    #[error("reverse failed: {0}")]
+    Reverse(#[from] ReceiveSwapError),
 }
 
 #[cfg(test)]

@@ -341,6 +341,111 @@ impl CashuSendSwapService {
         }
     }
 
+    /// PENDING → REVERSED — reclaim an unclaimed send.
+    ///
+    /// Faithful port of TS `CashuSendSwapService.reverse`. The sender
+    /// retracts a token no recipient has claimed by creating a
+    /// **compensating receive swap** over the swap's `proofs_to_send`,
+    /// tagged with `reversed_transaction_id = swap.transaction_id`. The TS
+    /// version stops there (a separate proof-state subscription drives the
+    /// receive swap to completion); the CLI/facade port is request-response
+    /// with no background subscriber, so this method also drives that
+    /// receive swap to completion — exactly as `receive_cashu_token` does
+    /// (create → complete). When the receive swap completes, the
+    /// `complete_cashu_receive_swap` Postgres function flips THIS send-swap
+    /// row PENDING → REVERSED (and marks its reserved proofs SPENT). We then
+    /// re-load the row so the returned swap reflects the terminal state.
+    ///
+    /// Idempotent on an already-`REVERSED` swap (matches TS's
+    /// `if (swap.state === 'REVERSED') return`). Errors on any non-PENDING
+    /// state, and on a swap that does not belong to `account`.
+    ///
+    /// `receive_swap_service` is passed explicitly rather than held on
+    /// `Self` — TS's `CashuSendSwapService` constructor takes the receive
+    /// service, but the Rust `CashuSendSwapService::new` signature is shared
+    /// with the FFI composition root; threading it as a parameter keeps the
+    /// reverse flow inside this module without a cross-crate ripple. The
+    /// facade already holds both services.
+    pub async fn reverse(
+        &self,
+        swap: &CashuSendSwap,
+        account: &Account,
+        receive_swap_service: &crate::receive_swap::CashuReceiveSwapService,
+        seed: &[u8; 64],
+    ) -> Result<CashuSendSwap, SendSwapError> {
+        // Idempotent terminal short-circuit (TS: `if REVERSED return`).
+        if matches!(swap.state, CashuSendSwapState::Reversed) {
+            return Ok(swap.clone());
+        }
+
+        // Precondition: only a PENDING swap can be reversed (TS throws
+        // `'Swap is not PENDING'` otherwise).
+        let proofs_to_send = match &swap.state {
+            CashuSendSwapState::Pending { proofs_to_send, .. } => proofs_to_send.clone(),
+            other => {
+                return Err(SendSwapError::InvalidTransition {
+                    from: format!("{other:?}"),
+                    event: "reverse".into(),
+                });
+            }
+        };
+
+        // TS: `if (swap.accountId !== account.id) throw`.
+        if swap.account_id != account.id {
+            return Err(SendSwapError::InvalidTransition {
+                from: format!("account {} != swap account {}", account.id, swap.account_id),
+                event: "reverse".into(),
+            });
+        }
+
+        // Drive the machine — Pending is the only state that reaches here.
+        let mut machine = SendSwapMachine::from_existing(swap.clone());
+        let MachineState::Pending(_) = machine.state() else {
+            return Err(SendSwapError::InvalidTransition {
+                from: format!("{:?}", machine.state()),
+                event: "reverse".into(),
+            });
+        };
+
+        // Build a Cashu token over `proofs_to_send` so the receive swap
+        // can claim it back. TS hands `{ mint, proofs, unit }` straight to
+        // `cashuReceiveSwapService.create`; the Rust receive service
+        // consumes a `ParsedToken`, so we encode + parse here. The encoded
+        // string is the same wire form the sender originally produced.
+        let mint_url_str = account_mint_url(account)?;
+        let mint_url = MintUrl::from_str(&mint_url_str)
+            .map_err(|e| SendSwapError::Mint(CashuProviderError::InvalidUrl(e.to_string())))?;
+        let cdk_proofs = proofs_to_send
+            .iter()
+            .map(token_proof_to_cdk_proof)
+            .collect::<Result<Vec<_>, _>>()?;
+        let unit = cashu_unit_for_currency(account.currency);
+        let token = Token::new(mint_url, cdk_proofs, None, unit);
+        let parsed =
+            crate::receive_swap::ParsedToken::parse(&token.to_string(), &self.cashu_provider)
+                .await?;
+
+        // Compensating receive swap, tagged with the send transaction id —
+        // this is what makes `complete_cashu_receive_swap` reverse the send
+        // swap server-side (TS: `reversedTransactionId: swap.transactionId`).
+        let created = receive_swap_service
+            .create(swap.user_id, &parsed, account, Some(swap.transaction_id))
+            .await?;
+
+        // Drive the receive swap to completion. The DB's
+        // `complete_cashu_receive_swap` flips THIS send-swap row to REVERSED
+        // and marks its reserved proofs SPENT as part of that same call.
+        receive_swap_service
+            .complete_swap(&created.account, created.swap, seed)
+            .await?;
+
+        // Re-load the send-swap row to observe the server-applied REVERSED
+        // transition, then record it on the machine.
+        let reversed = self.storage.get(swap.id).await?;
+        machine.apply(Event::SwapReversed(reversed.clone()))?;
+        Ok(reversed)
+    }
+
     /// Mirror TS `prepareProofsAndFee` — sender-pays-fee branch.
     ///
     /// Two-pass selection:
@@ -1045,6 +1150,76 @@ mod tests {
         CashuSendSwapService::new(storage, provider)
     }
 
+    /// Receive-swap storage that should never be reached — the `reverse()`
+    /// precondition tests bail out before any receive-swap I/O.
+    struct UnusedReceiveStorage;
+
+    #[async_trait]
+    impl crate::receive_swap::CashuReceiveSwapStorage for UnusedReceiveStorage {
+        async fn create(
+            &self,
+            _input: crate::receive_swap::CreateReceiveSwap,
+        ) -> Result<
+            crate::receive_swap::CreateReceiveSwapResult,
+            crate::receive_swap::ReceiveSwapStorageError,
+        > {
+            unreachable!()
+        }
+        async fn complete(
+            &self,
+            _token_hash: &str,
+            _user_id: UserId,
+            _proofs: Vec<TokenProof>,
+        ) -> Result<
+            crate::receive_swap::CompleteReceiveSwapResult,
+            crate::receive_swap::ReceiveSwapStorageError,
+        > {
+            unreachable!()
+        }
+        async fn fail(
+            &self,
+            _token_hash: &str,
+            _user_id: UserId,
+            _reason: &str,
+        ) -> Result<
+            crate::receive_swap::CashuReceiveSwap,
+            crate::receive_swap::ReceiveSwapStorageError,
+        > {
+            unreachable!()
+        }
+        async fn list_pending_for_user(
+            &self,
+            _user_id: UserId,
+        ) -> Result<
+            Vec<crate::receive_swap::CashuReceiveSwap>,
+            crate::receive_swap::ReceiveSwapStorageError,
+        > {
+            unreachable!()
+        }
+    }
+
+    /// A `CashuReceiveSwapService` whose deps panic if touched — valid to
+    /// pass to `reverse()` for the cases that short-circuit before any
+    /// receive-swap work (idempotent-REVERSED, bad-state, wrong-account).
+    fn unused_receive_service() -> crate::receive_swap::CashuReceiveSwapService {
+        let storage: Arc<dyn crate::receive_swap::CashuReceiveSwapStorage> =
+            Arc::new(UnusedReceiveStorage);
+        let provider: Arc<dyn CashuProvider> = Arc::new(UnusedProvider);
+        crate::receive_swap::CashuReceiveSwapService::new(storage, provider)
+    }
+
+    /// Build a PENDING send swap whose `account_id` is `account.id`.
+    fn pending_swap_for(account: &Account) -> CashuSendSwap {
+        let mut s = stub_swap();
+        s.account_id = account.id;
+        s.user_id = account.user_id;
+        s.state = CashuSendSwapState::Pending {
+            token_hash: "h".into(),
+            proofs_to_send: vec![proof_with_id(60, "ks1").proof],
+        };
+        s
+    }
+
     #[tokio::test]
     async fn get_quote_rejects_currency_mismatch() {
         let svc = make_service();
@@ -1216,6 +1391,82 @@ mod tests {
         assert!(matches!(out.state, CashuSendSwapState::Failed { .. }));
         let recorded = recording.failed.lock().clone();
         assert_eq!(recorded, Some((draft.id, "user aborted".to_string())));
+    }
+
+    #[tokio::test]
+    async fn reverse_no_op_on_already_reversed() {
+        let svc = make_service();
+        let account = stub_account(Currency::Btc, "https://m");
+        let mut swap = pending_swap_for(&account);
+        swap.state = CashuSendSwapState::Reversed;
+        let seed = [0u8; 64];
+        let out = svc
+            .reverse(&swap, &account, &unused_receive_service(), &seed)
+            .await
+            .unwrap();
+        assert!(matches!(out.state, CashuSendSwapState::Reversed));
+    }
+
+    #[tokio::test]
+    async fn reverse_errors_on_draft() {
+        let svc = make_service();
+        let account = stub_account(Currency::Btc, "https://m");
+        let mut swap = pending_swap_for(&account);
+        swap.state = CashuSendSwapState::Draft;
+        let seed = [0u8; 64];
+        let err = svc
+            .reverse(&swap, &account, &unused_receive_service(), &seed)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[tokio::test]
+    async fn reverse_errors_on_completed() {
+        let svc = make_service();
+        let account = stub_account(Currency::Btc, "https://m");
+        let mut swap = pending_swap_for(&account);
+        swap.state = CashuSendSwapState::Completed {
+            token_hash: "h".into(),
+            proofs_to_send: vec![],
+        };
+        let seed = [0u8; 64];
+        let err = svc
+            .reverse(&swap, &account, &unused_receive_service(), &seed)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[tokio::test]
+    async fn reverse_errors_on_failed() {
+        let svc = make_service();
+        let account = stub_account(Currency::Btc, "https://m");
+        let mut swap = pending_swap_for(&account);
+        swap.state = CashuSendSwapState::Failed {
+            failure_reason: "x".into(),
+        };
+        let seed = [0u8; 64];
+        let err = svc
+            .reverse(&swap, &account, &unused_receive_service(), &seed)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
+    }
+
+    #[tokio::test]
+    async fn reverse_errors_when_swap_belongs_to_other_account() {
+        let svc = make_service();
+        let account = stub_account(Currency::Btc, "https://m");
+        // PENDING swap, but its account_id points elsewhere.
+        let mut swap = pending_swap_for(&account);
+        swap.account_id = AccountId::new();
+        let seed = [0u8; 64];
+        let err = svc
+            .reverse(&swap, &account, &unused_receive_service(), &seed)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendSwapError::InvalidTransition { .. }));
     }
 
     #[test]
