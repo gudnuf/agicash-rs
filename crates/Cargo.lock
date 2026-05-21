@@ -433,6 +433,7 @@ dependencies = [
  "agicash-auth-opensecret",
  "agicash-cashu",
  "agicash-domain",
+ "agicash-driver",
  "agicash-money",
  "agicash-realtime",
  "agicash-storage-supabase",

@@ -211,6 +211,24 @@ pub struct WalletData {
         RwSignal<Option<std::sync::Arc<agicash_realtime::WalletRealtimeService>>, LocalStorage>,
     #[cfg(not(target_arch = "wasm32"))]
     pub realtime_service: RwSignal<Option<()>, LocalStorage>,
+    /// Tracked handle to the running [`agicash_driver::ResumptionDriver`]
+    /// trigger task (plan 2026-05-21 §7 Lane E). Same `LocalStorage`
+    /// shape as [`Self::realtime_service`] for the same reason: the wasm
+    /// driver task holds the `Arc<WalletClient>` (whose storage layer
+    /// holds non-`Send` `web_sys::Headers` / `Fetch` handles), so the
+    /// handle is pinned to the JS main thread where it was constructed.
+    ///
+    /// The handle is the React `useProcessXTasks` analog: it exposes
+    /// `.stop()` (sign-out teardown) and `.notify_foreground()`
+    /// (`visibilitychange` / `online` edges — see
+    /// [`wire_dom_lifecycle`]). `None` until the realtime pump finishes
+    /// wiring (the async session-load + wallet-client build can fail),
+    /// or after `.stop()` clears it. Native rlib build is `Option<()>`
+    /// to keep the `Clone + Debug` shape uniform across cfg.
+    #[cfg(target_arch = "wasm32")]
+    pub driver_handle: RwSignal<Option<std::sync::Arc<agicash_driver::DriverHandle>>, LocalStorage>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub driver_handle: RwSignal<Option<()>, LocalStorage>,
     /// Idempotency latch for [`WalletData::start_realtime`]. The
     /// realtime subscription + pump are wired into the page lifetime
     /// exactly once; a Home remount (client-side nav back to `/`) must
@@ -233,6 +251,10 @@ impl WalletData {
             // wasm transport handles inside `WalletRealtimeService`.
             // See the struct field doc.
             realtime_service: RwSignal::new_local(None),
+            // Thread-pinned for the same reason as `realtime_service`:
+            // the driver handle indirectly holds the `Arc<WalletClient>`
+            // whose wasm storage stack is `!Send` (`web_sys` handles).
+            driver_handle: RwSignal::new_local(None),
             reactivity_wired: RwSignal::new(false),
         }
     }
@@ -254,6 +276,22 @@ impl WalletData {
         if let Some(service) = self.realtime_service.get_untracked() {
             service.stop();
         }
+        // Resumption driver (plan 2026-05-21 §7 Lane E): mirror the
+        // realtime teardown — `.stop()` is idempotent (atomic-store +
+        // 1-pulse wake on the trigger task's internal waker), so calling
+        // it when the driver never started is a no-op. The trigger task
+        // observes the flag at its next loop tick and exits; the
+        // in-flight sweep (if any) runs to completion. Stop the driver
+        // BEFORE clearing the realtime service so any final
+        // `Connected` / `Event` the supervisor flushes on close still
+        // races a stopped driver (the driver is the one observing the
+        // broadcast for triggers — the realtime service close emits a
+        // `StatusChanged(Closed)`, which is a no-op trigger anyway).
+        #[cfg(target_arch = "wasm32")]
+        if let Some(handle) = self.driver_handle.get_untracked() {
+            handle.stop();
+        }
+        self.driver_handle.set(None);
         self.realtime_service.set(None);
         self.realtime_status.set(RealtimeStatus::Idle);
         self.reactivity_wired.set(false);
@@ -586,6 +624,16 @@ impl WalletData {
     // the `realtime_service` field both require; `Rc` would mean
     // changing that crate's API surface, out of scope for lint cleanup.
     #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+    // Wiring the realtime pump + the resumption driver alongside it
+    // is fundamentally sequential (session-load → opensecret client →
+    // realtime service → driver wallet client → driver task + pump +
+    // DOM listeners). Splitting this into helpers would mean threading
+    // half a dozen `Arc`s + the captured `AppConfig` through fn
+    // boundaries with no real readability win — every step has its own
+    // commentary block. Lint is also tripped on the native rlib build
+    // (the whole body is `cfg(target_arch="wasm32")` so the
+    // line-counter still sees the source span); allow unconditionally.
+    #[allow(clippy::too_many_lines)]
     pub fn start_realtime(&self, config: Option<AppConfig>) {
         // Flip the latch once. If it was already set, another mount
         // already wired the subscription — bail without stacking a
@@ -685,6 +733,60 @@ impl WalletData {
                 // lifetime instead of being orphaned in a detached task.
                 wallet.realtime_service.set(Some(Arc::clone(&service)));
 
+                // Resumption driver wiring (plan 2026-05-21 §7 Lane E).
+                //
+                // Build a session-seeded `Arc<WalletClient>` — same
+                // composition root `fetch_pending_state` uses — and
+                // hand it to `WalletClientSweeper`, which the driver
+                // calls into to advance every unresolved
+                // send_swap/receive_swap/mint_quote/melt_quote row.
+                //
+                // The driver subscribes to a SECOND receiver off the
+                // SAME realtime service (`async-broadcast` allows N
+                // independent receivers; the existing pump above
+                // already used one). On every Connected / relevant
+                // Event the driver runs a coalesced sweep — the React
+                // `useProcessXTasks` analog. The driver handle is
+                // stored alongside the realtime service handle so the
+                // sign-out path can `.stop()` both.
+                //
+                // A WalletClient build failure is non-fatal: the
+                // realtime pump (above) and the existing background
+                // `refresh_pending_state` still run; the user just
+                // loses recoverability for this session. Log + carry
+                // on so the page is never blocked by a driver-init
+                // hiccup.
+                let driver_started = match build_driver_wallet_client(&config, uid).await {
+                    Ok(wallet_client) => {
+                        use agicash_driver::{DriverConfig, ResumptionDriver, WalletClientSweeper};
+                        let sweeper = Arc::new(WalletClientSweeper::new(wallet_client));
+                        // Second receiver: independent of the pump's
+                        // `subscribe()` above. Each consumer sees every
+                        // event from the moment it clones; the burst-
+                        // coalescing latch inside the driver handles
+                        // the in-flight + dirty-bit shape.
+                        let rx = service.subscribe();
+                        let driver = ResumptionDriver::new(sweeper, rx, DriverConfig::default());
+                        // `.start()` is idempotent — a second call on
+                        // the same `ResumptionDriver` returns a fresh
+                        // handle over the SAME shared state. Our
+                        // `reactivity_wired` latch guards this whole
+                        // block anyway, so a re-mount cannot stack a
+                        // second driver task.
+                        let handle = Arc::new(driver.start());
+                        wallet.driver_handle.set(Some(Arc::clone(&handle)));
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        leptos::logging::log!(
+                            "start_realtime: resumption driver disabled — \
+                             WalletClient build failed (recoverability degraded \
+                             for this session, realtime still active): {e}"
+                        );
+                        None
+                    }
+                };
+
                 // Pump: on every Connected (no replay → catch up) and
                 // every broadcast Event, refetch in background/SWR mode
                 // — keep the last balance, never flash the spinner, and
@@ -749,7 +851,19 @@ impl WalletData {
                 // observers via the FFI; on the web the equivalents
                 // are window-level events. The service handle is held
                 // by the closures via `Arc` so they outlive the spawn.
-                wire_dom_lifecycle(&service);
+                //
+                // The driver handle (if it constructed) rides along the
+                // SAME listeners (plan 2026-05-21 §7 Lane E): the
+                // `online` + `visibilitychange → visible` edges call
+                // `driver.notify_foreground()` alongside the existing
+                // `service.set_online(true)` / `set_active(true)` —
+                // the React `refetchOnWindowFocus` analog, on the same
+                // edge the focus listener already fires. The
+                // `offline` + `visibilitychange → hidden` edges do
+                // NOT notify the driver (those are NOT foreground
+                // signals; the driver pauses on `Unauthenticated`,
+                // not on background — see `task.rs` header).
+                wire_dom_lifecycle(&service, driver_started.as_ref());
 
                 // Drive the connect→join→serve→reconnect supervisor for
                 // the page's lifetime. `run()` borrows `&self`; the
@@ -777,7 +891,10 @@ impl WalletData {
 /// swap + 1-msg broadcast), so a redundant dispatch from a no-op
 /// transition is a non-issue.
 #[cfg(target_arch = "wasm32")]
-fn wire_dom_lifecycle(service: &std::sync::Arc<agicash_realtime::WalletRealtimeService>) {
+fn wire_dom_lifecycle(
+    service: &std::sync::Arc<agicash_realtime::WalletRealtimeService>,
+    driver: Option<&std::sync::Arc<agicash_driver::DriverHandle>>,
+) {
     use wasm_bindgen::{closure::Closure, JsCast};
 
     let Some(window) = web_sys::window() else {
@@ -787,11 +904,18 @@ fn wire_dom_lifecycle(service: &std::sync::Arc<agicash_realtime::WalletRealtimeS
         return;
     };
 
-    // `online` / `offline`
+    // `online` / `offline`. The `online` edge is a foreground signal
+    // for the driver — the React `refetchOnWindowFocus` analog
+    // (plan 2026-05-21 §7 Lane E). `offline` is NOT a foreground
+    // signal; the driver only resumes on actual focus / reconnect.
     {
         let service_on = service.clone();
+        let driver_on = driver.cloned();
         let online_cb = Closure::<dyn FnMut()>::new(move || {
             service_on.set_online(true);
+            if let Some(d) = driver_on.as_ref() {
+                d.notify_foreground();
+            }
         });
         let _ =
             window.add_event_listener_with_callback("online", online_cb.as_ref().unchecked_ref());
@@ -807,7 +931,9 @@ fn wire_dom_lifecycle(service: &std::sync::Arc<agicash_realtime::WalletRealtimeS
         offline_cb.forget();
     }
     // Apply the initial reachability state once so the supervisor doesn't
-    // sit on a stale `true` after the page loads offline.
+    // sit on a stale `true` after the page loads offline. (Initial
+    // `notify_foreground` is unnecessary: the driver's `start()`
+    // already marks an `InitialStart` trigger before the spawn.)
     if let Ok(online) = web_sys::js_sys::Reflect::get(
         &window.navigator(),
         &wasm_bindgen::JsValue::from_str("onLine"),
@@ -819,13 +945,21 @@ fn wire_dom_lifecycle(service: &std::sync::Arc<agicash_realtime::WalletRealtimeS
 
     // `visibilitychange` — drives `set_active`. The document's
     // `visibilityState` is the truth (string `"visible"` vs `"hidden"`);
-    // a focus change alone doesn't fire this.
+    // a focus change alone doesn't fire this. Only the
+    // `visible` edge is a driver foreground signal — `hidden` is the
+    // background edge, not a wake-up.
     if let Some(document) = window.document() {
         let service_vis = service.clone();
+        let driver_vis = driver.cloned();
         let doc_for_cb = document.clone();
         let vis_cb = Closure::<dyn FnMut()>::new(move || {
             let visible = doc_for_cb.visibility_state() == web_sys::VisibilityState::Visible;
             service_vis.set_active(visible);
+            if visible {
+                if let Some(d) = driver_vis.as_ref() {
+                    d.notify_foreground();
+                }
+            }
         });
         let _ = document
             .add_event_listener_with_callback("visibilitychange", vis_cb.as_ref().unchecked_ref());
@@ -1099,6 +1233,69 @@ fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
         S::Reversed => "REVERSED",
     }
     .to_string()
+}
+
+/// Build a session-seeded `Arc<WalletClient>` for the resumption driver
+/// (plan 2026-05-21 §7 Lane E).
+///
+/// Same composition root [`fetch_pending_state`] uses
+/// (`WalletClient::from_config` + `set_session` with the browser-
+/// persisted refresh token), but the `Arc` is kept long-lived: it is
+/// handed to `WalletClientSweeper::new`, which the driver task holds
+/// for its whole lifetime so every sweep reuses the same auth /
+/// storage stack instead of rebuilding it. `from_config` does NO
+/// network I/O at construction (verified by the `from_config_constructs_without_network`
+/// unit test in `crates/agicash-wallet/src/builder.rs`); `set_session`
+/// is the one async step (handshake + refresh exchange).
+///
+/// Caller invariants: must be called inside the same `spawn_local`
+/// future that built the realtime service — already passed
+/// `AppConfig` captured before the spawn — so this fn does not need
+/// to touch `use_context`. A failure here is non-fatal (logged and
+/// the driver is simply skipped this session); the realtime pump and
+/// the existing background `refresh_pending_state` continue to run.
+#[cfg(target_arch = "wasm32")]
+async fn build_driver_wallet_client(
+    config: &AppConfig,
+    user_id: Uuid,
+) -> Result<std::sync::Arc<agicash_wallet::WalletClient>, String> {
+    use agicash_traits::SessionStorage;
+    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
+
+    if config.supabase_anon_key.is_empty() {
+        return Err("Supabase anon key missing — driver wallet client skipped".to_string());
+    }
+
+    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
+        opensecret_url: config.opensecret_base_url.clone(),
+        opensecret_client_id: config.opensecret_client_id,
+        supabase_url: config.supabase_url.clone(),
+        supabase_anon_key: config.supabase_anon_key.clone(),
+        session_storage: SessionStorageChoice::InMemory,
+    })
+    .map_err(|e| format!("build wallet client: {e}"))?;
+
+    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
+        .load()
+        .await
+    {
+        Ok(Some(s)) => s.refresh_token,
+        Ok(None) => {
+            return Err(
+                "no persisted session — refresh token unavailable (please log in again)".into(),
+            )
+        }
+        Err(e) => return Err(format!("session load failed: {e}")),
+    };
+    wallet
+        .set_session(Session {
+            user_id: agicash_domain::UserId::from(user_id),
+            refresh_token,
+        })
+        .await
+        .map_err(|e| format!("seed wallet session: {e}"))?;
+
+    Ok(wallet)
 }
 
 /// Realtime-(re)connect catch-up: fetch the signed-in user's full

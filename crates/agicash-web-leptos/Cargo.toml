@@ -81,6 +81,18 @@ agicash-wallet = { path = "../agicash-wallet" }
 # (no FFI) — it drives the balance refresh, replacing the deleted
 # `start_visibility_refresh` visibilitychange/focus/poll Tier-1 hack.
 agicash-realtime = { path = "../agicash-realtime" }
+# Resumption driver (plan 2026-05-21 §7 Lane E). Linked directly the
+# same way `agicash-realtime` is — the driver crate itself is wasm-clean
+# (its tokio dep is `cfg(not(target_arch = "wasm32"))` and the wasm
+# spawn primitive is `wasm_bindgen_futures::spawn_local`, matching the
+# `feedback_leptos_spawn_local_gotchas` rule). The driver re-fires the
+# four `useProcessXTasks`-equivalent service methods on every unresolved
+# row whenever realtime (re)connects or a foreground edge fires, giving
+# the browser wallet recoverability for stuck `send_swap` / `melt_quote`
+# / `receive_swap` / `mint_quote` rows. The actual driver wiring lives
+# under `cfg(target_arch = "wasm32")` in `wallet_context.rs`; the native
+# rlib build links the crate but never spawns the task.
+agicash-driver = { path = "../agicash-driver" }
 
 # Browser-side runtime deps. Always-on now that ssr is gone — the
 # `target_arch = "wasm32"` cfg in `lib.rs::hydrate` keeps the native
