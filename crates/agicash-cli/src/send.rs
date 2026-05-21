@@ -27,12 +27,21 @@ pub enum SendCmdError {
     AccountAmbiguous,
     #[error("invalid account id: {0}")]
     InvalidAccountId(String),
+    #[error("invalid swap id: {0}")]
+    InvalidSwapId(String),
     #[error("token encode error: {0}")]
     TokenEncode(String),
     #[error("insufficient balance: {0}")]
     InsufficientBalance(String),
     #[error("send failed: {0}")]
     Send(String),
+    /// The swap is not in a reversible (PENDING) state — already claimed,
+    /// failed, or still a draft.
+    #[error("swap not reversible: {0}")]
+    SwapNotReversible(String),
+    /// No send swap exists with the supplied id.
+    #[error("no send swap with id {0}")]
+    SwapNotFound(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -74,6 +83,7 @@ fn map_err(e: WalletError) -> SendCmdError {
         WalletError::Validation { code, message } => match code.as_str() {
             "no_account" => SendCmdError::NoMatchingAccount,
             "ambiguous_account" => SendCmdError::AccountAmbiguous,
+            "swap_not_reversible" => SendCmdError::SwapNotReversible(message),
             _ => SendCmdError::Send(message),
         },
         WalletError::NotFound(_) => SendCmdError::NoMatchingAccount,
@@ -178,4 +188,47 @@ fn parse_account(requested: Option<&str>) -> Result<Option<AccountId>, SendCmdEr
             Ok(Some(AccountId::from(id)))
         }
     }
+}
+
+#[derive(Serialize)]
+struct ReverseOutput<'a> {
+    status: &'a str,
+    swap_id: String,
+    account_id: String,
+    amount: String,
+    unit: String,
+    currency: String,
+}
+
+/// `agicash send reverse <SWAP_ID>` — reclaim an unclaimed token send.
+///
+/// Maps `WalletError::NotFound` to its own `SwapNotFound` (exit 4) rather
+/// than the shared `map_err`'s `NoMatchingAccount` collapse — for this
+/// command a missing id is a missing *swap*, not a missing account.
+pub async fn cmd_send_reverse(deps: &CliDeps, swap_id: String) -> Result<(), SendCmdError> {
+    let id = Uuid::parse_str(&swap_id).map_err(|_| SendCmdError::InvalidSwapId(swap_id.clone()))?;
+
+    let receipt = deps
+        .wallet
+        .reverse_send_swap(id)
+        .await
+        .map_err(|e| match e {
+            WalletError::NotFound(_) => SendCmdError::SwapNotFound(swap_id.clone()),
+            other => map_err(other),
+        })?;
+
+    let status = match receipt.status {
+        agicash_wallet::ReverseSendStatus::Reversed => "reversed",
+        agicash_wallet::ReverseSendStatus::AlreadyReversed => "already-reversed",
+    };
+    let body = ReverseOutput {
+        status,
+        swap_id: receipt.swap_id.to_string(),
+        account_id: receipt.account_id.to_string(),
+        amount: receipt.amount.amount().to_string(),
+        unit: receipt.amount.unit().to_string(),
+        currency: receipt.amount.currency().to_string(),
+    };
+    println!("{}", serde_json::to_string(&body).expect("serialize JSON"));
+    Ok(())
 }

@@ -109,6 +109,10 @@ mod gated {
         "token-encode-error",
         "insufficient-balance",
         "amount-too-small",
+        // --- classify_error: send reverse (reclaim an unclaimed send) ---
+        "invalid-swap-id",
+        "swap-not-reversible",
+        "swap-not-found",
         // --- classify_error: lightning receive ---
         "invalid-quote-id",
         "quote-not-paid",

@@ -136,9 +136,16 @@ fn classify_error(e: &(dyn std::error::Error + 'static)) -> (&'static str, i32) 
             SendCmdError::NoMatchingAccount => ("no-matching-account", 1),
             SendCmdError::AccountAmbiguous => ("account-ambiguous", 1),
             SendCmdError::InvalidAccountId(_) => ("invalid-account-id", 1),
+            // A malformed swap id is a bad argument the caller can fix and
+            // re-invoke — exit 2, consistent with the `send reverse` help.
+            SendCmdError::InvalidSwapId(_) => ("invalid-swap-id", 2),
             SendCmdError::TokenEncode(_) => ("token-encode-error", 1),
             SendCmdError::InsufficientBalance(_) => ("insufficient-balance", 1),
             SendCmdError::Send(_) => ("mint-error", 1),
+            // The swap exists but is not PENDING — already claimed/failed.
+            SendCmdError::SwapNotReversible(_) => ("swap-not-reversible", 1),
+            // No swap row with that id — a missing resource (exit 4).
+            SendCmdError::SwapNotFound(_) => ("swap-not-found", 4),
             SendCmdError::Storage(inner) => (classify_storage(inner), 1),
             SendCmdError::Auth(inner) => classify_auth(inner),
         };
@@ -377,6 +384,9 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &deps, address, amount, account, comment, dry_run, no_wait, poll_ms, timeout_s,
                 )
                 .await?;
+            }
+            SendCommand::Reverse { swap_id } => {
+                send::cmd_send_reverse(&deps, swap_id).await?;
             }
         },
         None => {}

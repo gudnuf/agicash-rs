@@ -282,6 +282,7 @@ const LEAF_COMMANDS: &[&[&str]] = &[
     &["send", "lightning"],
     &["send", "lightning-complete"],
     &["send", "lightning-address"],
+    &["send", "reverse"],
 ];
 
 /// Top-level `--help` carries the orientation banner: output contract,
@@ -432,6 +433,39 @@ fn value_enum_args_show_possible_values() {
     assert!(
         mint.contains("Possible values:") && mint.contains("BTC:") && mint.contains("USD:"),
         "mint add --help does not list currency possible values:\n{mint}",
+    );
+}
+
+/// `send reverse` is the reclaim-an-unclaimed-send leaf. Its help must
+/// follow the 5-part house template, document the `swap_id` argument, and
+/// describe the idempotent `already-reversed` outcome + the not-reversible
+/// failure. (The generic template/blank-help checks cover it via
+/// `LEAF_COMMANDS`; this pins the reverse-specific content.)
+#[test]
+fn send_reverse_help_documents_reclaim_flow() {
+    let text = help_text(&["send", "reverse", "--help"]);
+    // Argument is documented.
+    assert!(
+        text.contains("swap_id") || text.contains("SWAP_ID"),
+        "send reverse --help must document the swap id argument:\n{text}",
+    );
+    // Idempotency surfaced.
+    assert!(
+        text.contains("already-reversed"),
+        "send reverse --help must mention the idempotent already-reversed \
+         outcome:\n{text}",
+    );
+    // The 5-part template blocks.
+    for marker in ["EXAMPLE", "EXIT CODES", "SEE ALSO"] {
+        assert!(
+            text.contains(marker),
+            "send reverse --help missing `{marker}` block:\n{text}",
+        );
+    }
+    // Exit-code 4 (no swap with that id) is documented.
+    assert!(
+        text.contains("4  no swap with that id"),
+        "send reverse --help must document the exit-4 not-found code:\n{text}",
     );
 }
 

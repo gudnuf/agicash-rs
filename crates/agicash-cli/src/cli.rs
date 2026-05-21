@@ -302,6 +302,31 @@ EXIT CODES\n  0  success (incl. `failed`/`timed-out` outcomes)\n  \
         #[arg(long, default_value_t = 300)]
         timeout_s: u64,
     },
+    /// Reclaim an unclaimed Cashu token send (reverse the swap).
+    #[command(
+        long_about = "Reclaim an unclaimed Cashu token send by its swap id — \
+reverse a PENDING send-swap whose token no recipient has claimed, returning \
+the funds to the originating account. The reversal swaps the unclaimed proofs \
+back via a compensating receive (NUT-03); once it settles the send-swap row \
+moves PENDING → REVERSED. Idempotent: re-reversing an already-reversed swap \
+reports `already-reversed`. A send the recipient has already claimed cannot be \
+reversed.",
+        after_long_help = "EXAMPLE\n  $ agicash send reverse \
+11111111-2222-3333-4444-555555555555\n  \
+{\"status\":\"reversed\",\"swap_id\":\"…\",\"account_id\":\"…\",\"amount\":\"100\",\
+\"unit\":\"sat\",\"currency\":\"BTC\"}\n\n  \
+status  `reversed` (funds reclaimed) or `already-reversed` (idempotent re-run).\n  \
+amount  the amount returned to the account, in `unit`.\n\n\
+EXIT CODES\n  0  success (incl. `already-reversed`)\n  \
+1  swap not reversible (already claimed/failed), mint or storage error\n  \
+2  bad arguments (e.g. malformed swap id)\n  3  not authenticated\n  \
+4  no swap with that id\n\n\
+SEE ALSO\n  agicash send token, agicash balance"
+    )]
+    Reverse {
+        /// The send-swap id (UUID) returned by `send token` as `swap_id`.
+        swap_id: String,
+    },
 }
 
 #[derive(clap::Args, Debug)]
