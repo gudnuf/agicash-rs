@@ -63,43 +63,32 @@ pub fn HomePage() -> impl IntoView {
     let wallet = expect_context::<WalletData>();
 
     // Resolve `AppConfig` ONCE here, in the component body — a valid
-    // Leptos reactive owner where `use_context` works. The realtime
-    // event pump runs in a detached `spawn_local` future (see
-    // `WalletData::start_realtime`) which has no owner, so it cannot
-    // read the context itself (it returns `None` → the "AppConfig
-    // context missing" load error). We capture the concrete value here
-    // and hand it down so the detached refresh path carries its own
-    // clone.
+    // Leptos reactive owner where `use_context` works. The pumps wired
+    // by `WalletData::start` run in detached `spawn_local` futures
+    // (no owner) and can never read context themselves; we capture the
+    // concrete value here and hand it in so every detached path carries
+    // its own clone.
     let app_config = use_context::<AppConfig>();
 
-    // Kick off the refresh on mount. Effect (not memo / resource) so it
-    // runs exactly once post-hydration and the spawned future drives the
-    // signal transitions. `clone` because closures need to own a copy
-    // and the retry handler below needs another.
+    // Kick off the wallet bring-up on mount. Effect (not memo /
+    // resource) so it runs exactly once post-hydration and the spawned
+    // futures drive the signal transitions.
     //
-    // The same Effect installs the realtime reactivity source (a single
-    // Supabase-Realtime subscription via the all-Rust `agicash-realtime`
-    // crate) so the balance tracks out-of-band receives the way the web
-    // canonical model does — see `WalletData::start_realtime` for the
-    // mechanism and
-    // `~/athanor/projects/agicash-rust/research/2026-05-18-balance-tracking-parity.md`
-    // for the cross-platform diagnosis. This replaces the deleted
-    // `visibilitychange` / `focus` / 4s-poll Tier-1 hack. The call is
-    // idempotent: a client-side nav back to `/` re-runs this Effect but
-    // the subscription is constructed exactly once for the page's
-    // lifetime.
+    // `WalletData::start` is the single entry point post cache-consumer
+    // migration (2026-05-22): it builds the session-seeded
+    // `Arc<WalletClient>`, kicks off a foreground populate of every
+    // cache-backed signal, wires the realtime service + resumption
+    // driver, and spawns the apply + dispatch pumps that keep the
+    // signals current from realtime `Change` events. Replaces the prior
+    // `refresh()` + `start_realtime()` pair.
     //
-    // `refresh()` runs first (it reads `AppConfig` from context — fine,
-    // we're inside the Effect owner) so first paint shows the balance
-    // ASAP; then the detached realtime pump is wired with the
-    // already-resolved `app_config` so its `spawn_local` future never
-    // touches the context off-owner.
+    // Idempotent: a client-side nav back to `/` re-runs this Effect but
+    // the subscription + pumps are constructed exactly once for the
+    // page's lifetime via the `reactivity_wired` latch.
     let wallet_for_mount = wallet.clone();
     let config_for_mount = app_config.clone();
     Effect::new(move |_| {
-        let wallet = wallet_for_mount.clone();
-        wallet.clone().refresh();
-        wallet.start_realtime(config_for_mount.clone());
+        wallet_for_mount.start(config_for_mount.clone());
     });
 
     // The retry button is a DOM click handler — also detached from the

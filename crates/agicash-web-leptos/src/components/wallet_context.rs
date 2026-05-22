@@ -13,32 +13,40 @@
 //! updates after a Receive completes, and no cross-page refetch on
 //! navigation.
 //!
-//! ## Where does the data come from now?
+//! ## Architecture (post cache-layer migration, 2026-05-22)
 //!
-//! [`WalletData::refresh`] uses the typed `agicash-storage-supabase`
-//! crate — the same `SupabaseStorage` the iOS / Android / CLI binaries
-//! call. The previous direct `gloo-net` REST path is gone (spec:
-//! `2026-05-17-storage-supabase-wasm-port-design.md` — port shipped
-//! 2026-05-17 / -18).
+//! `WalletData` no longer talks to storage directly. It holds an
+//! `Arc<agicash_wallet::WalletClient>` (the same composition root the
+//! FFI uses) and consumes the wallet's in-process cache layer
+//! (`agicash_wallet::WalletCache`) via two long-lived tasks wired up in
+//! [`WalletData::start`]:
 //!
-//! The fetch path:
+//! 1. **Apply pump.** Subscribes to
+//!    [`agicash_realtime::WalletRealtimeService`]'s broadcast and routes
+//!    every `Change(boxed)` into `WalletClient::apply_realtime_change`,
+//!    keeping the in-process cache row-current. `StatusChanged` drives
+//!    the realtime banner; `Connected` / `Error` are tracing-only —
+//!    there is NO refetch hedge: the resumption driver writes rows on
+//!    reconnect catch-up, those writes surface as Change events, and
+//!    the cache absorbs them as ordinary updates. `Event(_)` is a no-op
+//!    (its old refetch role was deleted in the cache-consumer migration).
+//! 2. **Dispatch pump.** Subscribes to
+//!    [`agicash_wallet::WalletClient::cache_updates`] and translates each
+//!    [`agicash_wallet::CacheUpdate`] tick into the corresponding signal
+//!    `set()` — re-reading the cache slice that mutated. The dispatch
+//!    handles `broadcast::error::RecvError::Lagged(n)` by resyncing
+//!    every cache-backed signal at once (the cache is still
+//!    authoritative; only the tick stream lagged).
 //!
-//! 1. Read `user_id` from `BrowserSessionStorage` (already persisted by
-//!    [`LoginView`] on successful auth).
-//! 2. Build an `OpenSecretTokenProvider` over a **session-seeded**
-//!    `OpenSecretClient` (the SDK session manager is in-memory +
-//!    per-client, so the persisted refresh token from
-//!    `BrowserSessionStorage` MUST be threaded in via `set_tokens` +
-//!    `refresh` — see `session_seeded_opensecret_client`), and pass it
-//!    to `SupabaseStorage::new`. JWTs are minted on each call via
-//!    `OpenSecretClient::generate_third_party_token` (cached
-//!    server-side).
-//! 3. `storage.list_accounts(user_id).await` — typed postgrest call,
-//!    same surface every other platform uses.
-//! 4. Per Cashu account, `send_swap_storage.list_unspent_proofs(account.id)`
-//!    and sum each proof's `.amount` (mirrors
-//!    `agicash_ffi::wallet::compute_cashu_balance`). Spark accounts
-//!    render `balance = 0` until their proof storage lands.
+//! Initial population is lazy via the cache's `*_or_populate` methods:
+//! mount calls `wallet.start(config)`, which seeds the wallet client and
+//! kicks off `populate_all` (foreground accounts + four pending lists in
+//! parallel). Subsequent reads are O(1) cache hits.
+//!
+//! Sign-out teardown drops the `Arc<WalletClient>` — its inner
+//! `WalletCache` drops, the broadcast sender closes, and the dispatch
+//! pump's `recv()` returns `Err(Closed)`, exiting cleanly. Same shape as
+//! `realtime_service` / `driver_handle`.
 //!
 //! ## Empty-state correctness
 //!
@@ -49,9 +57,9 @@
 use leptos::prelude::*;
 use uuid::Uuid;
 
-// `AppConfig` is part of the public `refresh_with_config` signature, so
-// it must be in scope on every target (it is `cfg`-free and the native
-// build constructs a dev-defaults instance).
+// `AppConfig` is part of the public `start` / `refresh_with_config`
+// signature, so it must be in scope on every target (it is `cfg`-free and
+// the native build constructs a dev-defaults instance).
 use crate::config::AppConfig;
 
 // `RealtimeStatus` is re-exported in `WalletData::realtime_status` so the
@@ -80,20 +88,20 @@ pub enum RealtimeStatus {
 /// waiting" from "asked, failed" from "asked, here's data".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum LoadState<T> {
-    /// `WalletData::refresh` hasn't been called yet (first paint).
+    /// `WalletData::start` hasn't been called yet (first paint).
     #[default]
     Idle,
-    /// In-flight: an async refresh is running.
+    /// In-flight: an async populate is running.
     Loading,
     /// Ready with data — could be an empty `Vec`, which is the canonical
     /// "signed-in guest, no accounts" state today.
     Ready(T),
-    /// Refresh failed; carries a user-facing message.
+    /// Populate failed; carries a user-facing message.
     Error(String),
 }
 
 impl<T> LoadState<T> {
-    /// True iff a refresh is in flight.
+    /// True iff a populate is in flight.
     #[must_use]
     pub const fn is_loading(&self) -> bool {
         matches!(self, Self::Loading)
@@ -128,13 +136,39 @@ pub struct AccountSummary {
     pub balance: u64,
 }
 
+#[cfg(target_arch = "wasm32")]
+impl AccountSummary {
+    /// Convert the facade [`agicash_wallet::AccountSummary`] to the local
+    /// home-page-shaped summary. The facade's `balance` field is a
+    /// decimal-encoded `String` (so the cross-FFI/JS boundary doesn't
+    /// lose precision); we parse it back to `u64` since the local hero
+    /// owns the numeric formatting anyway.
+    ///
+    /// A parse failure (shouldn't happen — the facade builds the string
+    /// from a `u64`) collapses to `0` with a tracing-log breadcrumb so
+    /// the page never crashes on a malformed wire-payload.
+    fn from_facade(s: &agicash_wallet::AccountSummary) -> Self {
+        let balance = s.balance.parse::<u64>().unwrap_or_else(|_| {
+            leptos::logging::log!(
+                "AccountSummary::from_facade: balance parse failed for {} → 0",
+                s.balance
+            );
+            0
+        });
+        Self {
+            currency: s.currency.to_string(),
+            balance,
+        }
+    }
+}
+
 /// One in-flight money-state row, flattened to the `(id, state)` pair
 /// the view layer needs to reconcile a stale "waiting…" list.
 ///
-/// The full money/proof payload stays in the storage layer — a consumer
-/// that wants detail re-fetches by `id`. This summary only answers
-/// *which* rows are still in flight and *what state* they are in, which
-/// is all the realtime-reconnect catch-up needs (slice 12e Lane 3).
+/// The full money/proof payload stays in the cache — a consumer that
+/// wants detail re-reads by `id`. This summary only answers *which* rows
+/// are still in flight and *what state* they are in, which is all the
+/// realtime-reconnect catch-up needs (slice 12e Lane 3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingItem {
     /// Row identity — UUID (mint/melt quote, send swap) or token hash
@@ -145,15 +179,14 @@ pub struct PendingItem {
 }
 
 /// The signed-in user's full in-flight money state — every pending /
-/// unresolved row across the four Cashu money flows, fetched in one
-/// shot on a realtime (re)connect (slice 12e Lane 3, Gap-D).
+/// unresolved row across the four Cashu money flows.
 ///
-/// The realtime channel ships no replay: a pending Lightning receive /
-/// unresolved send that resolves during a disconnect window leaves a
-/// stale "waiting…" row until the user navigates away. On every
-/// `Connected` the pump refetches this so the view can reconcile.
-/// An empty `Vec` is the canonical "nothing in flight" state. Mirrors
-/// the facade `agicash_wallet::PendingStateSnapshot`.
+/// Sourced from the cache layer's four pending-list slices
+/// (`CashuReceiveQuotes`, `CashuReceiveSwaps`, `CashuSendQuotes`,
+/// `CashuSendSwaps`). The dispatch pump recomposes this on every tick
+/// that mutates one of those slices.
+///
+/// Empty `Vec`s are the canonical "nothing in flight" state.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PendingStateSummary {
     /// UNPAID / PAID mint quotes — Lightning receives still in flight.
@@ -171,30 +204,26 @@ pub struct PendingStateSummary {
 #[derive(Clone, Debug)]
 pub struct WalletData {
     /// The signed-in user's id (from the persisted session). `None`
-    /// until [`WalletData::refresh`] runs.
+    /// until [`WalletData::start`] runs.
     pub user_id: RwSignal<Option<Uuid>>,
     /// Account list keyed by load state. `Ready(vec![])` is the
-    /// canonical empty-wallet state.
+    /// canonical empty-wallet state. Updated by the dispatch pump on
+    /// every `CacheKind::Accounts` / `CacheKind::AccountBalance` tick.
     pub accounts: RwSignal<LoadState<Vec<AccountSummary>>>,
     /// The user's in-flight money state (pending receives / unresolved
-    /// sends), refetched on every realtime (re)connect — the no-replay
-    /// catch-up that clears stale "waiting…" rows (slice 12e Lane 3,
-    /// Gap-D). `Idle` until the first `Connected`; `Ready(default)` is
-    /// the canonical "nothing in flight" state. Nothing renders off this
-    /// signal yet — landing it reactively is enough this lane; UI
-    /// consumption is a follow-up.
+    /// sends). Recomposed by the dispatch pump on every tick that
+    /// mutates one of the four Cashu pending-list slices.
     pub pending_state: RwSignal<LoadState<PendingStateSummary>>,
     /// Live realtime channel status. Drives the
     /// [`crate::components::RealtimeStatusBanner`] (Reconnecting / lost-
-    /// connection affordance). Updated by the pump in
-    /// [`WalletData::start_realtime`] on every `StatusChanged(_)` event;
+    /// connection affordance). Updated by the apply pump in
+    /// [`WalletData::start`] on every `StatusChanged(_)` event;
     /// stays at `Idle` if realtime never starts (e.g. native test build,
     /// missing supabase anon key).
     pub realtime_status: RwSignal<RealtimeStatus>,
     /// Tracked handle to the running [`agicash_realtime::WalletRealtimeService`]
     /// so the sign-out / session-teardown path can call `.stop()` on it
-    /// (closes the socket, drops the supervisor) — fixes the resource-leak
-    /// `.forget()` pattern Lane 2b inherited. `None` until the pump
+    /// (closes the socket, drops the supervisor). `None` until the pump
     /// finishes wiring (the async session-load + client-build can fail),
     /// or after `.stop()` clears it. Wasm-only — the native rlib build
     /// never opens a socket, so this is `Option<()>` there to keep the
@@ -223,14 +252,33 @@ pub struct WalletData {
     /// (`visibilitychange` / `online` edges — see
     /// [`wire_dom_lifecycle`]). `None` until the realtime pump finishes
     /// wiring (the async session-load + wallet-client build can fail),
-    /// or after `.stop()` clears it. Native rlib build is `Option<()>`
-    /// to keep the `Clone + Debug` shape uniform across cfg.
+    /// or after `.stop()` clears it.
     #[cfg(target_arch = "wasm32")]
     pub driver_handle: RwSignal<Option<std::sync::Arc<agicash_driver::DriverHandle>>, LocalStorage>,
     #[cfg(not(target_arch = "wasm32"))]
     pub driver_handle: RwSignal<Option<()>, LocalStorage>,
-    /// Idempotency latch for [`WalletData::start_realtime`]. The
-    /// realtime subscription + pump are wired into the page lifetime
+    /// The session-seeded [`agicash_wallet::WalletClient`] that owns the
+    /// cache layer. Built once on [`WalletData::start`]; cloned into the
+    /// driver, the apply pump (for `apply_realtime_change` calls), the
+    /// dispatch pump (for the `cache_updates` subscription + per-slice
+    /// re-reads), and the foreground populate path.
+    ///
+    /// Same `LocalStorage` reason as `realtime_service` /
+    /// `driver_handle`: the wasm wallet client's storage stack holds
+    /// non-`Send` `web_sys` handles. `Option<()>` on native to keep the
+    /// `Clone + Debug` shape uniform across cfg.
+    ///
+    /// On sign-out [`Self::teardown_realtime`] sets this to `None`,
+    /// dropping the last live `Arc` (the apply / dispatch pumps drop
+    /// their clones as they exit) and naturally closing the cache's
+    /// internal broadcast channel — the dispatch pump's `recv()` returns
+    /// `Err(Closed)` and the loop exits cleanly.
+    #[cfg(target_arch = "wasm32")]
+    pub wallet_client: RwSignal<Option<std::sync::Arc<agicash_wallet::WalletClient>>, LocalStorage>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub wallet_client: RwSignal<Option<()>, LocalStorage>,
+    /// Idempotency latch for [`WalletData::start`]. The realtime
+    /// subscription + cache pumps are wired into the page lifetime
     /// exactly once; a Home remount (client-side nav back to `/`) must
     /// not stack a second `WalletRealtimeService` / socket. `false`
     /// until the first wiring call flips it.
@@ -255,44 +303,52 @@ impl WalletData {
             // the driver handle indirectly holds the `Arc<WalletClient>`
             // whose wasm storage stack is `!Send` (`web_sys` handles).
             driver_handle: RwSignal::new_local(None),
+            // Thread-pinned: the wasm wallet client's storage stack
+            // holds `!Send` `web_sys` handles. The signal carries the
+            // long-lived `Arc<WalletClient>` shared with the driver,
+            // apply pump, dispatch pump, and foreground populate path.
+            wallet_client: RwSignal::new_local(None),
             reactivity_wired: RwSignal::new(false),
         }
     }
 
-    /// Tear down the realtime subscription + clear local view-model
-    /// state. Called from the sign-out flow (see
+    /// Tear down the realtime subscription + the cache + clear local
+    /// view-model state. Called from the sign-out flow (see
     /// [`crate::pages::SettingsIndexPage`]) before the auth signal is
-    /// cleared. Best-effort and idempotent: `.stop()` is a single
-    /// atomic-store + 1-msg broadcast, the supervisor task observes the
-    /// flag and exits at its next loop tick (closing the socket cleanly).
-    /// Safe to call when realtime never started — the service handle is
-    /// `None` and nothing happens.
+    /// cleared. Best-effort and idempotent.
+    ///
+    /// Teardown order matters:
+    ///
+    /// 1. Stop the resumption driver — it observes the realtime
+    ///    broadcast for triggers; stopping it first means any final
+    ///    `Connected` / `Change` the supervisor flushes on close races a
+    ///    stopped driver (those are no-op triggers anyway).
+    /// 2. Stop the realtime service — closes the socket; the apply
+    ///    pump's `rx.next()` returns `None` and that loop exits.
+    /// 3. Drop the `Arc<WalletClient>` (clear the signal) — the cache's
+    ///    internal `broadcast::Sender` drops once the last clone is
+    ///    gone, the dispatch pump's `recv()` returns `Err(Closed)`, and
+    ///    that loop exits cleanly.
     ///
     /// After teardown the `reactivity_wired` latch is reset so a later
     /// sign-in can wire a fresh subscription (the App root keeps a
     /// single `WalletData` instance for the page's lifetime).
     pub fn teardown_realtime(&self) {
         #[cfg(target_arch = "wasm32")]
-        if let Some(service) = self.realtime_service.get_untracked() {
-            service.stop();
-        }
-        // Resumption driver (plan 2026-05-21 §7 Lane E): mirror the
-        // realtime teardown — `.stop()` is idempotent (atomic-store +
-        // 1-pulse wake on the trigger task's internal waker), so calling
-        // it when the driver never started is a no-op. The trigger task
-        // observes the flag at its next loop tick and exits; the
-        // in-flight sweep (if any) runs to completion. Stop the driver
-        // BEFORE clearing the realtime service so any final
-        // `Connected` / `Event` the supervisor flushes on close still
-        // races a stopped driver (the driver is the one observing the
-        // broadcast for triggers — the realtime service close emits a
-        // `StatusChanged(Closed)`, which is a no-op trigger anyway).
-        #[cfg(target_arch = "wasm32")]
         if let Some(handle) = self.driver_handle.get_untracked() {
             handle.stop();
         }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(service) = self.realtime_service.get_untracked() {
+            service.stop();
+        }
         self.driver_handle.set(None);
         self.realtime_service.set(None);
+        // Drop the wallet client signal LAST: pumps exit on their own
+        // broadcast-close edges (above), but defensively clearing the
+        // signal here drops our reference even if a pump task got stuck
+        // shutting down.
+        self.wallet_client.set(None);
         self.realtime_status.set(RealtimeStatus::Idle);
         self.reactivity_wired.set(false);
     }
@@ -326,315 +382,50 @@ impl WalletData {
         }
     }
 
-    /// Kick off a refresh. Runs in the browser only — the native rlib
-    /// build (used by `cargo test` on the pure pieces) treats this as a
-    /// no-op so unit tests on view helpers don't need a browser.
+    /// One-shot bring-up entry point. Replaces the old
+    /// `refresh()` + `start_realtime()` pair the home mount Effect used
+    /// to call separately.
     ///
-    /// On wasm: loads the session, constructs a `SupabaseStorage`, calls
-    /// `list_accounts` + (per Cashu account) `list_unspent_proofs`, and
-    /// populates the signals with real balances.
+    /// Side-effects, in order:
     ///
-    /// **Owner requirement.** This entry point reads
-    /// `use_context::<AppConfig>()` synchronously, so it MUST be called
-    /// from within a valid Leptos reactive owner (a component body or an
-    /// `Effect`). A detached caller — a `.forget()`-leaked DOM event
-    /// closure or a bare `spawn_local` future — has no owner, so
-    /// `use_context` returns `None` and the load fails with the
-    /// `AppConfig context missing` error. The detached realtime pump
-    /// wired by [`WalletData::start_realtime`] MUST instead capture the
-    /// `AppConfig` once inside an owner and call
-    /// [`WalletData::refresh_with_config`] with the concrete value.
-    pub fn refresh(self) {
-        // Read the context here, while we are still guaranteed to be
-        // inside the owner that provided it (the Home mount Effect / the
-        // retry handler runs under the component owner). The concrete
-        // value is then threaded through to the detached future.
-        #[cfg(target_arch = "wasm32")]
-        let config = use_context::<AppConfig>();
-        // First load / explicit user-initiated refresh: foreground, so a
-        // spinner is allowed while we have no data yet.
-        #[cfg(target_arch = "wasm32")]
-        self.refresh_with_config(config, false);
-
-        #[cfg(not(target_arch = "wasm32"))]
-        self.refresh_with_config(None, false);
-    }
-
-    /// Refresh using an already-captured `AppConfig` instead of reading
-    /// it from context. This is the entry point detached callers must
-    /// use: the realtime pump spawned by [`WalletData::start_realtime`]
-    /// runs **outside** any Leptos reactive owner, so it cannot call
-    /// `use_context` itself. [`WalletData::refresh`] captures the
-    /// context from inside the owner and delegates here; the detached
-    /// callers carry a clone of the value captured at wiring time.
-    ///
-    /// `config` is `Option` only so the native test build (which has no
-    /// browser and no real config) can pass `None` and settle into the
-    /// same `Ready(empty)` shape view tests expect; on wasm a `None`
-    /// surfaces the `AppConfig context missing` error exactly as before.
-    ///
-    /// `background` selects the load-state discipline, mirroring the iOS
-    /// poll fix (`HomeView`'s foreground poll / `scenePhase` refresh call
-    /// `refreshAccounts()` without ever blanking the hero):
-    ///
-    /// - `false` — first load or an explicit user-initiated refresh
-    ///   (mount Effect, the Retry button). Allowed to flip to
-    ///   `LoadState::Loading` so the view can show the full-screen
-    ///   spinner *while there is no data yet*.
-    /// - `true` — a silent background catch-up (a realtime
-    ///   broadcast / (re)connect catch-up). Stale-while-
-    ///   revalidate: the last `Ready` value stays on screen and is only
-    ///   swapped when the new fetch resolves; a failure surfaces as a
-    ///   quiet `Error` *only if there was nothing to keep showing*, never
-    ///   as the full-screen spinner. This is the web canonical model's
-    ///   `refetchOnWindowFocus` behaviour (background refetch keeps the
-    ///   prior data) — the regression fixed here was the poll throwing
-    ///   the balance away on every tick.
-    ///
-    /// Even with `background == false` the spinner only appears when
-    /// there is no `Ready` data to preserve: an explicit Retry after a
-    /// successful load keeps the numbers on screen rather than flashing
-    /// the spinner.
-    //
-    // `config` is moved into the spawned future on wasm (the build that
-    // ships); the native test build cfg's that block out, so to clippy
-    // it then looks pass-by-value-but-unused. Allow it there only.
-    #[cfg_attr(
-        not(target_arch = "wasm32"),
-        allow(clippy::needless_pass_by_value, unused_variables)
-    )]
-    pub fn refresh_with_config(self, config: Option<AppConfig>, background: bool) {
-        // Stale-while-revalidate. Only blank the hero with the spinner
-        // when this is a foreground refresh AND there is no `Ready`
-        // value to keep showing. Background refreshes (realtime
-        // broadcast / (re)connect catch-up) NEVER flip to `Loading` —
-        // they keep the last balance on screen until the async fetch
-        // below resolves, then swap in the new data (or surface a quiet
-        // inline error). This mirrors the iOS poll discipline
-        // (`refreshAccounts()` never sets a loading phase) and the web's
-        // `refetchOnWindowFocus`. A realtime disconnect is non-fatal:
-        // the last balance stays, and the next `Connected` refetches.
-        let has_ready = matches!(self.accounts.get_untracked(), LoadState::Ready(_));
-        if !background && !has_ready {
-            self.accounts.set(LoadState::Loading);
-        }
-
-        // Wasm uses wasm_bindgen_futures directly because `leptos::task::
-        // spawn_local` requires the leptos Executor to be installed, and
-        // refresh() can fire from an Effect before hydration completes
-        // that handshake. Native test build uses leptos's spawn since
-        // tests run under tokio + the reactive harness.
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            // A failed *background* refresh must not blow away a balance
-            // that is already on screen — a transient poll/focus error
-            // should leave the last good numbers visible (stale-while-
-            // revalidate), exactly as the foreground spinner is
-            // suppressed above. Foreground refreshes, or background
-            // refreshes with nothing to preserve, still surface the
-            // error so the user isn't left staring at a stale value
-            // forever with no feedback.
-            let set_error = |this: &Self, msg: String| {
-                let keep_stale =
-                    background && matches!(this.accounts.get_untracked(), LoadState::Ready(_));
-                if !keep_stale {
-                    this.accounts.set(LoadState::Error(msg));
-                }
-            };
-
-            let Some(config) = config else {
-                set_error(&self, "AppConfig context missing".to_string());
-                return;
-            };
-
-            match load_session_user_id().await {
-                Ok(Some(uid)) => {
-                    self.user_id.set(Some(uid));
-                    match fetch_account_summaries(&config, uid).await {
-                        Ok(accounts) => {
-                            self.accounts.set(LoadState::Ready(accounts));
-                        }
-                        Err(msg) => {
-                            set_error(&self, msg);
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // No session — ProtectedLayout should have
-                    // redirected, but we don't want to spin.
-                    self.accounts.set(LoadState::Ready(Vec::new()));
-                }
-                Err(msg) => {
-                    set_error(&self, msg);
-                }
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        leptos::task::spawn_local(async move {
-            // Native: don't touch anything async — the test runner
-            // doesn't have a browser. Just settle into Ready(empty)
-            // so any view tests rendering this state get the same
-            // shape they'd see in the browser steady-state.
-            self.accounts.set(LoadState::Ready(Vec::new()));
-        });
-    }
-
-    /// Handle one realtime `Connected` event (the (re)connect catch-up).
-    ///
-    /// The realtime channel ships **no replay** (spec §5.5): everything
-    /// that landed while the socket was down has to be refetched. This
-    /// runs both halves of that catch-up:
-    ///
-    /// - [`Self::refresh_with_config`] in background/SWR mode — the
-    ///   accounts + balance (the pre-slice-12e behaviour);
-    /// - [`Self::refresh_pending_state`] — the in-flight money state
-    ///   (slice 12e Lane 3, Gap-D), so a pending receive / unresolved
-    ///   send that resolved during the disconnect window no longer
-    ///   leaves a stale "waiting…" row.
-    ///
-    /// Factored out of the `start_realtime` pump so the catch-up is one
-    /// named, self-documenting unit rather than two bare calls buried in
-    /// a match arm.
-    pub fn on_realtime_connected(&self, config: Option<AppConfig>) {
-        self.clone().refresh_with_config(config.clone(), true);
-        self.clone().refresh_pending_state(config);
-    }
-
-    /// Realtime-(re)connect catch-up: refetch the user's in-flight money
-    /// state into [`Self::pending_state`] (slice 12e Lane 3, Gap-D).
-    ///
-    /// The realtime channel ships no replay, so on every `Connected` the
-    /// pump runs this alongside the accounts [`Self::refresh_with_config`]
-    /// — a pending Lightning receive / unresolved send that resolved
-    /// during the disconnect window leaves a stale "waiting…" row
-    /// otherwise. Pure storage reads scoped to the signed-in user; the
-    /// facade `WalletClient::refresh_pending_state()` shape, against the
-    /// `agicash-cashu` storage traits the Leptos crate already links.
-    ///
-    /// **Always background / SWR**: a refetch failure is non-fatal — the
-    /// last good `pending_state` (or `Idle`) stays, the next reconnect
-    /// retries. It never flips the signal to `Loading` (no spinner) and
-    /// never surfaces an error screen; the accounts refresh already owns
-    /// the user-visible failure path. Nothing renders off the signal yet
-    /// — landing it reactively is enough this lane.
-    //
-    // `config` is moved into the spawned future on wasm (the build that
-    // ships); the native test build cfg's that block out, so to clippy
-    // it then looks pass-by-value-but-unused. Allow it there only —
-    // same shape as `refresh_with_config`.
-    #[cfg_attr(
-        not(target_arch = "wasm32"),
-        allow(clippy::needless_pass_by_value, unused_variables)
-    )]
-    pub fn refresh_pending_state(self, config: Option<AppConfig>) {
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async move {
-            let Some(config) = config else {
-                // No config → realtime can't auth anyway; the
-                // accounts refresh logs the same condition.
-                return;
-            };
-            let uid = match load_session_user_id().await {
-                Ok(Some(uid)) => uid,
-                Ok(None) => {
-                    // Signed out — nothing in flight to catch up.
-                    self.pending_state
-                        .set(LoadState::Ready(PendingStateSummary::default()));
-                    return;
-                }
-                Err(e) => {
-                    leptos::logging::log!(
-                        "refresh_pending_state: session load failed \
-                         (non-fatal, retries next reconnect): {e}"
-                    );
-                    return;
-                }
-            };
-            match fetch_pending_state(&config, uid).await {
-                Ok(summary) => {
-                    self.pending_state.set(LoadState::Ready(summary));
-                }
-                Err(e) => {
-                    // Non-fatal: keep the last snapshot (SWR), the
-                    // next reconnect retries. The accounts refresh
-                    // owns the user-visible error path.
-                    leptos::logging::log!(
-                        "refresh_pending_state: fetch failed (non-fatal, \
-                         retries next reconnect): {e}"
-                    );
-                }
-            }
-        });
-
-        #[cfg(not(target_arch = "wasm32"))]
-        leptos::task::spawn_local(async move {
-            // Native: no browser / no storage stack — settle into the
-            // canonical empty state so view tests see the steady shape.
-            self.pending_state
-                .set(LoadState::Ready(PendingStateSummary::default()));
-        });
-    }
-
-    /// Wire the realtime reactivity source: a single Supabase-Realtime
-    /// subscription (the all-Rust `agicash-realtime` crate, linked
-    /// directly — no FFI) drives the balance refresh. This **replaces**
-    /// the deleted `start_visibility_refresh` `visibilitychange` /
-    /// `focus` / 4s-poll Tier-1 hack — that apparatus caused the
-    /// `AppConfig context`-missing regression and the spinner flicker;
-    /// realtime is the reactivity source now. The catch-up semantics
-    /// match the web canonical model's React-Query invalidation:
-    ///
-    /// - on every `WalletRealtimeEvent::Connected` (emitted on every
-    ///   (re)join — there is **no replay**, spec §5.5) we refetch wallet
-    ///   state, catching up anything that landed while disconnected;
-    /// - on every `WalletRealtimeEvent::Event` (a DB `wallet:<uid>`
-    ///   broadcast) we refetch.
-    ///
-    /// Both refetches go through [`WalletData::refresh_with_config`] in
-    /// **background** mode (SWR / no-flicker discipline from Lane V):
-    /// the last `Ready` balance stays on screen until the new fetch
-    /// resolves; a realtime failure / disconnect is **non-fatal** — no
-    /// error screen, the prior balance is kept, and the next `Connected`
-    /// (after the service's internal reconnect/backoff) refetches.
-    ///
-    /// **Owner / context capture.** The event-pump runs inside a
-    /// detached `spawn_local` future (no Leptos reactive owner), so it
-    /// can never read `use_context::<AppConfig>()` — that always returns
-    /// `None` off the owner tree and is exactly the `AppConfig context
-    /// missing` regression. The caller (the Home mount `Effect`, which
-    /// *is* inside an owner) passes the already-resolved `AppConfig`;
-    /// every refetch goes through [`WalletData::refresh_with_config`]
-    /// with the captured value so no detached path touches the context.
+    /// 1. Build a session-seeded `Arc<WalletClient>` (the same
+    ///    composition root the FFI uses); store it on
+    ///    [`Self::wallet_client`].
+    /// 2. Run an initial foreground populate against the cache
+    ///    ([`Self::populate_all`]): drives `accounts` from `Idle` /
+    ///    `Loading` to `Ready(…)` / `Error(_)`, plus the four pending
+    ///    slices into `pending_state`.
+    /// 3. Wire the `WalletRealtimeService` + `ResumptionDriver` (the
+    ///    pre-existing recoverability machinery).
+    /// 4. Spawn the **apply pump** — routes
+    ///    `WalletRealtimeEvent::Change(boxed)` into
+    ///    `wallet_client.apply_realtime_change(*boxed)`, drives the
+    ///    realtime-status banner from `StatusChanged`, no other arms
+    ///    refetch.
+    /// 5. Spawn the **dispatch pump** — translates
+    ///    `wallet_client.cache_updates()` ticks into signal `set()`s.
+    ///    `Lagged(n)` triggers a full resync.
     ///
     /// Idempotent: the App root provides a single `WalletData`, but the
     /// Home page mount Effect can re-run on client-side nav back to `/`.
-    /// The `reactivity_wired` latch ensures the service + socket are
-    /// constructed exactly once for the page's lifetime (the realtime
-    /// channel is an app-global concern that outlives any single Home
-    /// mount, just as the web app's channel lives above the route tree).
+    /// The `reactivity_wired` latch ensures the service + socket + pumps
+    /// are constructed exactly once for the page's lifetime.
+    ///
+    /// **Owner / context capture.** The pumps run inside detached
+    /// `spawn_local` futures (no Leptos reactive owner), so they can
+    /// never read `use_context::<AppConfig>()`. The caller (Home mount
+    /// Effect, inside an owner) passes the already-resolved `AppConfig`;
+    /// every detached path captures the value once.
     #[cfg_attr(
         not(target_arch = "wasm32"),
         allow(clippy::needless_pass_by_value, unused_variables)
     )]
-    // On wasm32 the realtime handles (`Arc<dyn JwtSource>`,
-    // `Arc<WalletRealtimeService>`) are `!Send`/`!Sync` — `web_sys`
-    // sockets are JS-main-thread-pinned. `Arc` is the type the
-    // `agicash-realtime` public API (`WalletRealtimeService::new`) and
-    // the `realtime_service` field both require; `Rc` would mean
-    // changing that crate's API surface, out of scope for lint cleanup.
+    // On wasm32 the realtime handles + wallet client are `!Send`/`!Sync`
+    // (`web_sys` sockets / fetch are JS-main-thread-pinned). `Arc` is
+    // mandated by the agicash-realtime / agicash-wallet public APIs.
     #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
-    // Wiring the realtime pump + the resumption driver alongside it
-    // is fundamentally sequential (session-load → opensecret client →
-    // realtime service → driver wallet client → driver task + pump +
-    // DOM listeners). Splitting this into helpers would mean threading
-    // half a dozen `Arc`s + the captured `AppConfig` through fn
-    // boundaries with no real readability win — every step has its own
-    // commentary block. Lint is also tripped on the native rlib build
-    // (the whole body is `cfg(target_arch="wasm32")` so the
-    // line-counter still sees the source span); allow unconditionally.
     #[allow(clippy::too_many_lines)]
-    pub fn start_realtime(&self, config: Option<AppConfig>) {
+    pub fn start(&self, config: Option<AppConfig>) {
         // Flip the latch once. If it was already set, another mount
         // already wired the subscription — bail without stacking a
         // second `WalletRealtimeService` / socket.
@@ -653,65 +444,94 @@ impl WalletData {
             use agicash_traits::TokenProvider;
 
             let Some(config) = config else {
-                // No config off-owner → realtime can't authenticate.
-                // Non-fatal: the on-mount `refresh()` already showed the
-                // balance; we just don't get live updates this session.
+                // No config off-owner → realtime can't authenticate and
+                // the cache layer has nothing to populate from. Surface
+                // a foreground error so the home page Retry button has
+                // something to react to.
                 leptos::logging::log!(
-                    "start_realtime: AppConfig missing — realtime disabled (balance \
-                     stays from the initial refresh)"
+                    "WalletData::start: AppConfig missing — wallet bring-up skipped"
                 );
+                self.accounts
+                    .set(LoadState::Error("AppConfig context missing".to_string()));
                 return;
             };
 
             if config.supabase_anon_key.is_empty() {
                 leptos::logging::log!(
-                    "start_realtime: supabase anon key missing — realtime disabled \
-                     (balance stays from the initial refresh)"
+                    "WalletData::start: supabase anon key missing — wallet bring-up skipped"
                 );
+                self.accounts.set(LoadState::Error(
+                    "Supabase anon key missing — wallet disabled".to_string(),
+                ));
                 return;
             }
 
+            // Mark accounts + pending_state as Loading for foreground
+            // bring-up if there's no Ready value to preserve. This is
+            // the SWR discipline today's `refresh_with_config` had —
+            // kept intact so the home hero still shows a spinner only
+            // when there's nothing to show.
+            if !matches!(self.accounts.get_untracked(), LoadState::Ready(_)) {
+                self.accounts.set(LoadState::Loading);
+            }
+            if !matches!(self.pending_state.get_untracked(), LoadState::Ready(_)) {
+                self.pending_state.set(LoadState::Loading);
+            }
+
             let wallet = self.clone();
-            // The user id / token provider need an async context (the
-            // session load is async + the OpenSecret client builds the
-            // same way `fetch_account_summaries` does). Capture `config`
-            // before the spawn per the documented spawn_local/use_context
-            // gotcha — we never touch context inside the future.
             wasm_bindgen_futures::spawn_local(async move {
                 let uid = match load_session_user_id().await {
                     Ok(Some(uid)) => uid,
                     Ok(None) => {
                         // No session — ProtectedLayout should have
                         // redirected; nothing to subscribe to.
+                        wallet.accounts.set(LoadState::Ready(Vec::new()));
+                        wallet
+                            .pending_state
+                            .set(LoadState::Ready(PendingStateSummary::default()));
                         return;
                     }
                     Err(e) => {
-                        leptos::logging::log!(
-                            "start_realtime: session load failed, realtime \
-                             disabled (balance unaffected): {e}"
-                        );
+                        leptos::logging::log!("WalletData::start: session load failed: {e}");
+                        wallet.accounts.set(LoadState::Error(e));
                         return;
                     }
                 };
 
-                // Reuse the SAME OpenSecret token source the storage
-                // layer uses (mirrors `fetch_account_summaries` /
-                // Lane V's rehydration): a fresh Supabase-compatible JWT
-                // is minted per `get_jwt` call from the browser session's
-                // refresh token. `TokenProviderJwtSource` adapts it to
-                // the realtime crate's `JwtSource` (the wasm variant
-                // takes `Arc<dyn TokenProvider>`, no `Send + Sync`).
-                let client = match build_opensecret_client(&config).await {
+                wallet.user_id.set(Some(uid));
+
+                // 1. Build the session-seeded WalletClient. This is the
+                //    single composition root: cache + driver + apply
+                //    pump + dispatch pump + populate all share this
+                //    `Arc<WalletClient>`. The cache lives inside.
+                let wallet_client = match build_wallet_client(&config, uid).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        leptos::logging::log!("WalletData::start: wallet client build failed: {e}");
+                        wallet.accounts.set(LoadState::Error(e));
+                        return;
+                    }
+                };
+                wallet.wallet_client.set(Some(Arc::clone(&wallet_client)));
+
+                // 2. Foreground populate. Drives signals from Loading
+                //    to Ready (or Error) before any realtime tick lands.
+                populate_all(&wallet, &wallet_client).await;
+
+                // 3. Wire realtime service.
+                let opensecret = match session_seeded_opensecret_client(&config).await {
                     Ok(c) => c,
                     Err(e) => {
                         leptos::logging::log!(
-                            "start_realtime: opensecret client build failed, \
-                             realtime disabled (balance unaffected): {e}"
+                            "WalletData::start: opensecret client build failed, \
+                             realtime disabled (initial populate stays): {e}"
                         );
                         return;
                     }
                 };
-                let tokens: Arc<dyn TokenProvider> = Arc::new(client);
+                let tokens: Arc<dyn TokenProvider> = Arc::new(
+                    agicash_auth_opensecret::OpenSecretTokenProvider::new(opensecret),
+                );
                 let jwt = Arc::new(TokenProviderJwtSource(tokens));
                 let factory = Arc::new(WasmTransportFactory);
 
@@ -722,136 +542,80 @@ impl WalletData {
                     jwt,
                     factory,
                 ));
-
-                // Publish the service handle so the sign-out / teardown
-                // path can call `.stop()` (and the banner's retry-on-
-                // TerminalError can call `.set_online(false → true)` to
-                // clear the terminal latch). Replaces the
-                // `Arc::clone(...).forget()`-shaped leak the old wiring
-                // had: the `Arc` is now reachable from the view-model,
-                // so the supervisor stays addressable for its whole
-                // lifetime instead of being orphaned in a detached task.
                 wallet.realtime_service.set(Some(Arc::clone(&service)));
 
-                // Resumption driver wiring (plan 2026-05-21 §7 Lane E).
-                //
-                // Build a session-seeded `Arc<WalletClient>` — same
-                // composition root `fetch_pending_state` uses — and
-                // hand it to `WalletClientSweeper`, which the driver
-                // calls into to advance every unresolved
-                // send_swap/receive_swap/mint_quote/melt_quote row.
-                //
-                // The driver subscribes to a SECOND receiver off the
-                // SAME realtime service (`async-broadcast` allows N
-                // independent receivers; the existing pump above
-                // already used one). On every Connected / relevant
-                // Event the driver runs a coalesced sweep — the React
-                // `useProcessXTasks` analog. The driver handle is
-                // stored alongside the realtime service handle so the
-                // sign-out path can `.stop()` both.
-                //
-                // A WalletClient build failure is non-fatal: the
-                // realtime pump (above) and the existing background
-                // `refresh_pending_state` still run; the user just
-                // loses recoverability for this session. Log + carry
-                // on so the page is never blocked by a driver-init
-                // hiccup.
-                let driver_started = match build_driver_wallet_client(&config, uid).await {
-                    Ok(wallet_client) => {
-                        use agicash_driver::{DriverConfig, ResumptionDriver, WalletClientSweeper};
-                        let sweeper = Arc::new(WalletClientSweeper::new(wallet_client));
-                        // Second receiver: independent of the pump's
-                        // `subscribe()` above. Each consumer sees every
-                        // event from the moment it clones; the burst-
-                        // coalescing latch inside the driver handles
-                        // the in-flight + dirty-bit shape.
-                        let rx = service.subscribe();
-                        let driver = ResumptionDriver::new(sweeper, rx, DriverConfig::default());
-                        // `.start()` is idempotent — a second call on
-                        // the same `ResumptionDriver` returns a fresh
-                        // handle over the SAME shared state. Our
-                        // `reactivity_wired` latch guards this whole
-                        // block anyway, so a re-mount cannot stack a
-                        // second driver task.
-                        let handle = Arc::new(driver.start());
-                        wallet.driver_handle.set(Some(Arc::clone(&handle)));
-                        Some(handle)
-                    }
-                    Err(e) => {
-                        leptos::logging::log!(
-                            "start_realtime: resumption driver disabled — \
-                             WalletClient build failed (recoverability degraded \
-                             for this session, realtime still active): {e}"
-                        );
-                        None
-                    }
+                // 4. Wire the resumption driver (recoverability for
+                //    rows that resolved during disconnect windows).
+                //    Reuses the SAME `wallet_client` that holds the
+                //    cache — driver writes go through the same
+                //    composition root, so its writes also produce
+                //    `Change` events that patch the cache.
+                let driver_handle = {
+                    use agicash_driver::{DriverConfig, ResumptionDriver, WalletClientSweeper};
+                    let sweeper = Arc::new(WalletClientSweeper::new(Arc::clone(&wallet_client)));
+                    let rx_driver = service.subscribe();
+                    let driver = ResumptionDriver::new(sweeper, rx_driver, DriverConfig::default());
+                    let handle = Arc::new(driver.start());
+                    wallet.driver_handle.set(Some(Arc::clone(&handle)));
+                    handle
                 };
 
-                // Pump: on every Connected (no replay → catch up) and
-                // every broadcast Event, refetch in background/SWR mode
-                // — keep the last balance, never flash the spinner, and
-                // a refetch failure is itself non-fatal (the SWR path in
-                // `refresh_with_config` keeps stale data).
+                // 5. Apply pump: realtime → cache. Subscribes to a
+                //    SECOND receiver off the SAME realtime service
+                //    (async-broadcast permits N independent receivers).
                 //
-                // `StatusChanged(_)` is forwarded to
-                // [`WalletData::realtime_status`] so the
-                // `RealtimeStatusBanner` can render a "Reconnecting…"
-                // bar (Disconnected/Reconnecting/Error/Closed) or the
-                // persistent "Connection lost — Retry" affordance
-                // (TerminalError). The balance is NEVER blanked on a
-                // disconnect — Lane V's stale-while-revalidate
-                // discipline still owns that, the banner is purely an
-                // additive surface.
-                //
-                // `Error(_)` is logged + folded into the status banner
-                // by leaving the existing status (most often
-                // `Reconnecting` / `Error`) intact — the supervisor
-                // emits its own `StatusChanged` on transitions, so we
-                // don't need to synthesize one from a transient `Error`
-                // payload (which is opaque-string anyway).
+                //    Operator's clean-cut decision: NO refetch arm.
+                //    `Connected` is tracing-only — the driver + the
+                //    typed `Change` stream cover catch-up. `Event(_)` is
+                //    a no-op (legacy refetch path deleted). Only
+                //    `StatusChanged` mutates a signal (the banner).
                 {
+                    let wallet_for_pump = wallet.clone();
+                    let wallet_client_for_pump = Arc::clone(&wallet_client);
                     let service_for_pump = Arc::clone(&service);
-                    let wallet = wallet.clone();
-                    let config = config.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         let mut rx = service_for_pump.subscribe();
                         loop {
                             match futures_util::StreamExt::next(&mut rx).await {
-                                Some(WalletRealtimeEvent::Connected) => {
-                                    wallet.on_realtime_connected(Some(config.clone()));
-                                }
-                                Some(WalletRealtimeEvent::Event(_)) => {
-                                    wallet
-                                        .clone()
-                                        .refresh_with_config(Some(config.clone()), true);
+                                Some(WalletRealtimeEvent::Change(boxed)) => {
+                                    // Patch the cache from the typed
+                                    // delta. The cache's apply path
+                                    // logs + swallows conversion errors
+                                    // internally; it never breaks the
+                                    // pump.
+                                    wallet_client_for_pump.apply_realtime_change(*boxed).await;
                                 }
                                 Some(WalletRealtimeEvent::StatusChanged(status)) => {
-                                    wallet.realtime_status.set(status);
+                                    wallet_for_pump.realtime_status.set(status);
+                                }
+                                Some(WalletRealtimeEvent::Connected) => {
+                                    // Operator decision: trust the
+                                    // driver + Change stream. No SWR
+                                    // refetch hedge. The driver's sweep
+                                    // on Connected writes rows; those
+                                    // writes surface as Change events
+                                    // and the apply arm above patches
+                                    // the cache.
+                                    leptos::logging::log!(
+                                        "realtime: connected (driver sweep + Change stream \
+                                         own catch-up)"
+                                    );
+                                }
+                                Some(WalletRealtimeEvent::Event(_)) => {
+                                    // Legacy refetch arm — DELETED in
+                                    // the cache-consumer migration. The
+                                    // typed sibling `Change(boxed)`
+                                    // above is the load-bearing path.
                                 }
                                 Some(WalletRealtimeEvent::Error(msg)) => {
                                     // Log only — the supervisor emits a
                                     // companion `StatusChanged` so the
                                     // banner already reflects the new
-                                    // state. Toasting every transient
-                                    // socket blip would be noise.
+                                    // state.
                                     leptos::logging::log!(
                                         "realtime: transient error (banner reflects \
                                          status): {msg}"
                                     );
-                                }
-                                Some(WalletRealtimeEvent::Change(_)) => {
-                                    // Typed-row sibling of `Event` —
-                                    // the realtime supervisor fires
-                                    // both per broadcast (see
-                                    // `WalletRealtimeEvent` doc). The
-                                    // Leptos pump's "refetch on any
-                                    // change" discipline is already
-                                    // handled by the `Event(_)` arm
-                                    // above; the typed payload is for
-                                    // the cache layer
-                                    // (`agicash-wallet`) and not for
-                                    // this signal-graph pump. No
-                                    // behavior change this lane.
                                 }
                                 None => break, // sender dropped — service gone.
                             }
@@ -859,38 +623,330 @@ impl WalletData {
                     });
                 }
 
-                // Wire DOM lifecycle hooks (Gap-E): forward
-                // `visibilitychange` and `online`/`offline` to the
-                // service. iOS/Android get this from native lifecycle
-                // observers via the FFI; on the web the equivalents
-                // are window-level events. The service handle is held
-                // by the closures via `Arc` so they outlive the spawn.
+                // 6. Dispatch pump: cache → signals.
+                //    Each `CacheUpdate { kind, id }` tick drives the
+                //    matching cache-backed signal. The dispatch handler
+                //    re-reads the cache slice (O(1) under one
+                //    parking_lot lock) and `set()`s the corresponding
+                //    `RwSignal<LoadState<T>>`.
                 //
-                // The driver handle (if it constructed) rides along the
-                // SAME listeners (plan 2026-05-21 §7 Lane E): the
-                // `online` + `visibilitychange → visible` edges call
-                // `driver.notify_foreground()` alongside the existing
-                // `service.set_online(true)` / `set_active(true)` —
-                // the React `refetchOnWindowFocus` analog, on the same
-                // edge the focus listener already fires. The
-                // `offline` + `visibilitychange → hidden` edges do
-                // NOT notify the driver (those are NOT foreground
-                // signals; the driver pauses on `Unauthenticated`,
-                // not on background — see `task.rs` header).
-                wire_dom_lifecycle(&service, driver_started.as_ref());
+                //    `Lagged(n)` triggers a full resync — the cache is
+                //    still authoritative, only the tick stream lagged.
+                //    `Closed` means the underlying broadcast sender
+                //    dropped (sign-out path cleared the `wallet_client`
+                //    signal); the loop exits.
+                {
+                    let wallet_for_dispatch = wallet.clone();
+                    let wallet_client_for_dispatch = Arc::clone(&wallet_client);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let mut rx = wallet_client_for_dispatch.cache_updates();
+                        loop {
+                            match rx.recv().await {
+                                Ok(update) => {
+                                    dispatch_cache_update(
+                                        &wallet_for_dispatch,
+                                        &wallet_client_for_dispatch,
+                                        update,
+                                    )
+                                    .await;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    leptos::logging::log!(
+                                        "cache dispatch lagged ({n}) — resyncing all signals"
+                                    );
+                                    resync_all_signals(
+                                        &wallet_for_dispatch,
+                                        &wallet_client_for_dispatch,
+                                    )
+                                    .await;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                    leptos::logging::log!(
+                                        "cache dispatch closed — wallet client dropped"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
 
-                // Drive the connect→join→serve→reconnect supervisor for
-                // the page's lifetime. `run()` borrows `&self`; the
-                // `Arc` keeps the service alive across the spawned task.
-                // The view-model `Arc` (stored above) keeps the same
-                // service addressable from outside, so `teardown_realtime`
-                // can flip the stop flag and this loop exits cleanly.
+                // 7. DOM lifecycle: forward `visibilitychange` +
+                //    `online`/`offline` to the realtime service and
+                //    `notify_foreground` edges to the driver. Unchanged
+                //    from the pre-migration wiring.
+                wire_dom_lifecycle(&service, Some(&driver_handle));
+
+                // 8. Drive the connect→join→serve→reconnect supervisor
+                //    for the page's lifetime. `run()` borrows `&self`;
+                //    the `Arc` keeps the service alive across the
+                //    spawned task. The view-model `Arc` (stored above)
+                //    keeps the same service addressable from outside,
+                //    so `teardown_realtime` can flip the stop flag and
+                //    this loop exits cleanly.
                 wasm_bindgen_futures::spawn_local(async move {
                     service.run().await;
                 });
             });
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native: settle into the canonical empty steady state so
+            // view tests render the same shape they'd see in the
+            // browser steady-state.
+            self.accounts.set(LoadState::Ready(Vec::new()));
+            self.pending_state
+                .set(LoadState::Ready(PendingStateSummary::default()));
+        }
     }
+
+    /// Foreground retry — used by the home page's "Retry" affordance
+    /// when [`Self::start`] surfaced an `Error`. Re-runs
+    /// [`populate_all`] against the existing `Arc<WalletClient>` (or
+    /// builds one if `start` failed at the wallet-client step).
+    ///
+    /// `background == true` keeps the last `Ready` value on screen
+    /// during the retry (SWR); `background == false` flips to `Loading`
+    /// if nothing is currently `Ready`. The cache is the source of
+    /// truth: a successful retry means the cache's `*_or_populate`
+    /// methods completed their storage round-trip for the failed slice.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(clippy::needless_pass_by_value, unused_variables)
+    )]
+    pub fn refresh_with_config(self, config: Option<AppConfig>, background: bool) {
+        // Foreground spinner discipline preserved from the pre-cache
+        // shape: only blank the hero on a foreground refresh when there
+        // is no `Ready` value to keep showing.
+        let has_ready_accounts = matches!(self.accounts.get_untracked(), LoadState::Ready(_));
+        if !background && !has_ready_accounts {
+            self.accounts.set(LoadState::Loading);
+        }
+        let has_ready_pending = matches!(self.pending_state.get_untracked(), LoadState::Ready(_));
+        if !background && !has_ready_pending {
+            self.pending_state.set(LoadState::Loading);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(config) = config else {
+                self.accounts
+                    .set(LoadState::Error("AppConfig context missing".to_string()));
+                return;
+            };
+
+            // If `start` already built a wallet client, re-use it. The
+            // cache's `*_or_populate` methods are idempotent: a
+            // successful populate is a no-op, a failed one (the case
+            // we're retrying) re-attempts the storage call.
+            let wallet_client = if let Some(existing) = self.wallet_client.get_untracked() {
+                existing
+            } else {
+                // `start` failed before stashing a wallet client (e.g.
+                // session load failed). Re-build now.
+                let uid = match load_session_user_id().await {
+                    Ok(Some(uid)) => uid,
+                    Ok(None) => {
+                        self.accounts.set(LoadState::Ready(Vec::new()));
+                        return;
+                    }
+                    Err(e) => {
+                        self.accounts.set(LoadState::Error(e));
+                        return;
+                    }
+                };
+                self.user_id.set(Some(uid));
+                match build_wallet_client(&config, uid).await {
+                    Ok(c) => {
+                        self.wallet_client.set(Some(std::sync::Arc::clone(&c)));
+                        c
+                    }
+                    Err(e) => {
+                        self.accounts.set(LoadState::Error(e));
+                        return;
+                    }
+                }
+            };
+
+            populate_all(&self, &wallet_client).await;
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        leptos::task::spawn_local(async move {
+            self.accounts.set(LoadState::Ready(Vec::new()));
+            self.pending_state
+                .set(LoadState::Ready(PendingStateSummary::default()));
+        });
+    }
+}
+
+/// Run the initial cache populate for every cache-backed signal,
+/// foreground-style. Each cache method is lazy-populate-on-first-call;
+/// subsequent calls (the dispatch pump, the retry button) get back-to-
+/// back O(1) reads.
+///
+/// On error the corresponding signal flips to `LoadState::Error(_)`; the
+/// other signal is unaffected so a transient pending-list failure
+/// doesn't take down the balance hero (and vice versa).
+#[cfg(target_arch = "wasm32")]
+async fn populate_all(wallet: &WalletData, wallet_client: &agicash_wallet::WalletClient) {
+    // Run accounts + pending populates concurrently. The cache layer's
+    // in-flight guard serialises any duplicate first-callers across the
+    // five storage calls (it's keyed by `CacheKind`), so we're safe to
+    // fire them in parallel from the same task without exploding the
+    // request fan-out.
+    let accounts_fut = wallet_client.accounts();
+    let pending_fut = read_pending_state_summary(wallet_client);
+    let (accounts_res, pending_res) = futures_util::future::join(accounts_fut, pending_fut).await;
+
+    match accounts_res {
+        Ok(accounts) => {
+            let summaries: Vec<AccountSummary> =
+                accounts.iter().map(AccountSummary::from_facade).collect();
+            wallet.accounts.set(LoadState::Ready(summaries));
+        }
+        Err(e) => {
+            wallet.accounts.set(LoadState::Error(format!("{e}")));
+        }
+    }
+
+    match pending_res {
+        Ok(summary) => {
+            wallet.pending_state.set(LoadState::Ready(summary));
+        }
+        Err(e) => {
+            // Non-fatal: keep accounts on screen. Surface the pending
+            // failure on its own signal.
+            wallet.pending_state.set(LoadState::Error(e));
+        }
+    }
+}
+
+/// Read the four pending-list slices from the cache (lazy-populates on
+/// first call) and recompose into [`PendingStateSummary`].
+///
+/// The four reads run concurrently; the cache's in-flight guard
+/// serialises any duplicate storage calls across them. A single
+/// storage-error from any one slice fails the whole summary (mirrors
+/// the facade's `refresh_pending_state` short-circuit behaviour).
+#[cfg(target_arch = "wasm32")]
+async fn read_pending_state_summary(
+    wallet_client: &agicash_wallet::WalletClient,
+) -> Result<PendingStateSummary, String> {
+    let (mq, rs, sq, ss) = futures_util::future::join4(
+        wallet_client.pending_cashu_receive_quotes(),
+        wallet_client.pending_cashu_receive_swaps(),
+        wallet_client.unresolved_cashu_send_quotes(),
+        wallet_client.unresolved_cashu_send_swaps(),
+    )
+    .await;
+
+    let mint_quotes = mq.map_err(|e| format!("pending_cashu_receive_quotes: {e}"))?;
+    let receive_swaps = rs.map_err(|e| format!("pending_cashu_receive_swaps: {e}"))?;
+    let melt_quotes = sq.map_err(|e| format!("unresolved_cashu_send_quotes: {e}"))?;
+    let send_swaps = ss.map_err(|e| format!("unresolved_cashu_send_swaps: {e}"))?;
+
+    Ok(PendingStateSummary {
+        mint_quotes: mint_quotes
+            .iter()
+            .map(|q| PendingItem {
+                id: q.id.to_string(),
+                state: mint_quote_state_label(&q.state),
+            })
+            .collect(),
+        receive_swaps: receive_swaps
+            .iter()
+            .map(|sw| PendingItem {
+                // Receive-swap identity is its token_hash — no row UUID.
+                id: sw.token_hash.clone(),
+                state: receive_swap_state_label(&sw.state),
+            })
+            .collect(),
+        melt_quotes: melt_quotes
+            .iter()
+            .map(|q| PendingItem {
+                id: q.id.to_string(),
+                state: melt_quote_state_label(&q.state),
+            })
+            .collect(),
+        send_swaps: send_swaps
+            .iter()
+            .map(|sw| PendingItem {
+                id: sw.id.to_string(),
+                state: send_swap_state_label(&sw.state),
+            })
+            .collect(),
+    })
+}
+
+/// Translate one [`agicash_wallet::CacheUpdate`] tick into the matching
+/// signal `set()`.
+///
+/// Accounts + AccountBalance ticks rebuild the local
+/// `Vec<AccountSummary>` from the facade (`WalletClient::accounts()` is
+/// cache-resident after the first populate so this is an in-process
+/// roundtrip; the read includes a balance recompute via the cache's
+/// memoized `account_balance` field).
+///
+/// Any of the four pending-slice ticks recompose the full
+/// `PendingStateSummary` from cache. Signal-equality dedup in Leptos
+/// prevents extra renders if the value didn't change.
+///
+/// Other ticks (`Transactions`, `UnacknowledgedTransactionCount`) are
+/// out-of-scope for the current Leptos view; logged at trace and
+/// ignored.
+#[cfg(target_arch = "wasm32")]
+async fn dispatch_cache_update(
+    wallet: &WalletData,
+    wallet_client: &agicash_wallet::WalletClient,
+    update: agicash_wallet::CacheUpdate,
+) {
+    use agicash_wallet::CacheKind;
+
+    match update.kind {
+        CacheKind::Accounts | CacheKind::AccountBalance => match wallet_client.accounts().await {
+            Ok(accounts) => {
+                let summaries: Vec<AccountSummary> =
+                    accounts.iter().map(AccountSummary::from_facade).collect();
+                wallet.accounts.set(LoadState::Ready(summaries));
+            }
+            Err(e) => {
+                leptos::logging::log!(
+                    "cache dispatch: accounts re-read failed (keeping last value): {e}"
+                );
+            }
+        },
+        CacheKind::CashuReceiveQuotes
+        | CacheKind::CashuReceiveSwaps
+        | CacheKind::CashuSendQuotes
+        | CacheKind::CashuSendSwaps => match read_pending_state_summary(wallet_client).await {
+            Ok(summary) => {
+                wallet.pending_state.set(LoadState::Ready(summary));
+            }
+            Err(e) => {
+                leptos::logging::log!(
+                    "cache dispatch: pending-state re-read failed (keeping last value): {e}"
+                );
+            }
+        },
+        CacheKind::Transactions | CacheKind::UnacknowledgedTransactionCount => {
+            // No Leptos consumer yet — the transactions view is a
+            // separate lane.
+        }
+    }
+}
+
+/// Full resync after a `Lagged(n)` recv error. Drops any dispatch-state
+/// assumptions and rebuilds every cache-backed signal from the cache
+/// (which is still authoritative — only the tick stream lagged).
+///
+/// Quiet on the signal level: a successful resync transitions
+/// `LoadState::Ready(_)` → `LoadState::Ready(new_value)` and the dedup
+/// in Leptos suppresses no-op renders.
+#[cfg(target_arch = "wasm32")]
+async fn resync_all_signals(wallet: &WalletData, wallet_client: &agicash_wallet::WalletClient) {
+    populate_all(wallet, wallet_client).await;
 }
 
 /// Wire DOM lifecycle events to the realtime supervisor (Gap-E):
@@ -1005,21 +1061,12 @@ impl agicash_realtime::TransportFactory for WasmTransportFactory {
 /// per-client (`Arc<RwLock<Option<TokenPair>>>`, all `None` on `new()`);
 /// token *persistence* lives separately in `BrowserSessionStorage`
 /// (`window.localStorage`). A bare `OpenSecretClient::new(..)` is
-/// therefore a clean slate with no refresh token, so
-/// `generate_third_party_token` → SDK auto-refresh →
-/// `Error::Authentication("No refresh token available")`. Every
-/// token-provider construction site MUST re-seed the refresh token from
-/// `BrowserSessionStorage` (exactly as `app.rs::rehydrate_session`
-/// does); this helper is that seam, shared by both the storage path
-/// (`fetch_account_summaries`) and the realtime path
-/// (`build_opensecret_client`).
-///
-/// Steps mirror `rehydrate_session`: build client → load persisted
-/// session → `set_tokens("", Some(refresh_token))` → `refresh()` once
-/// (attestation handshake + `/refresh` exchange, which writes the fresh
-/// access + refresh pair into this client's session manager). A missing
-/// persisted session is a hard error here (callers only reach this
-/// after `ProtectedLayout` gated on an authenticated session).
+/// therefore a clean slate with no refresh token, so the realtime JWT
+/// mint fails with "No refresh token available". Every token-provider
+/// construction site MUST re-seed the refresh token from
+/// `BrowserSessionStorage`; this helper is that seam (still used by the
+/// realtime JWT provider after the cache-consumer migration — storage
+/// reads route through the `WalletClient` facade instead).
 #[cfg(target_arch = "wasm32")]
 async fn session_seeded_opensecret_client(
     config: &AppConfig,
@@ -1077,12 +1124,8 @@ async fn session_seeded_opensecret_client(
 /// session-threading pattern): construct the wallet, load the persisted
 /// session from `BrowserSessionStorage`, and if present hand it to
 /// `wallet.set_session(...)` — which runs the OS handshake + refresh
-/// + persist (mirrors what `session_seeded_opensecret_client` does for
-/// the storage / realtime composition roots). Returns the wallet
-/// regardless of whether a session was found: callers that genuinely
-/// support unauthenticated operation can still receive an
-/// `Unauthenticated` error on their first facade call instead of a
-/// helper-level hard failure.
+/// + persist. Returns the wallet regardless of whether a session was
+/// found.
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn seed_wasm_wallet(
     config: &AppConfig,
@@ -1107,9 +1150,7 @@ pub(crate) async fn seed_wasm_wallet(
         Ok(None) => {
             // No persisted session — caller may handle the resulting
             // Unauthenticated error explicitly (e.g. a public-mint
-            // preview path). The wallet is still returned so the call
-            // site's `Err` arm carries a real facade error, not a
-            // helper-level "no session" string.
+            // preview path).
         }
         Err(e) => {
             return Err(JsValue::from_str(&format!("session load failed: {e}")));
@@ -1117,21 +1158,6 @@ pub(crate) async fn seed_wasm_wallet(
     }
 
     Ok(wallet)
-}
-
-/// Build the `OpenSecret` token provider from the resolved [`AppConfig`]
-/// — the same session-seeded construction `fetch_account_summaries`
-/// uses for storage, so the realtime join JWT comes from the identical
-/// token source. Now async + session-threaded (was a bare empty-client
-/// `new`, the root cause of the "No refresh token available" failure).
-#[cfg(target_arch = "wasm32")]
-async fn build_opensecret_client(
-    config: &AppConfig,
-) -> Result<agicash_auth_opensecret::OpenSecretTokenProvider, String> {
-    use agicash_auth_opensecret::OpenSecretTokenProvider;
-
-    let client = session_seeded_opensecret_client(config).await?;
-    Ok(OpenSecretTokenProvider::new(client))
 }
 
 impl Default for WalletData {
@@ -1157,102 +1183,66 @@ async fn load_session_user_id() -> Result<Option<Uuid>, String> {
     }
 }
 
-/// Build the typed `SupabaseStorage` + the send-swap storage helper,
-/// fetch the user's accounts, and compute the per-account balance.
+/// Build a session-seeded `Arc<WalletClient>`.
 ///
-/// Mirrors `agicash_ffi::wallet::list_accounts` + `compute_cashu_balance`.
-// `SupabaseStorage` is `!Send`/`!Sync` on wasm32, but
-// `SupabaseCashuSendSwapStorage::new` (the `agicash-storage-supabase`
-// public API) requires `Arc<SupabaseStorage>` — the `Arc` is
-// API-mandated, not a free choice; `Rc` would mean changing that
-// crate's signature. Out of scope for lint cleanup. (This fn is
-// already wasm32-only, so a plain allow is correct.)
+/// Single composition root for the cache-consumer migration. The
+/// returned `Arc<WalletClient>` is shared by:
+///
+/// - The resumption driver — sweep writes (the `WalletClientSweeper`).
+/// - The apply pump — `apply_realtime_change` calls from the
+///   `Change(boxed)` arm of the realtime broadcast.
+/// - The dispatch pump — `cache_updates()` subscription + per-slice
+///   reads (`accounts()`, `pending_cashu_receive_quotes()`, etc.) on
+///   every tick.
+/// - The foreground populate path — initial bring-up + retry.
+///
+/// `from_config` does NO network I/O at construction (verified by the
+/// `from_config_constructs_without_network` unit test in
+/// `crates/agicash-wallet/src/builder.rs`); `set_session` is the one
+/// async step (handshake + refresh exchange against the browser-
+/// persisted refresh token).
 #[cfg(target_arch = "wasm32")]
-#[allow(clippy::arc_with_non_send_sync)]
-async fn fetch_account_summaries(
+async fn build_wallet_client(
     config: &AppConfig,
     user_id: Uuid,
-) -> Result<Vec<AccountSummary>, String> {
-    use std::sync::Arc;
-
-    use agicash_auth_opensecret::OpenSecretTokenProvider;
-    use agicash_cashu::CashuSendSwapStorage;
-    use agicash_domain::{AccountType, UserId};
-    use agicash_storage_supabase::{
-        SupabaseCashuSendSwapStorage, SupabaseStorage, SupabaseStorageConfig,
-    };
-    use agicash_traits::{PassthroughProofEncryption, ProofEncryption, TokenProvider, UserStorage};
+) -> Result<std::sync::Arc<agicash_wallet::WalletClient>, String> {
+    use agicash_traits::SessionStorage;
+    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
 
     if config.supabase_anon_key.is_empty() {
-        return Err(
-            "Supabase anon key missing — set <meta name=\"supabase-anon-key\"> in \
-             index.html or you'll only see auth-only state."
-                .to_string(),
-        );
+        return Err("Supabase anon key missing — wallet client skipped".to_string());
     }
 
-    // OpenSecret-backed token provider over a client that has the
-    // browser session's refresh token threaded in (via
-    // `session_seeded_opensecret_client` → `BrowserSessionStorage` +
-    // `set_tokens` + `refresh`). A bare `OpenSecretClient::new` here was
-    // an empty in-memory session → `generate_third_party_token` failed
-    // with "No refresh token available" and black-holed every
-    // authenticated wallet load. Each `get_jwt` now mints a fresh
-    // Supabase-compatible JWT from the seeded session.
-    let client = session_seeded_opensecret_client(config).await?;
-    let tokens: Arc<dyn TokenProvider> = Arc::new(OpenSecretTokenProvider::new(client));
+    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
+        opensecret_url: config.opensecret_base_url.clone(),
+        opensecret_client_id: config.opensecret_client_id,
+        supabase_url: config.supabase_url.clone(),
+        supabase_anon_key: config.supabase_anon_key.clone(),
+        session_storage: SessionStorageChoice::InMemory,
+    })
+    .map_err(|e| format!("build wallet client: {e}"))?;
 
-    let storage = SupabaseStorage::new(
-        SupabaseStorageConfig {
-            url: config.supabase_url.clone(),
-            anon_key: config.supabase_anon_key.clone(),
-        },
-        tokens,
-    )
-    .map_err(|e| format!("build supabase storage: {e}"))?;
-
-    let accounts = storage
-        .list_accounts(UserId::from(user_id))
+    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
+        .load()
         .await
-        .map_err(|e| format!("list_accounts failed: {e}"))?;
+    {
+        Ok(Some(s)) => s.refresh_token,
+        Ok(None) => {
+            return Err(
+                "no persisted session — refresh token unavailable (please log in again)".into(),
+            )
+        }
+        Err(e) => return Err(format!("session load failed: {e}")),
+    };
+    wallet
+        .set_session(Session {
+            user_id: agicash_domain::UserId::from(user_id),
+            refresh_token,
+        })
+        .await
+        .map_err(|e| format!("seed wallet session: {e}"))?;
 
-    // For per-account balance we need the send-swap storage, which
-    // wraps the same `SupabaseStorage` plus a `ProofEncryption`. The
-    // production stack uses `PassthroughProofEncryption` until the real
-    // encryption layer ships (mirrors CLI + FFI composition root).
-    let storage_arc = Arc::new(storage);
-    let encryption: Arc<dyn ProofEncryption> = Arc::new(PassthroughProofEncryption);
-    let send_swap_storage = SupabaseCashuSendSwapStorage::new(Arc::clone(&storage_arc), encryption);
-
-    let mut summaries = Vec::with_capacity(accounts.len());
-    for account in accounts {
-        let balance = match account.account_type {
-            AccountType::Cashu => match send_swap_storage.list_unspent_proofs(account.id).await {
-                Ok(proofs) => proofs.iter().map(|p| p.proof.amount).sum::<u64>(),
-                Err(e) => {
-                    // Log and continue — one account's failure shouldn't
-                    // black-hole the whole list. The user sees this
-                    // account's balance as zero with the rest intact.
-                    leptos::logging::log!(
-                        "list_unspent_proofs failed for account {}: {e}",
-                        account.id
-                    );
-                    0
-                }
-            },
-            AccountType::Spark => {
-                // Spark proof storage hasn't been wasm-ported yet (slice 9).
-                // Mirrors the FFI compute_cashu_balance Spark arm.
-                0
-            }
-        };
-        summaries.push(AccountSummary {
-            currency: account.currency.to_string(),
-            balance,
-        });
-    }
-
-    Ok(summaries)
+    Ok(wallet)
 }
 
 /// Map each Cashu money-state enum to the uppercase string the DB
@@ -1308,183 +1298,6 @@ fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
     .to_string()
 }
 
-/// Build a session-seeded `Arc<WalletClient>` for the resumption driver
-/// (plan 2026-05-21 §7 Lane E).
-///
-/// Same composition root [`fetch_pending_state`] uses
-/// (`WalletClient::from_config` + `set_session` with the browser-
-/// persisted refresh token), but the `Arc` is kept long-lived: it is
-/// handed to `WalletClientSweeper::new`, which the driver task holds
-/// for its whole lifetime so every sweep reuses the same auth /
-/// storage stack instead of rebuilding it. `from_config` does NO
-/// network I/O at construction (verified by the `from_config_constructs_without_network`
-/// unit test in `crates/agicash-wallet/src/builder.rs`); `set_session`
-/// is the one async step (handshake + refresh exchange).
-///
-/// Caller invariants: must be called inside the same `spawn_local`
-/// future that built the realtime service — already passed
-/// `AppConfig` captured before the spawn — so this fn does not need
-/// to touch `use_context`. A failure here is non-fatal (logged and
-/// the driver is simply skipped this session); the realtime pump and
-/// the existing background `refresh_pending_state` continue to run.
-#[cfg(target_arch = "wasm32")]
-async fn build_driver_wallet_client(
-    config: &AppConfig,
-    user_id: Uuid,
-) -> Result<std::sync::Arc<agicash_wallet::WalletClient>, String> {
-    use agicash_traits::SessionStorage;
-    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
-
-    if config.supabase_anon_key.is_empty() {
-        return Err("Supabase anon key missing — driver wallet client skipped".to_string());
-    }
-
-    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
-        opensecret_url: config.opensecret_base_url.clone(),
-        opensecret_client_id: config.opensecret_client_id,
-        supabase_url: config.supabase_url.clone(),
-        supabase_anon_key: config.supabase_anon_key.clone(),
-        session_storage: SessionStorageChoice::InMemory,
-    })
-    .map_err(|e| format!("build wallet client: {e}"))?;
-
-    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
-        .load()
-        .await
-    {
-        Ok(Some(s)) => s.refresh_token,
-        Ok(None) => {
-            return Err(
-                "no persisted session — refresh token unavailable (please log in again)".into(),
-            )
-        }
-        Err(e) => return Err(format!("session load failed: {e}")),
-    };
-    wallet
-        .set_session(Session {
-            user_id: agicash_domain::UserId::from(user_id),
-            refresh_token,
-        })
-        .await
-        .map_err(|e| format!("seed wallet session: {e}"))?;
-
-    Ok(wallet)
-}
-
-/// Realtime-(re)connect catch-up: fetch the signed-in user's full
-/// in-flight money state (slice 12e Lane 3, Gap-D).
-///
-/// Delegates to `agicash_wallet::WalletClient::refresh_pending_state` —
-/// the single in-flight money-state aggregator the FFI shell also calls.
-/// The `agicash-wallet` facade is wasm-composable (its deps are
-/// `cfg`-gated since `c11731cf`), so the Leptos client no longer needs
-/// to hand-roll a duplicate of the four `list_*` storage reads.
-///
-/// Construction path: `WalletClient::from_config` (the same composition
-/// root the FFI and the wasm-bindgen shell use) → `set_session` with the
-/// browser-persisted refresh token. `set_session` seeds the `OpenSecret`
-/// client the facade's storage layer shares, exactly as the old
-/// `session_seeded_opensecret_client` helper did (`ensure_handshake` +
-/// `set_tokens` + `refresh`). `refresh_pending_state` then issues the
-/// four reads concurrently and short-circuits on the first error.
-///
-/// The facade returns `PendingStateSnapshot` (raw `agicash-cashu` row
-/// types); this maps it to the local `(id, state)` view summary using
-/// the same state-label helpers.
-#[cfg(target_arch = "wasm32")]
-async fn fetch_pending_state(
-    config: &AppConfig,
-    user_id: Uuid,
-) -> Result<PendingStateSummary, String> {
-    use agicash_traits::SessionStorage;
-    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
-
-    if config.supabase_anon_key.is_empty() {
-        return Err("Supabase anon key missing — pending-state catch-up skipped".to_string());
-    }
-
-    // Build the facade over the SAME `from_config` composition root the
-    // FFI / wasm-bindgen shell use. No network I/O at construction; the
-    // browser persists the refresh token via `BrowserSessionStorage`, so
-    // the facade's own session-storage choice is irrelevant here.
-    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
-        opensecret_url: config.opensecret_base_url.clone(),
-        opensecret_client_id: config.opensecret_client_id,
-        supabase_url: config.supabase_url.clone(),
-        supabase_anon_key: config.supabase_anon_key.clone(),
-        session_storage: SessionStorageChoice::InMemory,
-    })
-    .map_err(|e| format!("build wallet client: {e}"))?;
-
-    // Seed the session from the browser-persisted refresh token. This
-    // threads the token into the `OpenSecret` client the facade's
-    // storage layer shares — `set_session` does the same
-    // `ensure_handshake` + `set_tokens` + `refresh` the old
-    // `session_seeded_opensecret_client` helper did.
-    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
-        .load()
-        .await
-    {
-        Ok(Some(s)) => s.refresh_token,
-        Ok(None) => {
-            return Err(
-                "no persisted session — refresh token unavailable (please log in again)".into(),
-            )
-        }
-        Err(e) => return Err(format!("session load failed: {e}")),
-    };
-    wallet
-        .set_session(Session {
-            user_id: agicash_domain::UserId::from(user_id),
-            refresh_token,
-        })
-        .await
-        .map_err(|e| format!("seed wallet session: {e}"))?;
-
-    // One call — the facade issues the four reads concurrently and
-    // short-circuits on the first storage error.
-    let snapshot = wallet
-        .refresh_pending_state()
-        .await
-        .map_err(|e| format!("refresh_pending_state: {e}"))?;
-
-    Ok(PendingStateSummary {
-        mint_quotes: snapshot
-            .mint_quotes
-            .iter()
-            .map(|q| PendingItem {
-                id: q.id.to_string(),
-                state: mint_quote_state_label(&q.state),
-            })
-            .collect(),
-        receive_swaps: snapshot
-            .receive_swaps
-            .iter()
-            .map(|sw| PendingItem {
-                // Receive-swap identity is its token_hash — no row UUID.
-                id: sw.token_hash.clone(),
-                state: receive_swap_state_label(&sw.state),
-            })
-            .collect(),
-        melt_quotes: snapshot
-            .melt_quotes
-            .iter()
-            .map(|q| PendingItem {
-                id: q.id.to_string(),
-                state: melt_quote_state_label(&q.state),
-            })
-            .collect(),
-        send_swaps: snapshot
-            .send_swaps
-            .iter()
-            .map(|sw| PendingItem {
-                id: sw.id.to_string(),
-                state: send_swap_state_label(&sw.state),
-            })
-            .collect(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1534,12 +1347,70 @@ mod tests {
     }
 
     /// `pending_state` is a `LoadState<PendingStateSummary>` — `Idle`
-    /// is the pre-first-`Connected` shape the App root constructs.
+    /// is the pre-first-populate shape the App root constructs.
     #[test]
     fn pending_state_load_state_idle_then_ready() {
         let idle: LoadState<PendingStateSummary> = LoadState::default();
         assert!(matches!(idle, LoadState::Idle));
         let ready = LoadState::Ready(PendingStateSummary::default());
         assert_eq!(ready.ready(), Some(&PendingStateSummary::default()));
+    }
+
+    /// Default `WalletData` matches the post-migration shape: every
+    /// data signal starts `Idle`, all lifecycle handles `None`, the
+    /// `reactivity_wired` latch `false`. This is the steady-state the
+    /// App root provides into context and the sign-out path resets
+    /// to via `clear_for_signout`.
+    #[test]
+    fn wallet_data_default_shape() {
+        let w = WalletData::new();
+        assert!(matches!(w.accounts.get_untracked(), LoadState::Idle));
+        assert!(matches!(w.pending_state.get_untracked(), LoadState::Idle));
+        assert_eq!(w.user_id.get_untracked(), None);
+        assert_eq!(w.realtime_status.get_untracked(), RealtimeStatus::Idle);
+        assert!(!w.reactivity_wired.get_untracked());
+    }
+
+    /// `clear_for_signout` returns every data signal to the
+    /// `LoadState::Idle` + `user_id = None` shape that matches a fresh
+    /// `WalletData`. Lifecycle handles + the wallet client get cleared
+    /// by `teardown_realtime` (called inside `clear_for_signout`).
+    #[test]
+    fn clear_for_signout_resets_data_signals() {
+        let w = WalletData::new();
+        // Seed some state to verify the reset actually fires.
+        w.accounts.set(LoadState::Ready(vec![AccountSummary {
+            currency: "BTC".into(),
+            balance: 1234,
+        }]));
+        w.pending_state
+            .set(LoadState::Ready(PendingStateSummary::default()));
+        w.user_id.set(Some(Uuid::nil()));
+        w.reactivity_wired.set(true);
+
+        w.clear_for_signout();
+
+        assert!(matches!(w.accounts.get_untracked(), LoadState::Idle));
+        assert!(matches!(w.pending_state.get_untracked(), LoadState::Idle));
+        assert_eq!(w.user_id.get_untracked(), None);
+        assert!(!w.reactivity_wired.get_untracked());
+    }
+
+    /// `start(None)` on native settles into the steady empty shape so
+    /// view tests render the same surface as the browser steady state.
+    /// (The wasm32 path is exercised by integration in the browser; the
+    /// native rlib test build covers the shape.)
+    #[test]
+    fn start_native_settles_empty_ready() {
+        let w = WalletData::new();
+        w.start(None);
+        assert_eq!(
+            w.accounts.get_untracked().ready(),
+            Some(&Vec::<AccountSummary>::new())
+        );
+        assert_eq!(
+            w.pending_state.get_untracked().ready(),
+            Some(&PendingStateSummary::default())
+        );
     }
 }

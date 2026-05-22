@@ -134,5 +134,18 @@ web-sys = { version = "0.3", features = [
 # unconditionally.
 getrandom = { workspace = true, features = ["js"] }
 
+# `tokio` — sync primitives ONLY. The cache dispatch pump
+# (`wallet_context::WalletData::start`) names
+# `tokio::sync::broadcast::error::RecvError::{Lagged, Closed}` when
+# matching on `WalletClient::cache_updates().recv()`. Mirrors the split-
+# cfg shape `agicash-wallet` ships: native takes the workspace tokio,
+# wasm takes a hand-spelled minimal sync-only dep so the wasm bundle
+# never pulls in the multi-thread runtime.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.42", default-features = false, features = ["sync"] }
+
 [lints]
 workspace = true

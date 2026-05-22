@@ -1,8 +1,8 @@
 //! `RealtimeStatusBanner` — thin connection-status strip rendered in the
 //! protected app shell (above `<Outlet/>`).
 //!
-//! Reads [`WalletData::realtime_status`] (kept current by the pump in
-//! [`WalletData::start_realtime`]) and renders three visual states,
+//! Reads [`WalletData::realtime_status`] (kept current by the apply
+//! pump in [`WalletData::start`]) and renders three visual states,
 //! mirroring the iOS/Android Lane 2a UX that's dispatched in parallel:
 //!
 //! - **Connected** (`Subscribed`) — banner hidden, no chrome cost. The
