@@ -29,6 +29,7 @@
 //! `WalletError::Validation` is returned with the missing-dep name.
 
 use crate::auth::AuthClient;
+use crate::cache::WalletCache;
 use crate::client::WalletClient;
 use crate::config::{SessionStorageChoice, WalletConfig};
 use crate::error::WalletError;
@@ -63,6 +64,13 @@ pub struct WalletClientBuilder {
     cashu_mint_quote_storage: Option<Arc<dyn CashuMintQuoteStorage>>,
     cashu_melt_quote_storage: Option<Arc<dyn CashuMeltQuoteStorage>>,
     exchange_rate: Option<Arc<dyn ExchangeRateProvider>>,
+    /// Proof-encryption handle used by the cache layer to decrypt
+    /// `encrypted_data` on incoming realtime `Change` payloads.
+    /// Defaults to `PassthroughProofEncryption` if not set — that
+    /// matches what `from_config` wires for the storage impls.
+    /// MUST be the same instance the storage impls were built with;
+    /// otherwise the cache's `to_cashu_*` conversions yield garbage.
+    encryption: Option<Arc<dyn ProofEncryption>>,
 }
 
 impl std::fmt::Debug for WalletClientBuilder {
@@ -85,6 +93,7 @@ impl std::fmt::Debug for WalletClientBuilder {
                 &self.cashu_melt_quote_storage.is_some(),
             )
             .field("exchange_rate_set", &self.exchange_rate.is_some())
+            .field("encryption_set", &self.encryption.is_some())
             .finish()
     }
 }
@@ -143,6 +152,19 @@ impl WalletClientBuilder {
         self
     }
 
+    /// Provide the proof-encryption handle the cache layer should use
+    /// when folding incoming realtime `Change` payloads. Must be the
+    /// same instance the storage impls were built with.
+    ///
+    /// If unset, the cache uses
+    /// [`agicash_traits::PassthroughProofEncryption`] (matches what
+    /// [`crate::WalletClient::from_config`] wires for storage).
+    #[must_use]
+    pub fn encryption(mut self, encryption: Arc<dyn ProofEncryption>) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
     /// Assemble the `WalletClient`. Fails with a `Validation` error if any
     /// required dep is missing — see module doc for the list.
     // `WalletClient` and its service handles are stored as `Arc<dyn …>` /
@@ -192,6 +214,16 @@ impl WalletClientBuilder {
             Arc::clone(&cashu_provider),
         ));
 
+        // The cache layer holds an Arc<dyn ProofEncryption> so it can
+        // call the storage `to_cashu_*` helpers on incoming realtime
+        // `Change` payloads. Defaults to passthrough — matches what
+        // `from_config` wires. Builder callers that use a non-trivial
+        // encryption MUST call `.encryption(...)` to keep this aligned.
+        let encryption: Arc<dyn ProofEncryption> = self
+            .encryption
+            .unwrap_or_else(|| Arc::new(PassthroughProofEncryption));
+        let cache = WalletCache::new(Arc::clone(&encryption));
+
         Ok(Arc::new(WalletClient {
             auth,
             user_storage,
@@ -205,6 +237,7 @@ impl WalletClientBuilder {
             mint_quote_service,
             melt_quote_service,
             exchange_rate: self.exchange_rate,
+            cache,
         }))
     }
 }
@@ -291,6 +324,9 @@ impl WalletClient {
             .cashu_send_storage(send_storage)
             .cashu_mint_quote_storage(mint_quote_storage)
             .cashu_melt_quote_storage(melt_quote_storage)
+            // The cache uses the same encryption handle as the storage
+            // impls so its row→rich conversions decrypt identically.
+            .encryption(Arc::clone(&encryption))
             .build()?;
 
         Ok((wallet, auth))
