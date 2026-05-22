@@ -6,6 +6,7 @@ use crate::event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
 use crate::transport::{RealtimeTransport, TransportBounds, WsFrame};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tracing::debug;
 
 const VSN: &str = "2.0.0";
 const CLIENT_VERSION: &str = "realtime-js/2.95.2";
@@ -170,10 +171,12 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
     /// timer (`run_once`'s monolithic loop holds `&mut self` for its
     /// whole lifetime, which a racing `send_heartbeat` cannot share).
     pub async fn connect_and_join(&mut self) -> Result<(), RealtimeError> {
+        debug!(user_id = %self.user_id, "realtime client: Connecting");
         let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
             RealtimeStatus::Connecting,
         ));
         self.transport.connect(&self.url).await?;
+        debug!(user_id = %self.user_id, "realtime client: socket Connected, sending phx_join");
 
         // Join (spec §3.3): join_ref == ref of this push.
         let jr = self.refs.next();
@@ -200,6 +203,7 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
         let msg = decode_frame(&frame)?;
         match classify(&msg, self.join_ref.as_deref()) {
             RouterAction::JoinReplyOk => {
+                debug!(user_id = %self.user_id, "realtime client: Subscribed (phx_reply ok)");
                 let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(
                     RealtimeStatus::Subscribed,
                 ));

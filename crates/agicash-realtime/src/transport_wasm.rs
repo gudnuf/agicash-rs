@@ -10,6 +10,7 @@ use crate::error::TransportError;
 use crate::transport::{RealtimeTransport, WsFrame};
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use tracing::{debug, error};
 use wasm_bindgen::{closure::Closure, JsCast};
 use web_sys::{BinaryType, MessageEvent, WebSocket};
 
@@ -37,7 +38,15 @@ impl WasmTransport {
 #[async_trait(?Send)]
 impl RealtimeTransport for WasmTransport {
     async fn connect(&mut self, url: &str) -> Result<(), TransportError> {
-        let ws = WebSocket::new(url).map_err(|e| TransportError::Connect(format!("{e:?}")))?;
+        debug!(url, "wasm transport connect starting");
+        let ws = WebSocket::new(url).map_err(|e| {
+            // Mirror the native side: log the JsValue error before
+            // wrapping into our own error type. Browser WS failures
+            // are notoriously cryptic; the raw JsValue debug print is
+            // the only diagnostic the runtime gives us.
+            error!(error = ?e, url, "browser WebSocket::new failed");
+            TransportError::Connect(format!("{e:?}"))
+        })?;
         ws.set_binary_type(BinaryType::Arraybuffer);
         let (tx, rx) = async_broadcast::broadcast(256);
 
@@ -63,6 +72,7 @@ impl RealtimeTransport for WasmTransport {
 
         self.ws = Some(ws);
         self.rx = Some(rx);
+        debug!(url, "wasm transport connect ok");
         Ok(())
     }
 
