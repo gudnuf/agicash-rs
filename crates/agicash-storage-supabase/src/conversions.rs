@@ -41,20 +41,23 @@
 //!
 //! ## Extraction status
 //!
-//! Three helpers are extracted in this pass (`to_account`,
-//! `to_cashu_mint_quote`, `to_cashu_melt_quote`,
-//! `to_cashu_receive_swap`). The send-swap conversion
-//! (`row_to_swap_with_extra_proofs` in `cashu_send_swap_storage.rs`)
-//! has a heavier entanglement with the per-proof bucketing logic
-//! (input proofs vs proofs-to-send vs change proofs) and the
-//! column-level encryption of `amount` / `secret` on each proof row;
-//! it remains inlined for now, flagged as a sub-smell of S9 — see the
-//! note in that file's module doc.
+//! Five helpers are extracted: `to_account`, `to_cashu_mint_quote`,
+//! `to_cashu_melt_quote`, `to_cashu_receive_swap`, and
+//! `to_cashu_send_swap`. The send-swap helper takes the typed
+//! `cashu_send_swaps` row PLUS a slice of joined `cashu_proofs` rows
+//! (the storage call sites already embed them via postgrest `select=*,
+//! cashu_proofs!cashu_send_swap_id(*)`), because the rich
+//! `CashuSendSwap` carries `input_proofs` / `proofs_to_send` buckets
+//! that are derived from the joined proofs — not from the swap row's
+//! `encrypted_data`. Per-proof `amount` / `secret` are themselves
+//! column-encrypted; the helper handles that internally. The bucket
+//! classification mirrors what the TS-side `to_swap` does (see body).
 
 use crate::generated::tables;
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteState, CashuMintQuote, CashuMintQuoteState, CashuReceiveSwap,
-    CashuReceiveSwapState, MeltQuoteStorageError, MintQuoteStorageError, ReceiveSwapStorageError,
+    CashuReceiveSwapState, CashuSendSwap, CashuSendSwapState, MeltQuoteStorageError,
+    MintQuoteStorageError, OutputAmounts, ReceiveSwapStorageError, SendSwapStorageError,
     TokenProof,
 };
 use agicash_domain::Account;
@@ -321,6 +324,154 @@ pub async fn to_cashu_receive_swap(
     })
 }
 
+/// `wallet.cashu_send_swaps` row + joined `cashu_proofs` rows →
+/// domain [`CashuSendSwap`].
+///
+/// Mirrors `SupabaseCashuSendSwapStorage::row_to_swap_with_extra_proofs`.
+/// Two-stage decryption:
+///
+/// 1. The swap row's `encrypted_data` blob → `SendData`
+///    (`amount_received`, fees, `output_amounts`, …).
+/// 2. Per-proof column-level decrypt of each joined `cashu_proofs`
+///    row's `amount` + `secret` columns (these are base64-of-cipher
+///    bytes wrapped by the SAME `ProofEncryption` handle as
+///    `encrypted_data`).
+///
+/// Each joined proof is classified into one of three buckets:
+///
+/// - **input proof** (`p.cashu_send_swap_id != swap.id`): proof was
+///   reserved as input to the swap but not produced by it.
+/// - **proof to send** (`p.cashu_send_swap_id == swap.id` AND
+///   `p.spending_cashu_send_swap_id == swap.id`): produced by the
+///   input swap AND tagged as spent-by this swap → the proof the
+///   receiver will claim.
+/// - **change** (`p.spending_cashu_send_swap_id != swap.id` AND
+///   `p.cashu_send_swap_id == swap.id`): produced by the input swap
+///   but flowed back to the account; no bucket in the rich type.
+///
+/// Exact-amount path (`requires_input_proofs_swap = false`): no input
+/// swap occurred, so the joined proofs ARE both the inputs AND the
+/// proofs-to-send. They appear in both buckets (matches the TS-side
+/// `to_swap` OR-condition).
+///
+/// # Errors
+///
+/// Returns `SendSwapStorageError::Backend` for blob decode / parse /
+/// utf8 / out-of-range numeric errors;
+/// `SendSwapStorageError::Encryption` if any decrypt call fails.
+pub async fn to_cashu_send_swap(
+    row: &tables::cashu_send_swaps::CashuSendSwapsRow,
+    cashu_proofs: &[tables::cashu_proofs::CashuProofsRow],
+    encryption: &dyn ProofEncryption,
+) -> Result<CashuSendSwap, SendSwapStorageError> {
+    let decoded = decrypt_blob::<SendSwapStorageError>(encryption, &row.encrypted_data).await?;
+    let send: SendData = serde_json::from_value(decoded)
+        .map_err(|e| SendSwapStorageError::Backend(format!("parse encrypted_data: {e}")))?;
+
+    // Bucket the joined proofs. See the doc comment above for the
+    // classification rule.
+    let mut input_proofs: Vec<TokenProof> = Vec::new();
+    let mut proofs_to_send: Vec<TokenProof> = Vec::new();
+    for p in cashu_proofs {
+        let is_swap_added = p.cashu_send_swap_id == Some(row.id);
+        let is_swap_spending = p.spending_cashu_send_swap_id == Some(row.id);
+        let proof = decrypt_proof_row(p, encryption).await?;
+        if !row.requires_input_proofs_swap {
+            // Exact-amount path: one set serves both buckets.
+            input_proofs.push(proof.clone());
+            proofs_to_send.push(proof);
+        } else if is_swap_added && is_swap_spending {
+            proofs_to_send.push(proof);
+        } else if !is_swap_added {
+            input_proofs.push(proof);
+        }
+        // else: change proof — owned by the account; no bucket here.
+    }
+
+    let state = match row.state {
+        crate::generated::enums::CashuSendSwapState::Draft => CashuSendSwapState::Draft,
+        crate::generated::enums::CashuSendSwapState::Pending => CashuSendSwapState::Pending {
+            token_hash: row.token_hash.clone().unwrap_or_default(),
+            proofs_to_send: proofs_to_send.clone(),
+        },
+        crate::generated::enums::CashuSendSwapState::Completed => CashuSendSwapState::Completed {
+            token_hash: row.token_hash.clone().unwrap_or_default(),
+            proofs_to_send: proofs_to_send.clone(),
+        },
+        crate::generated::enums::CashuSendSwapState::Failed => CashuSendSwapState::Failed {
+            failure_reason: row
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "unknown".into()),
+        },
+        crate::generated::enums::CashuSendSwapState::Reversed => CashuSendSwapState::Reversed,
+    };
+
+    let keyset_counter = match row.keyset_counter {
+        Some(c) => Some(u32::try_from(c).map_err(|_| {
+            SendSwapStorageError::Backend(format!("keyset_counter out of u32 range: {c}"))
+        })?),
+        None => None,
+    };
+    let version = u32::try_from(row.version).map_err(|_| {
+        SendSwapStorageError::Backend(format!("version out of u32 range: {}", row.version))
+    })?;
+
+    Ok(CashuSendSwap {
+        id: row.id,
+        account_id: agicash_domain::AccountId::from(row.account_id),
+        user_id: agicash_domain::UserId::from(row.user_id),
+        input_proofs,
+        input_amount: send.amount_reserved,
+        amount_received: send.amount_received,
+        cashu_receive_fee: send.cashu_receive_fee,
+        amount_to_send: send.amount_to_send,
+        cashu_send_fee: send.cashu_send_fee,
+        amount_spent: send.amount_spent,
+        total_fee: send.total_fee,
+        keyset_id: row.keyset_id.clone(),
+        keyset_counter,
+        output_amounts: send.output_amounts,
+        transaction_id: row.transaction_id,
+        created_at: row.created_at,
+        version,
+        state,
+    })
+}
+
+/// Decrypt a joined `cashu_proofs` row's column-level encrypted
+/// `amount` + `secret` and build a [`TokenProof`]. Other columns
+/// (`unblinded_signature`, `dleq`, `witness`) are plaintext and copy
+/// straight through.
+async fn decrypt_proof_row(
+    row: &tables::cashu_proofs::CashuProofsRow,
+    encryption: &dyn ProofEncryption,
+) -> Result<TokenProof, SendSwapStorageError> {
+    let amount_bytes = general_purpose::STANDARD
+        .decode(row.amount.as_bytes())
+        .map_err(|e| SendSwapStorageError::Backend(format!("decode amount: {e}")))?;
+    let secret_bytes = general_purpose::STANDARD
+        .decode(row.secret.as_bytes())
+        .map_err(|e| SendSwapStorageError::Backend(format!("decode secret: {e}")))?;
+    let amount_plain = encryption.decrypt(&amount_bytes).await?;
+    let secret_plain = encryption.decrypt(&secret_bytes).await?;
+    let amount: u64 = std::str::from_utf8(&amount_plain)
+        .map_err(|e| SendSwapStorageError::Backend(format!("amount utf8: {e}")))?
+        .parse()
+        .map_err(|e| SendSwapStorageError::Backend(format!("amount parse: {e}")))?;
+    let secret = std::str::from_utf8(&secret_plain)
+        .map_err(|e| SendSwapStorageError::Backend(format!("secret utf8: {e}")))?
+        .to_string();
+    Ok(TokenProof {
+        id: row.keyset_id.clone(),
+        amount,
+        secret,
+        c: row.unblinded_signature.clone(),
+        dleq: row.dleq.clone(),
+        witness: row.witness.clone(),
+    })
+}
+
 // ===========================================================================
 // Encrypted-blob shapes (intentionally private — they are an internal
 // wire-format detail of `encrypted_data`, not a stable contract).
@@ -382,6 +533,24 @@ struct ReceiveData {
     cashu_receive_fee: Money,
 }
 
+/// JSON inside `encrypted_data` for a Cashu send swap. Mirrors TS
+/// `CashuSwapSendDbDataSchema`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendData {
+    #[allow(dead_code)] // mint url isn't surfaced on the rich type today
+    token_mint_url: String,
+    amount_received: Money,
+    cashu_receive_fee: Money,
+    amount_to_send: Money,
+    cashu_send_fee: Money,
+    amount_spent: Money,
+    amount_reserved: Money,
+    total_fee: Money,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_amounts: Option<OutputAmounts>,
+}
+
 // ===========================================================================
 // Generic encryption helper (shared across the three quote/swap helpers).
 // ===========================================================================
@@ -417,6 +586,14 @@ impl BlobError for ReceiveSwapStorageError {
     }
     fn from_encryption(err: EncryptionError) -> Self {
         ReceiveSwapStorageError::Encryption(err)
+    }
+}
+impl BlobError for SendSwapStorageError {
+    fn backend(msg: String) -> Self {
+        SendSwapStorageError::Backend(msg)
+    }
+    fn from_encryption(err: EncryptionError) -> Self {
+        SendSwapStorageError::Encryption(err)
     }
 }
 
@@ -754,6 +931,216 @@ mod tests {
                 assert_eq!(failure_reason, "token already spent");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // -------- to_cashu_send_swap --------
+
+    /// Build a `SendData` JSON blob with all required side fields. Money
+    /// amounts are uniform — these tests exercise the bucket / state
+    /// machine logic, not the encrypted-data wiring.
+    fn send_blob() -> Value {
+        let money = Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat);
+        let zero = Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat);
+        json!({
+            "tokenMintUrl": "https://m",
+            "amountReceived": money,
+            "cashuReceiveFee": zero,
+            "amountToSend": money,
+            "cashuSendFee": zero,
+            "amountSpent": money,
+            "amountReserved": money,
+            "totalFee": zero,
+        })
+    }
+
+    /// Build a send-swap row in the given state. `requires_input_proofs_swap`
+    /// is wired in so the bucket logic in the helper sees the right shape.
+    async fn send_swap_row(
+        swap_id: Uuid,
+        state: crate::generated::enums::CashuSendSwapState,
+        requires_input_proofs_swap: bool,
+    ) -> tables::cashu_send_swaps::CashuSendSwapsRow {
+        tables::cashu_send_swaps::CashuSendSwapsRow {
+            id: swap_id,
+            user_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            transaction_id: Uuid::nil(),
+            keyset_id: None,
+            keyset_counter: None,
+            token_hash: Some("th".into()),
+            state,
+            version: 1,
+            created_at: chrono::Utc::now(),
+            failure_reason: None,
+            encrypted_data: encrypt_blob(&send_blob()).await,
+            requires_input_proofs_swap,
+        }
+    }
+
+    /// Build a column-encrypted proof row with the given send-swap
+    /// linkage. `cashu_send_swap_id` set → produced by the swap;
+    /// `spending_cashu_send_swap_id` set → spent by the swap. Set both
+    /// for a proof-to-send, only the latter NOT set for a change proof,
+    /// and neither for an input-only proof.
+    async fn proof_row(
+        secret: &str,
+        amount: u64,
+        cashu_send_swap_id: Option<Uuid>,
+        spending_cashu_send_swap_id: Option<Uuid>,
+    ) -> tables::cashu_proofs::CashuProofsRow {
+        let enc = passthrough();
+        let amount_cipher = enc.encrypt(amount.to_string().as_bytes()).await.unwrap();
+        let secret_cipher = enc.encrypt(secret.as_bytes()).await.unwrap();
+        tables::cashu_proofs::CashuProofsRow {
+            id: Uuid::new_v4(),
+            user_id: Uuid::nil(),
+            account_id: Uuid::nil(),
+            keyset_id: "ks1".into(),
+            amount: general_purpose::STANDARD.encode(amount_cipher),
+            secret: general_purpose::STANDARD.encode(secret_cipher),
+            unblinded_signature: "C1".into(),
+            public_key_y: "02deadbeef".into(),
+            dleq: None,
+            witness: None,
+            state: crate::generated::enums::CashuProofState::Reserved,
+            version: 0,
+            created_at: chrono::Utc::now(),
+            reserved_at: None,
+            spent_at: None,
+            cashu_receive_quote_id: None,
+            cashu_receive_swap_token_hash: None,
+            cashu_send_quote_id: None,
+            spending_cashu_send_quote_id: None,
+            cashu_send_swap_id,
+            spending_cashu_send_swap_id,
+        }
+    }
+
+    /// Exact-amount path (`requires_input_proofs_swap = false`): a single
+    /// joined proof is both the input AND the proof-to-send. The helper
+    /// double-counts (matches the TS-side OR condition).
+    #[tokio::test]
+    async fn to_cashu_send_swap_exact_amount_path_double_buckets_proof() {
+        let swap_id = Uuid::new_v4();
+        let row = send_swap_row(
+            swap_id,
+            crate::generated::enums::CashuSendSwapState::Pending,
+            false,
+        )
+        .await;
+        // For the exact-amount path the proof has neither linkage
+        // (storage attaches it via a different path) — bucketing
+        // ignores the linkage flags entirely.
+        let proofs = vec![proof_row("sec1", 64, None, None).await];
+        let swap = to_cashu_send_swap(&row, &proofs, passthrough().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(swap.input_proofs.len(), 1);
+        assert_eq!(swap.input_proofs[0].amount, 64);
+        match swap.state {
+            CashuSendSwapState::Pending {
+                token_hash,
+                proofs_to_send,
+            } => {
+                assert_eq!(token_hash, "th");
+                assert_eq!(proofs_to_send.len(), 1);
+                assert_eq!(proofs_to_send[0].secret, "sec1");
+            }
+            other => panic!("expected Pending, got: {other:?}"),
+        }
+    }
+
+    /// Input-swap path with a proof-to-send: `cashu_send_swap_id =
+    /// swap.id` AND `spending_cashu_send_swap_id = swap.id` → goes into
+    /// the `proofs_to_send` bucket only.
+    #[tokio::test]
+    async fn to_cashu_send_swap_input_swap_classifies_proof_to_send() {
+        let swap_id = Uuid::new_v4();
+        let row = send_swap_row(
+            swap_id,
+            crate::generated::enums::CashuSendSwapState::Pending,
+            true,
+        )
+        .await;
+        // One input proof (not produced by this swap) + one
+        // proof-to-send (produced AND spent by this swap).
+        let proofs = vec![
+            proof_row("input1", 64, None, None).await,
+            proof_row("send1", 32, Some(swap_id), Some(swap_id)).await,
+        ];
+        let swap = to_cashu_send_swap(&row, &proofs, passthrough().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(swap.input_proofs.len(), 1);
+        assert_eq!(swap.input_proofs[0].secret, "input1");
+        match swap.state {
+            CashuSendSwapState::Pending { proofs_to_send, .. } => {
+                assert_eq!(proofs_to_send.len(), 1);
+                assert_eq!(proofs_to_send[0].secret, "send1");
+                assert_eq!(proofs_to_send[0].amount, 32);
+            }
+            other => panic!("expected Pending, got: {other:?}"),
+        }
+    }
+
+    /// Input-swap path with a change proof: `cashu_send_swap_id =
+    /// swap.id` but `spending_cashu_send_swap_id != swap.id` (None
+    /// here — flowed back to the account). Falls into NO bucket on the
+    /// rich type.
+    #[tokio::test]
+    async fn to_cashu_send_swap_input_swap_change_proof_in_no_bucket() {
+        let swap_id = Uuid::new_v4();
+        let row = send_swap_row(
+            swap_id,
+            crate::generated::enums::CashuSendSwapState::Pending,
+            true,
+        )
+        .await;
+        // Input proof + proof-to-send + change proof (produced by swap
+        // but not spent by it).
+        let proofs = vec![
+            proof_row("input1", 64, None, None).await,
+            proof_row("send1", 32, Some(swap_id), Some(swap_id)).await,
+            proof_row("change1", 16, Some(swap_id), None).await,
+        ];
+        let swap = to_cashu_send_swap(&row, &proofs, passthrough().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(swap.input_proofs.len(), 1, "change must not be input");
+        assert_eq!(swap.input_proofs[0].secret, "input1");
+        match swap.state {
+            CashuSendSwapState::Pending { proofs_to_send, .. } => {
+                assert_eq!(
+                    proofs_to_send.len(),
+                    1,
+                    "change must not be in proofs_to_send"
+                );
+                assert_eq!(proofs_to_send[0].secret, "send1");
+            }
+            other => panic!("expected Pending, got: {other:?}"),
+        }
+    }
+
+    /// FAILED state pulls `failure_reason` from the public column.
+    #[tokio::test]
+    async fn to_cashu_send_swap_failed_uses_public_failure_reason() {
+        let swap_id = Uuid::new_v4();
+        let mut row = send_swap_row(
+            swap_id,
+            crate::generated::enums::CashuSendSwapState::Failed,
+            true,
+        )
+        .await;
+        row.failure_reason = Some("mint rejected".into());
+        let swap = to_cashu_send_swap(&row, &[], passthrough().as_ref())
+            .await
+            .unwrap();
+        match swap.state {
+            CashuSendSwapState::Failed { failure_reason } => {
+                assert_eq!(failure_reason, "mint rejected");
+            }
+            other => panic!("expected Failed, got: {other:?}"),
         }
     }
 }
