@@ -6125,6 +6125,31 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     }
 }
 /**
+ * Extract a Cashu token (`cashuA…` / `cashuB…`) from arbitrary text.
+ *
+ * Returns the verbatim matched substring iff it also structurally
+ * decodes; otherwise `None`. Pure, offline, no I/O — safe to call
+ * from any thread, no `async` runtime required.
+ *
+ * iOS calls this as `AgicashSDK.extractCashuToken(input:)`; Android
+ * calls it as `extractCashuToken(input)` on the package-level top.
+ * Both shells should call this **before** trimming + handing the
+ * string to `wallet.receiveToken(...)` — the inner CDK
+ * `Token::from_str` is strict and rejects anything wrapped (URL with
+ * hash, `cashu:` scheme, embedded in prose).
+ *
+ * On `None`, the UI should surface "no Cashu token found in that
+ * text" — do not fall back to passing the raw paste through
+ * `receiveToken`, which just re-creates the bug the extractor fixes.
+ */
+public func extractCashuToken(input: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_agicash_ffi_fn_func_extract_cashu_token(
+        FfiConverterString.lower(input),$0
+    )
+})
+}
+/**
  * Parse a Lightning Address into its localpart and domain.
  *
  * Validates the LUD-16 character set on the localpart and a sane
@@ -6232,6 +6257,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_agicash_ffi_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_agicash_ffi_checksum_func_extract_cashu_token() != 29195) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_func_parse_lightning_address() != 26475) {
         return InitializationResult.apiChecksumMismatch
