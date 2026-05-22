@@ -28,6 +28,12 @@ uuid = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 tokio-tungstenite = { workspace = true }
 tungstenite = { workspace = true }
+# Native TLS verifier — Security.framework on Apple, system cacerts on
+# Android, OS roots on desktop. Mirrors the `agicash-storage-supabase`
+# REST path so the iOS Simulator mkcert root is honoured by the
+# realtime WSS handshake too (see `transport_native.rs::connect`).
+rustls = { workspace = true }
+rustls-platform-verifier = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }

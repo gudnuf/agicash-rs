@@ -78,7 +78,15 @@ dotenvy = "0.15"
 getrandom = "0.2"
 
 # Realtime (Supabase / Phoenix v2 client) — slice 10
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-native-roots", "connect"] }
+# `__rustls-tls` exposes the `Connector::Rustls(Arc<ClientConfig>)` variant
+# and the `connect_async_tls_with_config` entry point — we pass a
+# `rustls-platform-verifier`-backed config so iOS Simulator / Android /
+# desktop all honour the platform trust store (mkcert root included).
+# We deliberately DO NOT use `rustls-tls-native-roots` (which calls
+# `rustls_native_certs::load_native_certs()` — reads `/etc/ssl` on macOS
+# but NOT the iOS Simulator Keychain, mirroring the bug that hit
+# `agicash-storage-supabase` weeks ago).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["__rustls-tls", "connect"] }
 tungstenite = { version = "0.24", default-features = false }
 web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event", "ErrorEvent"] }
 futures-util = "0.3"

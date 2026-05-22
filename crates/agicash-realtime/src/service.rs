@@ -15,6 +15,7 @@ use crate::event::{RealtimeStatus, WalletRealtimeEvent};
 use crate::transport::RealtimeTransport;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tracing::{debug, error, info_span, Instrument};
 
 /// Cap on consecutive `JoinReplyError` (RLS/auth deny) responses before
 /// the supervisor gives up. Mirrors React's
@@ -241,6 +242,14 @@ impl WalletRealtimeService {
     /// (§3.9). On every (re)join the client emits `Connected` so the
     /// caller can catch up (no replay, §5.5).
     pub async fn run(&self) {
+        // Scope every supervisor event under one span so the user_id /
+        // session distinguishes interleaved log streams in tests + on
+        // mobile (where the FFI bridge replays tracing into oslog/logcat).
+        let span = info_span!("realtime_supervisor", user_id = %self.user_id);
+        self.run_inner().instrument(span).await;
+    }
+
+    async fn run_inner(&self) {
         let mut attempt = 0usize;
         // JoinRejected attempts are tracked separately from transport
         // drops. Transport errors keep the existing "infinite retry,
@@ -283,15 +292,25 @@ impl WalletRealtimeService {
             }
             match result {
                 Ok(()) => {
+                    debug!("supervisor cycle ended cleanly; resetting counters");
                     attempt = 0;
                     join_rejects = 0;
                 }
-                Err(crate::RealtimeError::JoinRejected(_)) => {
+                Err(crate::RealtimeError::JoinRejected(reason)) => {
                     // Gap-B: an auth/RLS deny is qualitatively different
                     // from a transport drop. Count it; promote to
                     // terminal after the cap.
                     join_rejects += 1;
+                    error!(
+                        reason = %reason,
+                        join_rejects,
+                        cap = MAX_JOIN_REJECT_ATTEMPTS,
+                        "supervisor classified error: JoinRejected"
+                    );
                     if join_rejects >= MAX_JOIN_REJECT_ATTEMPTS {
+                        error!(
+                            "supervisor latching TerminalError after {MAX_JOIN_REJECT_ATTEMPTS} consecutive JoinRejected"
+                        );
                         self.terminal.store(true, Ordering::Relaxed);
                         let _ = self.tx.try_broadcast(WalletRealtimeEvent::StatusChanged(
                             RealtimeStatus::TerminalError,
@@ -306,18 +325,37 @@ impl WalletRealtimeService {
                         RealtimeStatus::Reconnecting,
                     ));
                     let idx = attempt.min(BACKOFF_MS.len() - 1);
-                    self.backoff_sleep(BACKOFF_MS[idx]).await;
+                    let ms = BACKOFF_MS[idx];
+                    debug!(
+                        attempt,
+                        backoff_ms = ms,
+                        "supervisor backoff sleep (JoinRejected branch)"
+                    );
+                    self.backoff_sleep(ms).await;
                     attempt += 1;
                 }
-                Err(_) => {
+                Err(e) => {
                     // Transport-level drop. Surface `Reconnecting` here
                     // so a bare `recv` error (no protocol `phx_close`)
                     // still tells the UI it lost the channel.
+                    //
+                    // The error string here is the load-bearing
+                    // diagnostic for this whole subsystem — when the iOS
+                    // sim TLS verifier rejects the local stack's mkcert
+                    // root, this is where the breadcrumb surfaces. Do
+                    // NOT swallow it.
+                    error!(error = %e, "supervisor classified error: transport drop (or non-JoinRejected)");
                     let _ = self.tx.try_broadcast(WalletRealtimeEvent::StatusChanged(
                         RealtimeStatus::Reconnecting,
                     ));
                     let idx = attempt.min(BACKOFF_MS.len() - 1);
-                    self.backoff_sleep(BACKOFF_MS[idx]).await;
+                    let ms = BACKOFF_MS[idx];
+                    debug!(
+                        attempt,
+                        backoff_ms = ms,
+                        "supervisor backoff sleep (transport branch)"
+                    );
+                    self.backoff_sleep(ms).await;
                     attempt += 1;
                     // Transport drops do NOT touch `join_rejects` — the
                     // counter only tracks the auth/RLS-deny class. A
