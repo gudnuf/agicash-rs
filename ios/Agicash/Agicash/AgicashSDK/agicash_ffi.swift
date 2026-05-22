@@ -2554,6 +2554,84 @@ public func FfiConverterTypeAuthStatus_lower(_ value: AuthStatus) -> RustBuffer 
 
 
 /**
+ * FFI-local mirror of `agicash_wallet::CacheUpdate` — one cache
+ * mutation tick. Lightweight by design: `(kind, optional row id)` lets
+ * the consumer decide whether it cares without re-reading the cache,
+ * and tells it which row changed if it does.
+ *
+ * Heavy payloads do NOT cross the FFI bridge — the consumer reads the
+ * new value back from the cache via the existing FFI methods
+ * (e.g. `AgicashWallet::list_accounts`, which is now cache-backed).
+ */
+public struct CacheUpdateFfi: Equatable, Hashable {
+    /**
+     * Which table slice mutated.
+     */
+    public var kind: CacheKindFfi
+    /**
+     * Row identity, when the mutation was row-scoped. `None` for
+     * derived/aggregate mutations (e.g. unacknowledged-count, balance
+     * recompute without a single row id).
+     */
+    public var id: RowIdFfi?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Which table slice mutated.
+         */kind: CacheKindFfi,
+        /**
+         * Row identity, when the mutation was row-scoped. `None` for
+         * derived/aggregate mutations (e.g. unacknowledged-count, balance
+         * recompute without a single row id).
+         */id: RowIdFfi?) {
+        self.kind = kind
+        self.id = id
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CacheUpdateFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCacheUpdateFfi: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CacheUpdateFfi {
+        return
+            try CacheUpdateFfi(
+                kind: FfiConverterTypeCacheKindFfi.read(from: &buf),
+                id: FfiConverterOptionTypeRowIdFfi.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CacheUpdateFfi, into buf: inout [UInt8]) {
+        FfiConverterTypeCacheKindFfi.write(value.kind, into: &buf)
+        FfiConverterOptionTypeRowIdFfi.write(value.id, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCacheUpdateFfi_lift(_ buf: RustBuffer) throws -> CacheUpdateFfi {
+    return try FfiConverterTypeCacheUpdateFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCacheUpdateFfi_lower(_ value: CacheUpdateFfi) -> RustBuffer {
+    return FfiConverterTypeCacheUpdateFfi.lower(value)
+}
+
+
+/**
  * A single exchange-rate reading for one currency pair.
  *
  * `rate` is decimal-stringified to match the
@@ -3713,175 +3791,6 @@ public func FfiConverterTypeMintQuoteSnapshot_lower(_ value: MintQuoteSnapshot) 
 
 
 /**
- * One in-flight (pending / unresolved) money-state row, flattened to
- * the minimal `(id, state)` pair the FFI surface needs.
- *
- * The full money/proof payload stays Rust-internal — a client that
- * wants the detail polls by `id` through the existing per-quote FFI
- * methods (`poll_mint_quote`, `check_send_swap_claimed`, …). This
- * record only has to tell the client *which* rows are still in flight
- * and *what state* they are in, which is all the realtime-reconnect
- * catch-up needs to refresh a stale "waiting…" list.
- */
-public struct PendingItemFfi: Equatable, Hashable {
-    /**
-     * The row's primary-key UUID, stringified.
-     */
-    public var id: String
-    /**
-     * Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` /
-     * `DRAFT`).
-     */
-    public var state: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The row's primary-key UUID, stringified.
-         */id: String,
-        /**
-         * Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` /
-         * `DRAFT`).
-         */state: String) {
-        self.id = id
-        self.state = state
-    }
-
-
-}
-
-#if compiler(>=6)
-extension PendingItemFfi: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypePendingItemFfi: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingItemFfi {
-        return
-            try PendingItemFfi(
-                id: FfiConverterString.read(from: &buf),
-                state: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: PendingItemFfi, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.id, into: &buf)
-        FfiConverterString.write(value.state, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePendingItemFfi_lift(_ buf: RustBuffer) throws -> PendingItemFfi {
-    return try FfiConverterTypePendingItemFfi.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePendingItemFfi_lower(_ value: PendingItemFfi) -> RustBuffer {
-    return FfiConverterTypePendingItemFfi.lower(value)
-}
-
-
-/**
- * FFI projection of `agicash_wallet::PendingStateSnapshot` — every
- * in-flight money-state row the signed-in user still owns, fetched in
- * one shot on a realtime (re)connect (slice 12e Lane 3, Gap-D).
- *
- * Four flat lists keyed by money-flow kind. An empty list is the
- * canonical "nothing in flight" state.
- */
-public struct PendingStateSnapshotFfi: Equatable, Hashable {
-    /**
-     * UNPAID / PAID mint quotes — Lightning receives still in flight.
-     */
-    public var mintQuotes: [PendingItemFfi]
-    /**
-     * PENDING receive swaps — inbound Cashu tokens still being claimed.
-     */
-    public var receiveSwaps: [PendingItemFfi]
-    /**
-     * UNPAID / PENDING melt quotes — Lightning sends still in flight.
-     */
-    public var meltQuotes: [PendingItemFfi]
-    /**
-     * DRAFT / PENDING send swaps — outbound tokens not yet claimed.
-     */
-    public var sendSwaps: [PendingItemFfi]
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * UNPAID / PAID mint quotes — Lightning receives still in flight.
-         */mintQuotes: [PendingItemFfi],
-        /**
-         * PENDING receive swaps — inbound Cashu tokens still being claimed.
-         */receiveSwaps: [PendingItemFfi],
-        /**
-         * UNPAID / PENDING melt quotes — Lightning sends still in flight.
-         */meltQuotes: [PendingItemFfi],
-        /**
-         * DRAFT / PENDING send swaps — outbound tokens not yet claimed.
-         */sendSwaps: [PendingItemFfi]) {
-        self.mintQuotes = mintQuotes
-        self.receiveSwaps = receiveSwaps
-        self.meltQuotes = meltQuotes
-        self.sendSwaps = sendSwaps
-    }
-
-
-}
-
-#if compiler(>=6)
-extension PendingStateSnapshotFfi: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypePendingStateSnapshotFfi: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingStateSnapshotFfi {
-        return
-            try PendingStateSnapshotFfi(
-                mintQuotes: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
-                receiveSwaps: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
-                meltQuotes: FfiConverterSequenceTypePendingItemFfi.read(from: &buf),
-                sendSwaps: FfiConverterSequenceTypePendingItemFfi.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: PendingStateSnapshotFfi, into buf: inout [UInt8]) {
-        FfiConverterSequenceTypePendingItemFfi.write(value.mintQuotes, into: &buf)
-        FfiConverterSequenceTypePendingItemFfi.write(value.receiveSwaps, into: &buf)
-        FfiConverterSequenceTypePendingItemFfi.write(value.meltQuotes, into: &buf)
-        FfiConverterSequenceTypePendingItemFfi.write(value.sendSwaps, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePendingStateSnapshotFfi_lift(_ buf: RustBuffer) throws -> PendingStateSnapshotFfi {
-    return try FfiConverterTypePendingStateSnapshotFfi.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypePendingStateSnapshotFfi_lower(_ value: PendingStateSnapshotFfi) -> RustBuffer {
-    return FfiConverterTypePendingStateSnapshotFfi.lower(value)
-}
-
-
-/**
  * FFI mirror of [`agicash_cashu::ReceiveFlowResult`]. Identical fields;
  * stringified for Swift codegen.
  */
@@ -4597,6 +4506,149 @@ public func FfiConverterTypeUserFfi_lift(_ buf: RustBuffer) throws -> UserFfi {
 public func FfiConverterTypeUserFfi_lower(_ value: UserFfi) -> RustBuffer {
     return FfiConverterTypeUserFfi.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * FFI-local mirror of `agicash_wallet::CacheKind` — which cache slice
+ * changed. Mirror (not re-export) so the wallet crate stays free of
+ * `uniffi` deps; the [`From`] impl below is exhaustive over every
+ * variant so a new kind can't silently drop on the FFI floor.
+ *
+ * Variant names match the DB-naming convention (smell S9):
+ * `CashuReceiveQuotes` is the React-side "mint quotes",
+ * `CashuSendQuotes` is the React-side "melt quotes". Receive / send
+ * swap names match both sides.
+ */
+
+public enum CacheKindFfi: Equatable, Hashable {
+
+    /**
+     * `wallet.accounts` rows.
+     */
+    case accounts
+    /**
+     * `wallet.transactions` rows.
+     */
+    case transactions
+    /**
+     * Derived: count of `wallet.transactions` with
+     * `acknowledgment_status = 'pending'`.
+     */
+    case unacknowledgedTransactionCount
+    /**
+     * `wallet.cashu_receive_quotes` rows (DB-naming for "mint quotes").
+     */
+    case cashuReceiveQuotes
+    /**
+     * `wallet.cashu_send_quotes` rows (DB-naming for "melt quotes").
+     */
+    case cashuSendQuotes
+    /**
+     * `wallet.cashu_receive_swaps` rows.
+     */
+    case cashuReceiveSwaps
+    /**
+     * `wallet.cashu_send_swaps` rows.
+     */
+    case cashuSendSwaps
+    /**
+     * Derived: per-account cached balance.
+     */
+    case accountBalance
+
+
+
+}
+
+#if compiler(>=6)
+extension CacheKindFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCacheKindFfi: FfiConverterRustBuffer {
+    typealias SwiftType = CacheKindFfi
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CacheKindFfi {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .accounts
+
+        case 2: return .transactions
+
+        case 3: return .unacknowledgedTransactionCount
+
+        case 4: return .cashuReceiveQuotes
+
+        case 5: return .cashuSendQuotes
+
+        case 6: return .cashuReceiveSwaps
+
+        case 7: return .cashuSendSwaps
+
+        case 8: return .accountBalance
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CacheKindFfi, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .accounts:
+            writeInt(&buf, Int32(1))
+
+
+        case .transactions:
+            writeInt(&buf, Int32(2))
+
+
+        case .unacknowledgedTransactionCount:
+            writeInt(&buf, Int32(3))
+
+
+        case .cashuReceiveQuotes:
+            writeInt(&buf, Int32(4))
+
+
+        case .cashuSendQuotes:
+            writeInt(&buf, Int32(5))
+
+
+        case .cashuReceiveSwaps:
+            writeInt(&buf, Int32(6))
+
+
+        case .cashuSendSwaps:
+            writeInt(&buf, Int32(7))
+
+
+        case .accountBalance:
+            writeInt(&buf, Int32(8))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCacheKindFfi_lift(_ buf: RustBuffer) throws -> CacheKindFfi {
+    return try FfiConverterTypeCacheKindFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCacheKindFfi_lower(_ value: CacheKindFfi) -> RustBuffer {
+    return FfiConverterTypeCacheKindFfi.lower(value)
+}
+
 
 
 public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
@@ -5599,6 +5651,105 @@ public func FfiConverterTypeReceiveStatusFfi_lower(_ value: ReceiveStatusFfi) ->
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * FFI-local mirror of `agicash_wallet::RowId` — identity of one
+ * cached row, stringified across the FFI boundary so iOS/Android
+ * don't have to model `Uuid` / `AccountId` directly.
+ *
+ * Mirror (not re-export) for the same reason as [`CacheKindFfi`]:
+ * keeps `uniffi` out of the wallet crate.
+ */
+
+public enum RowIdFfi: Equatable, Hashable {
+
+    /**
+     * `wallet.accounts.id` (UUID, stringified).
+     */
+    case account(id: String
+    )
+    /**
+     * Generic UUID-keyed row (transactions, quotes, send swaps), stringified.
+     */
+    case uuid(id: String
+    )
+    /**
+     * `wallet.cashu_receive_swaps.token_hash` — already a string on the
+     * domain type; no UUID for receive-swap rows.
+     */
+    case tokenHash(hash: String
+    )
+
+
+
+}
+
+#if compiler(>=6)
+extension RowIdFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRowIdFfi: FfiConverterRustBuffer {
+    typealias SwiftType = RowIdFfi
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RowIdFfi {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .account(id: try FfiConverterString.read(from: &buf)
+        )
+
+        case 2: return .uuid(id: try FfiConverterString.read(from: &buf)
+        )
+
+        case 3: return .tokenHash(hash: try FfiConverterString.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RowIdFfi, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case let .account(id):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(id, into: &buf)
+
+
+        case let .uuid(id):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(id, into: &buf)
+
+
+        case let .tokenHash(hash):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(hash, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRowIdFfi_lift(_ buf: RustBuffer) throws -> RowIdFfi {
+    return try FfiConverterTypeRowIdFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRowIdFfi_lower(_ value: RowIdFfi) -> RustBuffer {
+    return FfiConverterTypeRowIdFfi.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Claim state of a previously-created send swap.
  */
 
@@ -5690,21 +5841,32 @@ public func FfiConverterTypeSendSwapClaimState_lower(_ value: SendSwapClaimState
  * Implemented on the Swift/Kotlin side; the wallet calls these on
  * realtime activity. Registered via
  * [`crate::AgicashWallet::start_wallet_events`] and dropped (with the
- * supervisor task aborted) by
+ * supervisor + cache pump tasks aborted) by
  * [`crate::AgicashWallet::stop_wallet_events`].
  *
- * All methods are invoked from the realtime supervisor's tokio
- * task — never from the calling thread — so the foreign implementation
- * must be thread-safe. UniFFI enforces `Send + Sync` on the boxed
- * foreign object; the bridge additionally never re-enters the listener
- * (each callback is a fire-and-forget notification, not a request).
+ * All methods are invoked from background tokio tasks — never from the
+ * thread that called `start_wallet_events` — so the foreign
+ * implementation must be thread-safe. UniFFI enforces `Send + Sync` on
+ * the boxed foreign object; the bridge additionally never re-enters
+ * the listener (each callback is a fire-and-forget notification, not
+ * a request).
+ *
+ * The cache layer (`agicash-wallet::cache`, shipped at master
+ * `1b4f191b`) is the source of truth: every realtime `Change` event
+ * is applied to the cache by the apply pump, and the dispatch pump
+ * fires [`on_cache_change`] so the consumer can re-read the cache
+ * slice. Legacy `on_event` / `on_connected` "refetch on signal" paths
+ * were deleted in the FFI cache-consumer migration — the cache + the
+ * Lane-D resumption driver own catch-up.
  */
 public protocol WalletEventListener: AnyObject, Sendable {
 
     /**
-     * Channel (re)connected & joined. The platform MUST refetch wallet
-     * + balance state — there is no replay; this is the catch-up hook
-     * that replaces the deleted Tier-1 pollers.
+     * Channel (re)connected & joined. Observability only — the cache
+     * + Lane-D resumption driver handle the post-reconnect catch-up;
+     * the consumer does NOT need to refetch on this signal. (Mirrors
+     * the Leptos `Connected` arm semantics — see the Leptos cache-
+     * consumer migration design §2.1.)
      */
     func onConnected()
 
@@ -5713,6 +5875,12 @@ public protocol WalletEventListener: AnyObject, Sendable {
      * ACCOUNT_UPDATED, TRANSACTION_CREATED, TRANSACTION_UPDATED,
      * CASHU_RECEIVE_QUOTE_*, ...}. `payload_json` is the raw jsonb the
      * trigger sent (opaque to transport; parsed by the caller).
+     *
+     * Observability only — paired with [`on_cache_change`] one-for-one
+     * (the realtime supervisor fires `Event` + `Change` for every
+     * broadcast). Consumers should drive UI off `on_cache_change`; this
+     * callback is left in place so log-level taps on the FFI surface
+     * keep working.
      */
     func onEvent(event: String, payloadJson: String)
 
@@ -5727,20 +5895,19 @@ public protocol WalletEventListener: AnyObject, Sendable {
     func onError(message: String)
 
     /**
-     * The wallet's in-flight money state, refetched after an
-     * `on_connected` (re)connect catch-up (slice 12e Lane 3, Gap-D).
+     * One cache slice mutated — re-read the corresponding cache-backed
+     * FFI method (e.g. `list_accounts` for [`CacheKindFfi::Accounts`])
+     * to get the new value. The `id` (when present) lets the consumer
+     * filter to one row if it's tracking row-level identity.
      *
-     * Fired right after `on_connected` whenever the post-reconnect
-     * `refresh_pending_state()` succeeds — the platform uses it to
-     * clear stale "waiting…" rows that resolved while the channel was
-     * down. A `refresh_pending_state()` *failure* is swallowed (logged,
-     * non-fatal): the balance refetch in `on_connected` already keeps
-     * the UI alive, and the next reconnect retries. Until iOS/Android
-     * wire pending-list UI consumption (a follow-up), a logging-only
-     * stub here is acceptable — it mirrors the pre-banner state of the
-     * `on_status` callback.
+     * Fires from a tokio task subscribed to the cache's broadcast
+     * channel (`agicash_wallet::WalletClient::cache_updates`). One tick
+     * per cache mutation; ordered with respect to mutations on a single
+     * slice; bounded — a slow listener that overruns the channel
+     * capacity sees missed ticks dropped (the cache itself stays
+     * authoritative, the next tick still triggers a re-read).
      */
-    func onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi)
+    func onCacheChange(update: CacheUpdateFfi)
 
 }
 
@@ -5864,9 +6031,9 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 writeReturn: writeReturn
             )
         },
-        onPendingStateRefreshed: { (
+        onCacheChange: { (
             uniffiHandle: UInt64,
-            snapshot: RustBuffer,
+            update: RustBuffer,
             uniffiOutReturn: UnsafeMutableRawPointer,
             uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
         ) in
@@ -5875,8 +6042,8 @@ fileprivate struct UniffiCallbackInterfaceWalletEventListener {
                 guard let uniffiObj = try? FfiConverterCallbackInterfaceWalletEventListener.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return uniffiObj.onPendingStateRefreshed(
-                     snapshot: try FfiConverterTypePendingStateSnapshotFfi_lift(snapshot)
+                return uniffiObj.onCacheChange(
+                     update: try FfiConverterTypeCacheUpdateFfi_lift(update)
                 )
             }
 
@@ -6030,6 +6197,30 @@ fileprivate struct FfiConverterOptionTypeSession: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeRowIdFfi: FfiConverterRustBuffer {
+    typealias SwiftType = RowIdFfi?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRowIdFfi.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRowIdFfi.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeAccountFfi: FfiConverterRustBuffer {
     typealias SwiftType = [AccountFfi]
 
@@ -6047,31 +6238,6 @@ fileprivate struct FfiConverterSequenceTypeAccountFfi: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeAccountFfi.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterSequenceTypePendingItemFfi: FfiConverterRustBuffer {
-    typealias SwiftType = [PendingItemFfi]
-
-    public static func write(_ value: [PendingItemFfi], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterTypePendingItemFfi.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PendingItemFfi] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [PendingItemFfi]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterTypePendingItemFfi.read(from: &buf))
         }
         return seq
     }
@@ -6369,10 +6535,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_constructor_agicashwallet_new() != 44726) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_connected() != 385) {
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_connected() != 37091) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_event() != 39256) {
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_event() != 51096) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_status() != 9782) {
@@ -6381,7 +6547,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_error() != 44003) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_pending_state_refreshed() != 42166) {
+    if (uniffi_agicash_ffi_checksum_method_walleteventlistener_on_cache_change() != 39481) {
         return InitializationResult.apiChecksumMismatch
     }
 

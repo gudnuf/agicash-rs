@@ -29,7 +29,8 @@ import uniffi.agicash_ffi.MeltQuoteSnapshot
 import uniffi.agicash_ffi.MintAddResult
 import uniffi.agicash_ffi.MintQuoteFfiState
 import uniffi.agicash_ffi.MintQuoteHandle
-import uniffi.agicash_ffi.PendingStateSnapshotFfi
+import uniffi.agicash_ffi.CacheKindFfi
+import uniffi.agicash_ffi.CacheUpdateFfi
 import uniffi.agicash_ffi.RealtimeStatusFfi
 import uniffi.agicash_ffi.ReceiveResult
 import uniffi.agicash_ffi.SendQuotePreview
@@ -223,24 +224,32 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
     private var connectivityRegistered = false
 
     /**
-     * Forwards Supabase-Realtime activity (delivered on the Rust
+     * Forwards Supabase-Realtime + cache activity (delivered on the Rust
      * realtime supervisor's tokio task — see the `WalletEventListener`
-     * UniFFI callback-interface doc) onto the existing
-     * [refreshAccounts] path. `onConnected` is the **no-replay catch-up**
-     * (spec §5.5): on every (re)connect we refetch wallet+balance, which
-     * is exactly why the Tier-1 foreground poll on `HomeScreen` is
-     * deleted — a fresh connect already does the catch-up the poll used
-     * to do. `onEvent` is a DB-originated broadcast; the wallet layer
-     * demuxes by name, so here we just refetch (mirrors the React
-     * `useTrackWalletChanges` → React-Query-invalidate behavior).
+     * UniFFI callback-interface doc) onto the existing [refreshAccounts]
+     * path through the cache.
      *
-     * `onStatus`/`onError` are **non-fatal** by construction: they only
+     * The cache (`agicash-wallet::cache`, shipped at master `1b4f191b`)
+     * is the source of truth: every realtime `Change` event is applied
+     * to the cache by the Rust-side apply pump, and the dispatch pump
+     * fires [onCacheChange] here. The bridge dispatches by `update.kind`
+     * — for slices the Android UI consumes (today: only [CacheKindFfi.ACCOUNTS]
+     * + [CacheKindFfi.ACCOUNT_BALANCE]), it triggers a cache-backed
+     * re-read via [refreshAccounts]. Other kinds are no-ops until UI
+     * lands for them.
+     *
+     * [onConnected]/[onEvent] are observability only post-migration: the
+     * cache + Lane-D resumption driver own catch-up, so the bridge does
+     * NOT refetch on these signals anymore (mirror of the Leptos cache-
+     * consumer migration — `Connected` is a tracing breadcrumb).
+     *
+     * [onStatus]/[onError] are **non-fatal** by construction: they only
      * log. A realtime drop/error must NEVER route to the
      * session-destroying [Phase.Error]/`ErrorView` — the tiered
      * non-destructive model in [refreshAccountsSuspending]
      * (`isBootstrap`/`isSignedIn` discipline) is preserved untouched.
      * Realtime down → last-known balance stays on screen; the next
-     * `onConnected` refetches on reconnect.
+     * cache mutation refetches via [onCacheChange] on reconnect.
      *
      * [refreshAccounts] is fire-and-forget on `viewModelScope`, so these
      * callbacks never block the realtime supervisor task and the bridge
@@ -251,11 +260,17 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
      */
     private inner class WalletEventBridge : WalletEventListener {
         override fun onConnected() {
-            refreshAccounts()
+            // Observability only: the cache + Lane-D resumption driver
+            // own post-reconnect catch-up. No refetch here.
+            android.util.Log.d("WalletViewModel", "realtime connected (cache + driver own catch-up)")
         }
 
         override fun onEvent(event: String, payloadJson: String) {
-            refreshAccounts()
+            // Observability only post-migration. The Rust-side apply
+            // pump consumes the typed `Change` sibling of this event and
+            // writes it into the cache; the cache then broadcasts a
+            // `CacheUpdate` we observe via `onCacheChange`.
+            android.util.Log.d("WalletViewModel", "realtime event: $event")
         }
 
         override fun onStatus(status: RealtimeStatusFfi) {
@@ -275,20 +290,23 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             android.util.Log.w("WalletViewModel", "realtime error (non-fatal): $message")
         }
 
-        override fun onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi) {
-            // In-flight money-state snapshot from the post-reconnect
-            // catch-up (slice 12e Lane 3, Gap-D). Logging-only for now —
-            // mirrors the pre-banner state of `onStatus`. Wiring the
-            // pending-list to UI (clearing stale "waiting…" rows) is a
-            // scoped follow-up; until then just record the list counts.
-            android.util.Log.d(
-                "WalletViewModel",
-                "realtime pending-state refreshed: " +
-                    "mintQuotes=${snapshot.mintQuotes.size} " +
-                    "receiveSwaps=${snapshot.receiveSwaps.size} " +
-                    "meltQuotes=${snapshot.meltQuotes.size} " +
-                    "sendSwaps=${snapshot.sendSwaps.size}",
-            )
+        override fun onCacheChange(update: CacheUpdateFfi) {
+            // Dispatch by `kind` and trigger a cache-backed re-read for
+            // slices the UI consumes today. Other kinds are no-ops — the
+            // cache stays current for free; UI will pull from it when
+            // the feature lands. Mirrors the iOS `handleCacheChange`
+            // (and Leptos signal-dispatch) shape.
+            when (update.kind) {
+                CacheKindFfi.ACCOUNTS, CacheKindFfi.ACCOUNT_BALANCE ->
+                    refreshAccounts()
+                CacheKindFfi.CASHU_RECEIVE_QUOTES,
+                CacheKindFfi.CASHU_SEND_QUOTES,
+                CacheKindFfi.CASHU_RECEIVE_SWAPS,
+                CacheKindFfi.CASHU_SEND_SWAPS,
+                CacheKindFfi.TRANSACTIONS,
+                CacheKindFfi.UNACKNOWLEDGED_TRANSACTION_COUNT ->
+                    Unit
+            }
         }
     }
 

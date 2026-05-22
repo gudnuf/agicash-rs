@@ -328,105 +328,15 @@ impl From<agicash_wallet::SendTokenClaimStatus> for crate::send::SendSwapClaimSn
     }
 }
 
-// --- slice 12e Lane 3: pending-state snapshot → FFI projection ----------
-//
-// The four `*_state` helpers map each domain state enum to the uppercase
-// string the DB column + the realtime `on_event` payload already use, so
-// the FFI string is consistent with what iOS/Android parse elsewhere.
-
-fn mint_quote_state_label(s: &agicash_cashu::CashuMintQuoteState) -> String {
-    use agicash_cashu::CashuMintQuoteState as S;
-    match s {
-        S::Unpaid => "UNPAID",
-        S::Paid { .. } => "PAID",
-        S::Completed { .. } => "COMPLETED",
-        S::Expired => "EXPIRED",
-        S::Failed { .. } => "FAILED",
-    }
-    .to_string()
-}
-
-fn receive_swap_state_label(s: &agicash_cashu::CashuReceiveSwapState) -> String {
-    use agicash_cashu::CashuReceiveSwapState as S;
-    match s {
-        S::Pending => "PENDING",
-        S::Completed => "COMPLETED",
-        S::Failed { .. } => "FAILED",
-    }
-    .to_string()
-}
-
-fn melt_quote_state_label(s: &agicash_cashu::CashuMeltQuoteState) -> String {
-    use agicash_cashu::CashuMeltQuoteState as S;
-    match s {
-        S::Unpaid => "UNPAID",
-        S::Pending => "PENDING",
-        S::Paid { .. } => "PAID",
-        S::Expired => "EXPIRED",
-        S::Failed { .. } => "FAILED",
-    }
-    .to_string()
-}
-
-fn send_swap_state_label(s: &agicash_cashu::CashuSendSwapState) -> String {
-    use agicash_cashu::CashuSendSwapState as S;
-    match s {
-        S::Draft => "DRAFT",
-        S::Pending { .. } => "PENDING",
-        S::Completed { .. } => "COMPLETED",
-        S::Failed { .. } => "FAILED",
-        S::Reversed => "REVERSED",
-    }
-    .to_string()
-}
-
-/// Project a facade [`agicash_wallet::PendingStateSnapshot`] onto the
-/// FFI [`crate::realtime::PendingStateSnapshotFfi`] — flatten each
-/// domain row to its `(id, state)` pair. Used by the realtime-reconnect
-/// catch-up to push the in-flight money state across the FFI boundary
-/// (slice 12e Lane 3, Gap-D).
-pub fn pending_state_snapshot_to_ffi(
-    s: &agicash_wallet::PendingStateSnapshot,
-) -> crate::realtime::PendingStateSnapshotFfi {
-    use crate::realtime::PendingItemFfi;
-    crate::realtime::PendingStateSnapshotFfi {
-        mint_quotes: s
-            .mint_quotes
-            .iter()
-            .map(|q| PendingItemFfi {
-                id: q.id.to_string(),
-                state: mint_quote_state_label(&q.state),
-            })
-            .collect(),
-        receive_swaps: s
-            .receive_swaps
-            .iter()
-            .map(|sw| PendingItemFfi {
-                // The receive swap's identity is its token_hash (the
-                // unique key used by `complete` / `fail`); there is no
-                // separate row UUID on the domain type.
-                id: sw.token_hash.clone(),
-                state: receive_swap_state_label(&sw.state),
-            })
-            .collect(),
-        melt_quotes: s
-            .melt_quotes
-            .iter()
-            .map(|q| PendingItemFfi {
-                id: q.id.to_string(),
-                state: melt_quote_state_label(&q.state),
-            })
-            .collect(),
-        send_swaps: s
-            .send_swaps
-            .iter()
-            .map(|sw| PendingItemFfi {
-                id: sw.id.to_string(),
-                state: send_swap_state_label(&sw.state),
-            })
-            .collect(),
-    }
-}
+// NOTE: the `pending_state_snapshot_to_ffi` projection + its four
+// `*_state_label` helpers were removed in the FFI cache-consumer
+// migration. The legacy reconnect-catch-up path that fed them
+// (`on_pending_state_refreshed`) was superseded by the cache + Lane-D
+// resumption driver — every typed `Change` event now applies to the
+// cache, which broadcasts a `CacheUpdate` tick that consumers read via
+// `on_cache_change` and the cache-backed FFI methods. No state-label
+// projection across the FFI boundary is needed; consumers re-read the
+// typed row from the cache.
 
 #[cfg(test)]
 mod tests {
@@ -773,90 +683,8 @@ mod tests {
         assert_eq!(h.mint_url, "https://m.example");
     }
 
-    // --- slice 12e Lane 3: pending-state projection ---------------------
-
-    #[test]
-    fn pending_state_empty_snapshot_projects_to_empty_lists() {
-        let ffi = pending_state_snapshot_to_ffi(&agicash_wallet::PendingStateSnapshot::default());
-        assert!(ffi.mint_quotes.is_empty());
-        assert!(ffi.receive_swaps.is_empty());
-        assert!(ffi.melt_quotes.is_empty());
-        assert!(ffi.send_swaps.is_empty());
-    }
-
-    #[test]
-    fn mint_quote_state_label_covers_every_variant() {
-        use agicash_cashu::CashuMintQuoteState as S;
-        assert_eq!(mint_quote_state_label(&S::Unpaid), "UNPAID");
-        assert_eq!(
-            mint_quote_state_label(&S::Paid {
-                keyset_id: "k".into(),
-                keyset_counter: 0,
-                output_amounts: vec![],
-            }),
-            "PAID"
-        );
-        assert_eq!(
-            mint_quote_state_label(&S::Completed {
-                keyset_id: "k".into(),
-                keyset_counter: 0,
-                output_amounts: vec![],
-            }),
-            "COMPLETED"
-        );
-        assert_eq!(mint_quote_state_label(&S::Expired), "EXPIRED");
-        assert_eq!(
-            mint_quote_state_label(&S::Failed {
-                failure_reason: "x".into()
-            }),
-            "FAILED"
-        );
-    }
-
-    #[test]
-    fn receive_swap_state_label_covers_every_variant() {
-        use agicash_cashu::CashuReceiveSwapState as S;
-        assert_eq!(receive_swap_state_label(&S::Pending), "PENDING");
-        assert_eq!(receive_swap_state_label(&S::Completed), "COMPLETED");
-        assert_eq!(
-            receive_swap_state_label(&S::Failed {
-                failure_reason: "x".into()
-            }),
-            "FAILED"
-        );
-    }
-
-    #[test]
-    fn melt_quote_state_label_covers_every_variant() {
-        use agicash_cashu::CashuMeltQuoteState as S;
-        assert_eq!(melt_quote_state_label(&S::Unpaid), "UNPAID");
-        assert_eq!(melt_quote_state_label(&S::Pending), "PENDING");
-        assert_eq!(melt_quote_state_label(&S::Expired), "EXPIRED");
-        assert_eq!(
-            melt_quote_state_label(&S::Failed {
-                failure_reason: "x".into()
-            }),
-            "FAILED"
-        );
-    }
-
-    #[test]
-    fn send_swap_state_label_covers_every_variant() {
-        use agicash_cashu::CashuSendSwapState as S;
-        assert_eq!(send_swap_state_label(&S::Draft), "DRAFT");
-        assert_eq!(
-            send_swap_state_label(&S::Pending {
-                token_hash: "th".into(),
-                proofs_to_send: vec![],
-            }),
-            "PENDING"
-        );
-        assert_eq!(send_swap_state_label(&S::Reversed), "REVERSED");
-        assert_eq!(
-            send_swap_state_label(&S::Failed {
-                failure_reason: "x".into()
-            }),
-            "FAILED"
-        );
-    }
+    // --- FFI cache-consumer migration: pending-state-snapshot tests
+    // removed alongside `pending_state_snapshot_to_ffi` + the four
+    // `*_state_label` helpers. Cache-update conversions are covered by
+    // the bridge smoke test in `wallet.rs::bridge_forwards_each_event_variant_to_listener`.
 }

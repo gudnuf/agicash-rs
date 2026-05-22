@@ -685,17 +685,18 @@ impl AgicashWallet {
     /// MVP scale but could grow to N+1 latency once users hold many
     /// proofs. A grouped query is the natural follow-up.
     pub async fn list_accounts(&self) -> Result<Vec<AccountFfi>, FfiError> {
-        // Shell-resident observability (spec §6) — kept verbatim. The
-        // session check + balance summing now live in the facade
-        // `list_accounts` (it `require_session()`s the shared slot and
-        // sums via the same Supabase storage + cashu provider). The
-        // post-session-loaded per-account log lines depended on the
-        // now-removed inline loop; dropping them is a log-only change.
+        // Shell-resident observability (spec §6) — kept verbatim. Cache-
+        // backed since the FFI cache-consumer migration: `facade.accounts()`
+        // populates from storage on first call and returns from cache on
+        // subsequent calls. Realtime `Change` events keep both account rows
+        // and per-account balances current via the apply pump in
+        // `start_wallet_events`. The FFI surface shape (`Vec<AccountFfi>`)
+        // is unchanged.
         crate::observability::init();
         tracing::info!(target: "agicash_ffi::wallet", "list_accounts: enter");
         let summaries = self
             .facade
-            .list_accounts()
+            .accounts()
             .await
             .map_err(crate::convert::wallet_error_to_ffi)?;
         let out: Vec<AccountFfi> = summaries
@@ -1527,44 +1528,89 @@ impl AgicashWallet {
         // — coalesced + acted on (re-fires service methods on unresolved
         // rows) rather than dispatched to the FFI listener.
         let driver_rx = svc.subscribe();
+        // Cache lane: subscribe to the cache's broadcast channel BEFORE
+        // we start the pump, so no tick fired between `start_wallet_events`
+        // and the dispatch task's first `recv()` can be missed. The
+        // realtime apply pump (folded into the main event match below)
+        // is what feeds rows into the cache; this receiver fans the
+        // resulting `CacheUpdate` ticks out to the FFI listener.
+        let mut cache_rx = self.facade.cache_updates();
         // `Box<dyn WalletEventListener>` is `Send + Sync` (UniFFI's
         // foreign shim); behind an `Arc` so the spawned pump owns a
         // clone for the lifetime of the task.
         let listener: Arc<dyn crate::WalletEventListener> = Arc::from(listener);
         let svc_run = Arc::clone(&svc);
-        // The composed facade — the pump calls `refresh_pending_state()`
-        // on it after every `Connected` to run the no-replay catch-up
-        // (slice 12e Lane 3, Gap-D).
+        // The composed facade — the pump calls `apply_realtime_change`
+        // on every typed `Change` so the in-process cache stays current
+        // for cache-backed FFI reads (e.g. `list_accounts`).
         let facade = Arc::clone(&self.facade);
         let handle = tokio::spawn(async move {
-            // Pump: drain the service's broadcast receiver and fan each
-            // event out to the foreign listener via the FFI bridge.
+            // Realtime → listener + cache apply pump. Drains the
+            // service's broadcast receiver; for every event we
+            //  - dispatch the listener-visible side (status / error /
+            //    connected / opaque event), and
+            //  - apply typed `Change` payloads to the cache (the apply
+            //    pump, folded into this single match per the FFI cache-
+            //    consumer migration design §3).
             let pump = {
-                let listener = Arc::clone(&listener);
+                let listener_for_pump = Arc::clone(&listener);
+                let facade_for_pump = Arc::clone(&facade);
                 async move {
                     while let Ok(ev) = rx.recv().await {
-                        // A `Connected` (re)connect needs a pending-state
-                        // catch-up *after* `on_connected` fires — the
-                        // realtime channel ships no replay. Detect it
-                        // before the bridge consumes `ev`.
-                        let is_connected =
-                            matches!(ev, agicash_realtime::WalletRealtimeEvent::Connected);
-                        crate::realtime::dispatch_realtime_event(listener.as_ref(), ev);
-                        if is_connected {
-                            crate::realtime::dispatch_pending_state_refresh(
-                                facade.as_ref(),
-                                listener.as_ref(),
-                            )
-                            .await;
+                        match ev {
+                            agicash_realtime::WalletRealtimeEvent::Change(boxed) => {
+                                // Feed the typed row into the cache. The
+                                // cache broadcasts a `CacheUpdate` tick
+                                // that the dispatch pump (below) fans out
+                                // to the listener. We do NOT call the
+                                // listener directly here — the consumer
+                                // sees the change through `on_cache_change`.
+                                facade_for_pump.apply_realtime_change(*boxed).await;
+                            }
+                            other => crate::realtime::dispatch_realtime_event(
+                                listener_for_pump.as_ref(),
+                                other,
+                            ),
                         }
                     }
                 }
             };
-            // Drive the supervisor + pump together; `stop()` (via
-            // `stop_wallet_events`) ends `run()`, after which the
-            // broadcast sender drops and the pump's `recv()` returns
-            // `Err`, ending the task cleanly even before `abort()`.
-            tokio::join!(svc_run.run(), pump);
+            // Cache → listener dispatch pump. Drains the cache's
+            // broadcast channel and fires `on_cache_change` for every
+            // tick. Lagged ticks are logged and skipped — the cache
+            // itself is still authoritative (the next tick triggers a
+            // re-read; missed ticks don't mean missed data).
+            let dispatch = {
+                let listener_for_dispatch = Arc::clone(&listener);
+                async move {
+                    loop {
+                        match cache_rx.recv().await {
+                            Ok(update) => crate::realtime::dispatch_cache_update(
+                                listener_for_dispatch.as_ref(),
+                                &update,
+                            ),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    target: "agicash_ffi::realtime",
+                                    "cache_updates lagged ({n} ticks dropped); cache is still \
+                                     authoritative — next tick triggers a fresh re-read"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            };
+            // Drive the supervisor + apply pump + dispatch pump together;
+            // `stop()` (via `stop_wallet_events`) ends `run()`, after
+            // which the broadcast sender drops and the apply pump's
+            // `recv()` returns `Err`, ending its loop. The dispatch
+            // pump exits via `Closed` once the facade's cache sender
+            // drops (sign-out / wallet drop), OR via the outer
+            // `.abort()` from `stop_wallet_events` if the wallet
+            // outlives the realtime subscription (the common case —
+            // `stop_wallet_events` aborts the task explicitly).
+            tokio::join!(svc_run.run(), pump, dispatch);
         });
 
         // Lane D: build the resumption driver alongside the realtime
@@ -2752,7 +2798,7 @@ mod tests {
             fn on_event(&self, _: String, _: String) {}
             fn on_status(&self, _: crate::RealtimeStatusFfi) {}
             fn on_error(&self, _: String) {}
-            fn on_pending_state_refreshed(&self, _: crate::PendingStateSnapshotFfi) {}
+            fn on_cache_change(&self, _: crate::CacheUpdateFfi) {}
         }
         let cfg = fake_config();
         let w = AgicashWallet::new(
@@ -2956,9 +3002,9 @@ mod tests {
     /// Hermetic bridge smoke test: a fake `WalletEventListener` receives
     /// the right callback for each synthetic `WalletRealtimeEvent`
     /// pushed through the FFI bridge (`dispatch_realtime_event`) — no
-    /// socket, tokio task, or live Supabase stack. This proves the
-    /// Stage-3 surface (`WalletRealtimeEvent` → Swift/Kotlin callbacks)
-    /// without depending on Stages 1/2 runtime behavior.
+    /// socket, tokio task, or live Supabase stack. Also exercises the
+    /// cache-dispatch side (`dispatch_cache_update`) so a `CacheUpdate`
+    /// gets projected onto `on_cache_change` with the right shape.
     #[test]
     fn bridge_forwards_each_event_variant_to_listener() {
         use agicash_realtime::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
@@ -2970,7 +3016,7 @@ mod tests {
             events: Mutex<Vec<(String, String)>>,
             statuses: Mutex<Vec<crate::RealtimeStatusFfi>>,
             errors: Mutex<Vec<String>>,
-            pending_refreshes: Mutex<u32>,
+            cache_changes: Mutex<Vec<crate::CacheUpdateFfi>>,
         }
         impl crate::WalletEventListener for Recorder {
             fn on_connected(&self) {
@@ -2985,8 +3031,8 @@ mod tests {
             fn on_error(&self, message: String) {
                 self.errors.lock().unwrap().push(message);
             }
-            fn on_pending_state_refreshed(&self, _: crate::PendingStateSnapshotFfi) {
-                *self.pending_refreshes.lock().unwrap() += 1;
+            fn on_cache_change(&self, update: crate::CacheUpdateFfi) {
+                self.cache_changes.lock().unwrap().push(update);
             }
         }
 
@@ -3006,6 +3052,17 @@ mod tests {
         );
         crate::realtime::dispatch_realtime_event(&rec, WalletRealtimeEvent::Error("boom".into()));
 
+        // Cache side — a synthetic `CacheUpdate` projects 1:1 onto the
+        // FFI mirror and fires `on_cache_change` with kind + id.
+        let row = uuid::Uuid::new_v4();
+        crate::realtime::dispatch_cache_update(
+            &rec,
+            &agicash_wallet::CacheUpdate {
+                kind: agicash_wallet::CacheKind::CashuReceiveQuotes,
+                id: Some(agicash_wallet::RowId::Uuid(row)),
+            },
+        );
+
         assert_eq!(*rec.connected.lock().unwrap(), 1);
         assert_eq!(
             *rec.events.lock().unwrap(),
@@ -3019,11 +3076,19 @@ mod tests {
             vec![crate::RealtimeStatusFfi::Subscribed]
         );
         assert_eq!(*rec.errors.lock().unwrap(), vec!["boom".to_string()]);
-        // `dispatch_realtime_event` only fires the four base callbacks;
-        // the pending-state catch-up is the separate async
-        // `dispatch_pending_state_refresh` (needs a live facade), so the
-        // synchronous bridge must NOT touch `on_pending_state_refreshed`.
-        assert_eq!(*rec.pending_refreshes.lock().unwrap(), 0);
+        // `dispatch_realtime_event` has no listener-visible arm for
+        // `Change` (the pump applies it to the cache separately) — only
+        // the explicit `dispatch_cache_update` call above produced the
+        // single `on_cache_change` we expect.
+        let cache = rec.cache_changes.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].kind, crate::CacheKindFfi::CashuReceiveQuotes);
+        assert_eq!(
+            cache[0].id,
+            Some(crate::RowIdFfi::Uuid {
+                id: row.to_string()
+            })
+        );
     }
 
     #[tokio::test]
