@@ -25,8 +25,14 @@
 /// On `None`, the UI should surface "no Cashu token found in that
 /// text" — do not fall back to passing the raw paste through
 /// `receiveToken`, which just re-creates the bug the extractor fixes.
+// `input` is taken by value because UniFFI marshals strings as owned
+// `String` across the FFI boundary; clippy's `needless_pass_by_value`
+// is a false positive in that context (same pattern used by the
+// `parse_lightning_address` free function in `lightning_address.rs`,
+// which silences `unused_async` for the analogous reason).
 #[uniffi::export]
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn extract_cashu_token(input: String) -> Option<String> {
     agicash_cashu::extract_cashu_token(&input)
 }
