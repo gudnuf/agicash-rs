@@ -284,3 +284,21 @@ use wasm_bindgen::prelude::*;
 pub fn agicash_wasm_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
+
+/// Extract a Cashu token (`cashuA…` / `cashuB…`) from arbitrary text.
+///
+/// Pure, offline, no-I/O — same shape as the React reference's
+/// `extractCashuToken`. Returns the verbatim matched substring iff it
+/// also structurally decodes, otherwise `null`/`undefined`.
+///
+/// Leptos / browser callers feed this with clipboard contents, URLs,
+/// `cashu:` URIs, or raw paste; the returned string is the encoded
+/// token they then pass to `AgicashWasmWallet::receiveToken`.
+///
+/// `Option<String>` maps cleanly to `string | undefined` in JS via
+/// `wasm-bindgen` — no JSON marshaling needed.
+#[wasm_bindgen(js_name = extractCashuToken)]
+#[must_use]
+pub fn extract_cashu_token(input: &str) -> Option<String> {
+    agicash_cashu::extract_cashu_token(input)
+}

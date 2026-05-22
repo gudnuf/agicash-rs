@@ -11,6 +11,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wasm-bindgen = { workspace = true }
+# Pulled on all targets so the `extract_cashu_token` free function
+# (a pure, no-I/O paste helper) is available from both the wasm cdylib
+# and the native `rlib` build. `agicash-cashu` builds cleanly on
+# wasm32; native `cargo test --workspace` already compiles it.
+agicash-cashu = { path = "../agicash-cashu" }
 
 # The real Wallet binding. agicash-wallet wasm-builds as of slice 12d
 # (AuthClient ?Send + dep target-gates). Pulled on wasm32 only so the
