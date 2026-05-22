@@ -2,12 +2,15 @@
 
 pub mod dleq;
 pub mod error;
+pub mod extract;
 pub mod melt_quote;
 pub mod mint_quote;
 pub mod provider;
 pub mod receive_flow;
 pub mod receive_swap;
 pub mod send_swap;
+
+pub use extract::extract_cashu_token;
 
 pub use dleq::{
     dleq_to_json, match_blind_signatures_to_pre_mints, verify_blind_signatures, verify_proof_dleq,
