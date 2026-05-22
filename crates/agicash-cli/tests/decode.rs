@@ -116,6 +116,40 @@ fn decode_lightning_address_emits_address_shape() {
 }
 
 #[test]
+fn decode_extracts_token_from_url_query() {
+    // Step 0 of the receive flow: the user often pastes a redeem URL,
+    // not the raw encoded token. `decode` must extract the token from
+    // the URL (mirrors the iOS/Android/Leptos paste-handler behaviour
+    // exposed via `agicash_cashu::extract_cashu_token`).
+    let url = format!("https://wallet.example/redeem?token={TOKEN_V4}");
+    let v = decode_ok(&url);
+    assert_eq!(v["artifact"], "cashu-token");
+    assert_eq!(v["version"], 4);
+    assert_eq!(v["amount"], "1");
+}
+
+#[test]
+fn decode_extracts_token_from_url_hash() {
+    // `cashu:`-style deep links + share URLs often use the fragment.
+    let url = format!("https://wallet.example/r#{TOKEN_V3}");
+    let v = decode_ok(&url);
+    assert_eq!(v["artifact"], "cashu-token");
+    assert_eq!(v["version"], 3);
+    assert_eq!(v["amount"], "10");
+}
+
+#[test]
+fn decode_extracts_token_from_cashu_uri() {
+    // Apps that DO register the `cashu:` URI scheme route through the
+    // same extraction step — `cashu:cashuB…` works because the regex
+    // skips the prefix and finds the encoded token.
+    let uri = format!("cashu:{TOKEN_V4}");
+    let v = decode_ok(&uri);
+    assert_eq!(v["artifact"], "cashu-token");
+    assert_eq!(v["version"], 4);
+}
+
+#[test]
 fn decode_malformed_token_exits_one_with_invalid_token() {
     let (code, body) = decode_err("cashuBnot-real-cbor");
     assert_eq!(code, 1, "decode is offline — malformed input is code 1");
