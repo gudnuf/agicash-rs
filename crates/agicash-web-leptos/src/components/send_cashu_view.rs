@@ -191,12 +191,7 @@ pub fn SendCashuView() -> impl IntoView {
             // None, None)` shape.
             #[cfg(target_arch = "wasm32")]
             {
-                match agicash_wasm::AgicashWasmWallet::new(
-                    config.opensecret_base_url.clone(),
-                    config.opensecret_client_id.to_string(),
-                    config.supabase_url.clone(),
-                    config.supabase_anon_key.clone(),
-                ) {
+                match crate::components::wallet_context::seed_wasm_wallet(&config).await {
                     Ok(wallet) => match wallet.prepare_send_quote(amount, None, None).await {
                         Ok(q) => phase.set(Phase::Confirming(quote_from_wasm(&q))),
                         Err(e) => phase.set(Phase::Failure(js_err_string(&e))),
@@ -230,12 +225,7 @@ pub fn SendCashuView() -> impl IntoView {
             // verbatim the FFI `create_send_swap`).
             #[cfg(target_arch = "wasm32")]
             {
-                match agicash_wasm::AgicashWasmWallet::new(
-                    config.opensecret_base_url.clone(),
-                    config.opensecret_client_id.to_string(),
-                    config.supabase_url.clone(),
-                    config.supabase_anon_key.clone(),
-                ) {
+                match crate::components::wallet_context::seed_wasm_wallet(&config).await {
                     Ok(wallet) => {
                         match wallet
                             .create_send_swap(quote.amount_to_send, None, None)
@@ -1110,12 +1100,7 @@ fn js_err_string(e: &wasm_bindgen::JsValue) -> String {
 async fn poll_claim_once(config: &AppConfig, swap_id: &str) -> ClaimPoll {
     #[cfg(target_arch = "wasm32")]
     {
-        let Ok(wallet) = agicash_wasm::AgicashWasmWallet::new(
-            config.opensecret_base_url.clone(),
-            config.opensecret_client_id.to_string(),
-            config.supabase_url.clone(),
-            config.supabase_anon_key.clone(),
-        ) else {
+        let Ok(wallet) = crate::components::wallet_context::seed_wasm_wallet(config).await else {
             return ClaimPoll::Pending;
         };
         match wallet.check_send_swap_claimed(swap_id.to_string()).await {

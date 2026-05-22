@@ -19,8 +19,19 @@ const SHELL_URLS = [
 ];
 
 self.addEventListener('install', (event) => {
+  // `cache.addAll` is atomic — a single 404 (e.g. an icon variant the
+  // build pipeline hasn't emitted yet) fails the whole install and
+  // leaves the PWA without a service worker. Switch to per-URL `add`
+  // with a swallowed warn so a missing optional asset is logged but
+  // doesn't sink the rest of the shell.
   event.waitUntil(
-    caches.open(CACHE_VERSION).then((cache) => cache.addAll(SHELL_URLS)),
+    caches.open(CACHE_VERSION).then((cache) =>
+      Promise.all(
+        SHELL_URLS.map((u) =>
+          cache.add(u).catch((err) => console.warn('SW cache skip:', u, err)),
+        ),
+      ),
+    ),
   );
   // Take over from any older SW on first install.
   self.skipWaiting();

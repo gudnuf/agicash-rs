@@ -1046,6 +1046,65 @@ async fn session_seeded_opensecret_client(
     Ok(client)
 }
 
+/// Build a wasm-shell `AgicashWasmWallet` over the SAME composition core
+/// the FFI uses **and** thread the persisted browser session into its
+/// in-memory session slot.
+///
+/// `AgicashWasmWallet::new` is a parallel composition root: it
+/// constructs a fresh `WalletClient` whose `OpenSecretAuthClient`
+/// session slot is `None` (`InMemorySessionStorage` empty). Every
+/// `require_session()`-gated facade call (`send_token`,
+/// `receive_cashu_token`, `prepare_send_quote`, `check_send_token_claimed`,
+/// `list_accounts`) therefore returns `WalletError::Unauthenticated`
+/// from a freshly-constructed wallet — which is exactly what every
+/// Send/Receive button-click did before this fix.
+///
+/// This helper closes the gap (the 4th instance of the FFI-shell
+/// session-threading pattern): construct the wallet, load the persisted
+/// session from `BrowserSessionStorage`, and if present hand it to
+/// `wallet.set_session(...)` — which runs the OS handshake + refresh
+/// + persist (mirrors what `session_seeded_opensecret_client` does for
+/// the storage / realtime composition roots). Returns the wallet
+/// regardless of whether a session was found: callers that genuinely
+/// support unauthenticated operation can still receive an
+/// `Unauthenticated` error on their first facade call instead of a
+/// helper-level hard failure.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn seed_wasm_wallet(
+    config: &AppConfig,
+) -> Result<agicash_wasm::AgicashWasmWallet, wasm_bindgen::JsValue> {
+    use agicash_auth_opensecret::BrowserSessionStorage;
+    use agicash_traits::SessionStorage;
+    use wasm_bindgen::JsValue;
+
+    let wallet = agicash_wasm::AgicashWasmWallet::new(
+        config.opensecret_base_url.clone(),
+        config.opensecret_client_id.to_string(),
+        config.supabase_url.clone(),
+        config.supabase_anon_key.clone(),
+    )?;
+
+    match BrowserSessionStorage::new().load().await {
+        Ok(Some(session)) => {
+            wallet
+                .set_session(session.user_id.to_string(), session.refresh_token)
+                .await?;
+        }
+        Ok(None) => {
+            // No persisted session — caller may handle the resulting
+            // Unauthenticated error explicitly (e.g. a public-mint
+            // preview path). The wallet is still returned so the call
+            // site's `Err` arm carries a real facade error, not a
+            // helper-level "no session" string.
+        }
+        Err(e) => {
+            return Err(JsValue::from_str(&format!("session load failed: {e}")));
+        }
+    }
+
+    Ok(wallet)
+}
+
 /// Build the `OpenSecret` token provider from the resolved [`AppConfig`]
 /// — the same session-seeded construction `fetch_account_summaries`
 /// uses for storage, so the realtime join JWT comes from the identical

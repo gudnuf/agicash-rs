@@ -19,7 +19,7 @@ mod types;
 #[cfg(target_arch = "wasm32")]
 mod wasm_impl {
     use crate::types::AuthStatusWasm;
-    use agicash_wallet::{SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
+    use agicash_wallet::{Session, SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
     use std::sync::Arc;
     use uuid::Uuid;
     use wasm_bindgen::prelude::*;
@@ -103,6 +103,34 @@ mod wasm_impl {
                 .await
                 .map_err(crate::convert::wallet_error_to_js)?;
             Ok(crate::convert::session_from_facade(&s))
+        }
+
+        /// Seed an already-authenticated session into this wallet's
+        /// in-memory session slot. Pure delegate to
+        /// `WalletClient::set_session` — the facade runs OS handshake +
+        /// refresh + persist (see `opensecret_auth::set_session`). The
+        /// Leptos shell calls this immediately after construction with
+        /// the `user_id` + `refresh_token` it already loaded from
+        /// `BrowserSessionStorage`, closing the parallel composition-root
+        /// gap (`AgicashWasmWallet::new` left the session slot `None`,
+        /// so every Send/Receive button-click wallet hit
+        /// `Unauthenticated`). Mirrors the FFI 6.6 `set_session` shape.
+        #[wasm_bindgen(js_name = setSession)]
+        pub async fn set_session(
+            &self,
+            user_id: String,
+            refresh_token: String,
+        ) -> Result<(), JsValue> {
+            let user_id_uuid = Uuid::parse_str(user_id.trim())
+                .map_err(|e| JsValue::from_str(&format!("invalid user_id: {e}")))?;
+            let session = Session {
+                user_id: user_id_uuid.into(),
+                refresh_token,
+            };
+            self.client
+                .set_session(session)
+                .await
+                .map_err(crate::convert::wallet_error_to_js)
         }
 
         /// Best-effort server logout (always clears local state). Pure

@@ -185,12 +185,7 @@ pub fn CashuTokenPasteView() -> impl IntoView {
             // scope, NOT implemented here).
             #[cfg(target_arch = "wasm32")]
             {
-                match agicash_wasm::AgicashWasmWallet::new(
-                    config.opensecret_base_url.clone(),
-                    config.opensecret_client_id.to_string(),
-                    config.supabase_url.clone(),
-                    config.supabase_anon_key.clone(),
-                ) {
+                match crate::components::wallet_context::seed_wasm_wallet(&config).await {
                     Ok(wallet) => match wallet.receive_token(preview.raw.clone()).await {
                         Ok(r) => phase.set(Phase::Success(ReceiveResult {
                             amount: r.amount.trim().parse::<u64>().unwrap_or(0),
@@ -670,12 +665,7 @@ struct AccountMintUrl {
 /// mints itself regardless.
 #[cfg(target_arch = "wasm32")]
 async fn fetch_mint_known(config: &AppConfig, mint_url: &str) -> bool {
-    let Ok(wallet) = agicash_wasm::AgicashWasmWallet::new(
-        config.opensecret_base_url.clone(),
-        config.opensecret_client_id.to_string(),
-        config.supabase_url.clone(),
-        config.supabase_anon_key.clone(),
-    ) else {
+    let Ok(wallet) = crate::components::wallet_context::seed_wasm_wallet(config).await else {
         return true;
     };
     let Ok(js) = wallet.list_accounts().await else {
