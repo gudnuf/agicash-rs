@@ -113,10 +113,11 @@ pub fn App() -> impl IntoView {
     rehydrating.0.set(false);
 
     // Shared wallet view-model. Idle on first paint; the home page (and
-    // any other consumer) calls `.refresh()` from an Effect once it
-    // mounts. The shape stays the same when slice 13 ships a real
-    // wasm wallet binding — only the body of `WalletData::refresh`
-    // changes. See `components/wallet_context.rs`.
+    // any other consumer) calls `.start(config)` from an Effect once it
+    // mounts — that single entry point builds the session-seeded
+    // `Arc<WalletClient>`, runs the foreground cache populate, and
+    // spawns the realtime apply + cache dispatch pumps. See
+    // `components/wallet_context.rs`.
     provide_context(WalletData::new());
 
     view! {
