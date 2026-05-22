@@ -411,6 +411,7 @@ dependencies = [
 name = "agicash-wasm"
 version = "0.1.0"
 dependencies = [
+ "agicash-cashu",
  "agicash-domain",
  "agicash-money",
  "agicash-traits",

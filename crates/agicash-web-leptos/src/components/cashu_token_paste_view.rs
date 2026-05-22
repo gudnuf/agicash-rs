@@ -584,12 +584,24 @@ where
 
 // ---- Helpers --------------------------------------------------------------
 
-/// Parse a raw Cashu token string into the preview view-model. Pure
-/// (no network): only uses `cdk::nuts::Token::from_str` +
-/// `.value() / .mint_url() / .unit() / .memo()` which the cdk types
-/// derive from the encoded payload itself.
+/// Parse a Cashu token from arbitrary pasted text into the preview
+/// view-model. Pure (no network).
+///
+/// Step 1: `agicash_cashu::extract_cashu_token` finds the encoded
+/// token inside the input (URL with hash/query, `cashu:` URI,
+/// embedded prose, or raw paste all work). Returns the verbatim
+/// matched substring — what we then re-decode with
+/// `cdk::nuts::Token::from_str` so we can read `.value() /
+/// .mint_url() / .unit() / .memo()` for the preview card.
+///
+/// The `raw` field on `TokenPreview` carries the **extracted** token
+/// (not the original input), so the receive call downstream gets a
+/// clean encoded string — the strict `WalletClient::receive_token`
+/// inside the wasm wallet would reject the original URL paste.
 fn parse_token(raw: &str) -> Result<TokenPreview, String> {
-    let token = Token::from_str(raw).map_err(|e| format!("Invalid token: {e}"))?;
+    let encoded = agicash_cashu::extract_cashu_token(raw)
+        .ok_or_else(|| "No Cashu token found in that text.".to_string())?;
+    let token = Token::from_str(&encoded).map_err(|e| format!("Invalid token: {e}"))?;
     let mint_url = token
         .mint_url()
         .map_err(|e| format!("Token is missing a mint URL: {e}"))?
@@ -600,7 +612,7 @@ fn parse_token(raw: &str) -> Result<TokenPreview, String> {
         .map_err(|e| format!("Could not compute token amount: {e}"))?;
     let memo = token.memo().clone();
     Ok(TokenPreview {
-        raw: raw.to_string(),
+        raw: encoded,
         amount: amount.into(),
         unit: unit_label,
         mint_url,
@@ -815,11 +827,28 @@ mod tests {
     #[test]
     fn rejects_garbage_string() {
         let err = parse_token("not-a-token").expect_err("garbage rejected");
-        // The exact message comes from cdk; we only care that it surfaces.
+        // Post-extractor: garbage has no `cashu[AB]…` substring at
+        // all, so the new "No Cashu token found" message surfaces
+        // before we ever reach cdk's "Invalid token" wording.
         assert!(
-            err.contains("Invalid token") || err.contains("decode"),
+            err.contains("No Cashu token")
+                || err.contains("Invalid token")
+                || err.contains("decode"),
             "unexpected message: {err}",
         );
+    }
+
+    #[test]
+    fn extracts_token_from_url() {
+        // The whole point of routing through extract_cashu_token: the
+        // user pastes a redeem URL and we still get the preview.
+        let url = format!("https://wallet.example/redeem?token={V3_TOKEN_FIXTURE}");
+        let preview = parse_token(&url).expect("URL-wrapped token parses");
+        assert_eq!(preview.amount, 10);
+        assert_eq!(preview.unit, "sats");
+        // `raw` should carry the extracted token, NOT the full URL —
+        // downstream `WalletClient::receive_token` is strict.
+        assert_eq!(preview.raw, V3_TOKEN_FIXTURE);
     }
 
     #[test]
