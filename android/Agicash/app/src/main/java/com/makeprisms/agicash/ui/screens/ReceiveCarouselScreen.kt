@@ -351,8 +351,21 @@ private fun CashuPasteFormCard(
 private sealed interface LnReceivePhase {
     data object AmountEntry : LnReceivePhase
     data object Generating : LnReceivePhase
-    data class Invoice(val handle: MintQuoteHandle) : LnReceivePhase
-    data object Completing : LnReceivePhase
+    /**
+     * Invoice phase covers both "show invoice, poll for payment" and the
+     * subsequent "minting proofs" handoff. [completing] flips true once
+     * the mint reports PAID/COMPLETED and we're awaiting the FFI
+     * `completeMintQuote` call. Critically, the polling
+     * [LaunchedEffect] is keyed on `handle.quoteId` (NOT on the phase
+     * identity or [completing]), so the in-flight suspend is NOT
+     * cancelled mid-call by the visual transition — that was the bug
+     * where success surfaced as "unexpected: The coroutine scope left
+     * the composition".
+     */
+    data class Invoice(
+        val handle: MintQuoteHandle,
+        val completing: Boolean = false,
+    ) : LnReceivePhase
     data class Success(val result: ReceiveResult) : LnReceivePhase
     data class Failure(val message: String) : LnReceivePhase
 }
@@ -397,7 +410,11 @@ private fun LightningReceivePage(
                 is WalletViewModel.LightningPollOutcome.State -> when (o.state) {
                     MintQuoteFfiState.UNPAID -> Unit // keep polling
                     MintQuoteFfiState.PAID, MintQuoteFfiState.COMPLETED -> {
-                        phase = LnReceivePhase.Completing
+                        // Flip the "completing" flag on the SAME Invoice
+                        // phase — preserves `handle.quoteId` as the
+                        // LaunchedEffect key, so the suspend below
+                        // doesn't get cancelled out from under us.
+                        phase = LnReceivePhase.Invoice(h, completing = true)
                         phase = when (val c = viewModel.completeLightningQuote(h.quoteId)) {
                             is WalletViewModel.ReceiveOutcome.Success ->
                                 LnReceivePhase.Success(c.result)
@@ -507,12 +524,15 @@ private fun LightningReceivePage(
                 )
             }
             is LnReceivePhase.Generating -> CenteredProgress("Requesting invoice from mint…")
-            is LnReceivePhase.Invoice -> InvoiceCard(
-                handle = p.handle,
-                onCopy = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(p.handle.invoice)) },
-                onCancel = { resetToEntry() },
-            )
-            is LnReceivePhase.Completing -> CenteredProgress("Minting proofs…")
+            is LnReceivePhase.Invoice -> if (p.completing) {
+                CenteredProgress("Minting proofs…")
+            } else {
+                InvoiceCard(
+                    handle = p.handle,
+                    onCopy = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(p.handle.invoice)) },
+                    onCancel = { resetToEntry() },
+                )
+            }
             is LnReceivePhase.Success -> Column(
                 modifier = Modifier.padding(Spacing.l),
                 horizontalAlignment = Alignment.CenterHorizontally,

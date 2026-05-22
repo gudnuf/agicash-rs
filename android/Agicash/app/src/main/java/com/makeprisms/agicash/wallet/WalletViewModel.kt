@@ -11,6 +11,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -854,6 +855,11 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             val result = withContext(Dispatchers.IO) { w.receiveToken(trimmed) }
             refreshAccounts()
             return ReceiveOutcome.Success(result)
+        } catch (e: CancellationException) {
+            // Cancellation must propagate — never re-wrap it as a
+            // user-facing failure, or callers see "unexpected:*" on the
+            // success path when the surrounding scope/effect ends.
+            throw e
         } catch (e: FfiException) {
             return ReceiveOutcome.Failure(ffiErrorMessage(e))
         } catch (e: Throwable) {
@@ -897,6 +903,8 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
                 w.startMintQuote(amount, accountId, currency)
             }
             LightningQuoteOutcome.Success(handle)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: FfiException) {
             LightningQuoteOutcome.Failure(ffiErrorMessage(e))
         } catch (e: Throwable) {
@@ -914,6 +922,8 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
         return try {
             val snap = withContext(Dispatchers.IO) { w.pollMintQuote(quoteId) }
             LightningPollOutcome.State(snap.state, snap.failureReason)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: FfiException) {
             LightningPollOutcome.Failure(ffiErrorMessage(e))
         } catch (e: Throwable) {
@@ -934,6 +944,8 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             val result = withContext(Dispatchers.IO) { w.completeMintQuote(quoteId) }
             refreshAccounts()
             ReceiveOutcome.Success(result)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: FfiException) {
             ReceiveOutcome.Failure(ffiErrorMessage(e))
         } catch (e: Throwable) {
