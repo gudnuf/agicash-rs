@@ -15,17 +15,15 @@
 
 use crate::SupabaseStorage;
 use agicash_cashu::{
-    CashuMintQuote, CashuMintQuoteState, CashuMintQuoteStorage, CompleteMintQuote,
-    CompleteMintQuoteResult, CreateMintQuote, MintQuoteStorageError, ProcessMintQuotePayment,
-    ProcessMintQuotePaymentResult,
+    CashuMintQuote, CashuMintQuoteStorage, CompleteMintQuote, CompleteMintQuoteResult,
+    CreateMintQuote, MintQuoteStorageError, ProcessMintQuotePayment, ProcessMintQuotePaymentResult,
 };
-use agicash_domain::{Account, AccountId, UserId};
+use agicash_domain::{Account, UserId};
 use agicash_money::Money;
 use agicash_traits::ProofEncryption;
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -56,36 +54,6 @@ impl SupabaseCashuMintQuoteStorage {
         let cipher = self.encryption.encrypt(&bytes).await?;
         Ok(general_purpose::STANDARD.encode(cipher))
     }
-
-    async fn decrypt_from_base64(&self, encoded: &str) -> Result<Value, MintQuoteStorageError> {
-        let cipher = general_purpose::STANDARD
-            .decode(encoded.as_bytes())
-            .map_err(|e| MintQuoteStorageError::Backend(format!("decode encrypted_data: {e}")))?;
-        let plain = self.encryption.decrypt(&cipher).await?;
-        let value: Value = serde_json::from_slice(&plain)
-            .map_err(|e| MintQuoteStorageError::Backend(format!("encrypted_data not JSON: {e}")))?;
-        Ok(value)
-    }
-}
-
-/// One row from `wallet.cashu_receive_quotes`. Field names match the
-/// postgrest response (`snake_case` columns).
-#[derive(Debug, Clone, Deserialize)]
-struct CashuMintQuoteRow {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    account_id: AccountId,
-    user_id: UserId,
-    keyset_id: Option<String>,
-    keyset_counter: Option<i32>,
-    state: String,
-    version: i32,
-    failure_reason: Option<String>,
-    transaction_id: Uuid,
-    payment_hash: String,
-    locking_derivation_path: String,
-    encrypted_data: String,
 }
 
 /// JSON inside `encrypted_data` (mirrors TS `CashuLightningReceiveDbDataSchema`).
@@ -453,62 +421,20 @@ impl CashuMintQuoteStorage for SupabaseCashuMintQuoteStorage {
 }
 
 impl SupabaseCashuMintQuoteStorage {
+    /// Delegates to `crate::conversions::to_cashu_mint_quote` after
+    /// deserializing the postgrest row JSON into the codegen
+    /// `CashuReceiveQuotesRow`. The conversion logic — including the
+    /// `encrypted_data` decrypt and the state-machine fold — was
+    /// extracted as a public helper so the wallet-side cache
+    /// (`agicash-wallet`, sibling lane) can call it on the same
+    /// typed row variants the realtime crate emits via
+    /// `WalletRealtimeEvent::Change`.
     async fn row_to_quote(&self, value: Value) -> Result<CashuMintQuote, MintQuoteStorageError> {
-        let row: CashuMintQuoteRow = serde_json::from_value(value).map_err(|e| {
-            MintQuoteStorageError::Backend(format!("parse cashu_receive_quote row: {e}"))
-        })?;
-        let decoded = self.decrypt_from_base64(&row.encrypted_data).await?;
-        let receive: LightningReceiveData = serde_json::from_value(decoded)
-            .map_err(|e| MintQuoteStorageError::Backend(format!("parse encrypted_data: {e}")))?;
-        let version = u32::try_from(row.version).map_err(|_| {
-            MintQuoteStorageError::Backend(format!("version out of u32 range: {}", row.version))
-        })?;
-        let state = match row.state.as_str() {
-            "UNPAID" => CashuMintQuoteState::Unpaid,
-            "PAID" => CashuMintQuoteState::Paid {
-                keyset_id: row.keyset_id.clone().unwrap_or_default(),
-                keyset_counter: row
-                    .keyset_counter
-                    .and_then(|c| u32::try_from(c).ok())
-                    .unwrap_or(0),
-                output_amounts: receive.output_amounts.clone().unwrap_or_default(),
-            },
-            "COMPLETED" => CashuMintQuoteState::Completed {
-                keyset_id: row.keyset_id.clone().unwrap_or_default(),
-                keyset_counter: row
-                    .keyset_counter
-                    .and_then(|c| u32::try_from(c).ok())
-                    .unwrap_or(0),
-                output_amounts: receive.output_amounts.clone().unwrap_or_default(),
-            },
-            "EXPIRED" => CashuMintQuoteState::Expired,
-            "FAILED" => CashuMintQuoteState::Failed {
-                failure_reason: row.failure_reason.unwrap_or_else(|| "unknown".to_string()),
-            },
-            other => {
-                return Err(MintQuoteStorageError::Backend(format!(
-                    "unknown mint quote state: {other}"
-                )));
-            }
-        };
-        Ok(CashuMintQuote {
-            id: row.id,
-            quote_id: receive.mint_quote_id,
-            user_id: row.user_id,
-            account_id: row.account_id,
-            amount: receive.amount_received,
-            description: receive.description,
-            payment_request: receive.payment_request,
-            payment_hash: row.payment_hash,
-            locking_derivation_path: row.locking_derivation_path,
-            transaction_id: row.transaction_id,
-            minting_fee: receive.minting_fee,
-            total_fee: receive.total_fee,
-            created_at: row.created_at,
-            expires_at: row.expires_at,
-            version,
-            state,
-        })
+        let row: crate::generated::tables::cashu_receive_quotes::CashuReceiveQuotesRow =
+            serde_json::from_value(value).map_err(|e| {
+                MintQuoteStorageError::Backend(format!("parse cashu_receive_quote row: {e}"))
+            })?;
+        crate::conversions::to_cashu_mint_quote(&row, self.encryption.as_ref()).await
     }
 }
 
@@ -540,9 +466,7 @@ fn proof_to_y(secret: &str) -> String {
 mod tests {
     use super::*;
     use agicash_domain::{AccountPurpose, AccountState, AccountType, Currency};
-    use agicash_money::Unit;
     use agicash_traits::PassthroughProofEncryption;
-    use rust_decimal::Decimal;
     use serde_json::json;
 
     struct StubTokens;
@@ -567,12 +491,26 @@ mod tests {
         SupabaseCashuMintQuoteStorage::new(base, passthrough())
     }
 
+    // `row_to_quote` is now a thin delegation to
+    // `crate::conversions::to_cashu_mint_quote`; its state-machine and
+    // encrypted-data folding tests live next to that helper in
+    // `conversions.rs`. Tests below cover the parts that stay here:
+    // the write-path `encrypt_to_base64` round-trip, the hash + key
+    // helpers, and the account-row parser.
+
     #[tokio::test]
-    async fn encrypt_round_trip_via_passthrough() {
+    async fn encrypt_to_base64_round_trips_through_passthrough() {
         let storage = make_storage();
         let value = json!({ "hello": "world" });
+        // Round-trip via the conversion helper's matching decrypt path
+        // (it reads what `encrypt_to_base64` writes).
         let encoded = storage.encrypt_to_base64(&value).await.unwrap();
-        let back = storage.decrypt_from_base64(&encoded).await.unwrap();
+        // Decode + decrypt with the same passthrough impl.
+        let cipher = general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        let plain = storage.encryption.decrypt(&cipher).await.unwrap();
+        let back: Value = serde_json::from_slice(&plain).unwrap();
         assert_eq!(back, value);
     }
 
@@ -590,131 +528,6 @@ mod tests {
         let y = proof_to_y("0123456789abcdef");
         assert!(!y.is_empty());
         assert!(y.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn receive_data_round_trips_through_json() {
-        let data = LightningReceiveData {
-            payment_request: "lnbc...".into(),
-            mint_quote_id: "qid".into(),
-            amount_received: Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            description: Some("memo".into()),
-            minting_fee: Some(Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat)),
-            output_amounts: Some(vec![64]),
-            total_fee: Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat),
-        };
-        let json = serde_json::to_value(&data).unwrap();
-        assert!(json.get("paymentRequest").is_some());
-        assert!(json.get("mintQuoteId").is_some());
-        assert!(json.get("amountReceived").is_some());
-        let back: LightningReceiveData = serde_json::from_value(json).unwrap();
-        assert_eq!(back.output_amounts, Some(vec![64]));
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_unpaid_state() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "mintQuoteId": "qid",
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "totalFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": null,
-            "keyset_counter": null,
-            "state": "UNPAID",
-            "version": 0,
-            "failure_reason": null,
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "locking_derivation_path": "",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        assert_eq!(quote.quote_id, "qid");
-        assert!(matches!(quote.state, CashuMintQuoteState::Unpaid));
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_paid_state_with_output_amounts() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "mintQuoteId": "qid",
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "totalFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-            "outputAmounts": [64],
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 7,
-            "state": "PAID",
-            "version": 1,
-            "failure_reason": null,
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "locking_derivation_path": "",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        match quote.state {
-            CashuMintQuoteState::Paid {
-                keyset_id,
-                keyset_counter,
-                output_amounts,
-            } => {
-                assert_eq!(keyset_id, "00abcdef");
-                assert_eq!(keyset_counter, 7);
-                assert_eq!(output_amounts, vec![64]);
-            }
-            other => panic!("unexpected state: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_failed_state_with_reason() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "mintQuoteId": "qid",
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "totalFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": null,
-            "keyset_counter": null,
-            "state": "FAILED",
-            "version": 1,
-            "failure_reason": "Boom",
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "locking_derivation_path": "",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        match quote.state {
-            CashuMintQuoteState::Failed { failure_reason } => assert_eq!(failure_reason, "Boom"),
-            other => panic!("unexpected: {other:?}"),
-        }
     }
 
     #[test]

@@ -261,6 +261,7 @@ name = "agicash-realtime"
 version = "0.1.0"
 dependencies = [
  "agicash-domain",
+ "agicash-storage-supabase",
  "agicash-traits",
  "async-broadcast",
  "async-trait",

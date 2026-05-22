@@ -8,6 +8,7 @@
 pub mod codec;
 pub mod error;
 pub mod event;
+pub mod payload;
 pub mod transport;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,5 +24,11 @@ pub use error::{RealtimeError, TransportError};
 // corresponding modules (kept off while those modules are placeholders so the
 // Task-1 skeleton build is green).
 pub use event::{RealtimeStatus, WalletEvent, WalletRealtimeEvent};
+pub use payload::{
+    parse_change, AccountWithProofs, AccountsRow, AcknowledgmentStatus, CashuProofsRow,
+    CashuReceiveQuotesRow, CashuReceiveSwapsRow, CashuSendQuoteWithProofs, CashuSendQuotesRow,
+    CashuSendSwapWithProofs, CashuSendSwapsRow, ContactsRow, SparkReceiveQuotesRow,
+    SparkSendQuotesRow, TransactionWithPreviousAck, TransactionsRow, WalletChange,
+};
 pub use service::{TokenProviderJwtSource, TransportFactory, WalletRealtimeService};
 pub use transport::{RealtimeTransport, WsFrame};

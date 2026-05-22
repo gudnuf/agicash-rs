@@ -216,12 +216,25 @@ impl<T: RealtimeTransport> PhoenixClient<T> {
                 event,
                 payload_json,
             } => {
+                // Emit `Event` (string-shaped) for the refetch-style
+                // consumers (FFI bridge, Leptos pump, driver), then
+                // `Change` (typed) for the cache layer. Order matters:
+                // `Event` first so today's "something changed → refetch"
+                // discipline kicks off ahead of the cache delta apply,
+                // matching the React app's `useTrackWalletChanges` →
+                // typed-handler ordering. Both fires are best-effort
+                // (`try_broadcast`) — an overflowing channel drops the
+                // oldest, never blocks the supervisor.
+                let typed = crate::payload::parse_change(&event, &payload_json);
                 let _ = self
                     .sink
                     .try_broadcast(WalletRealtimeEvent::Event(WalletEvent {
                         event,
                         payload_json,
                     }));
+                let _ = self
+                    .sink
+                    .try_broadcast(WalletRealtimeEvent::Change(Box::new(typed)));
             }
             RouterAction::ChannelDown => {
                 let _ = self.sink.try_broadcast(WalletRealtimeEvent::StatusChanged(

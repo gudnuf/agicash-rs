@@ -13,16 +13,15 @@
 
 use crate::SupabaseStorage;
 use agicash_cashu::{
-    CashuMeltQuote, CashuMeltQuoteState, CashuMeltQuoteStorage, CompleteMeltQuote,
-    CompleteMeltQuoteResult, CreateMeltQuote, CreateMeltQuoteResult, MeltQuoteStorageError,
+    CashuMeltQuote, CashuMeltQuoteStorage, CompleteMeltQuote, CompleteMeltQuoteResult,
+    CreateMeltQuote, CreateMeltQuoteResult, MeltQuoteStorageError,
 };
-use agicash_domain::{Account, AccountId, UserId};
+use agicash_domain::{Account, UserId};
 use agicash_money::Money;
 use agicash_traits::ProofEncryption;
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -53,36 +52,6 @@ impl SupabaseCashuMeltQuoteStorage {
         let cipher = self.encryption.encrypt(&bytes).await?;
         Ok(general_purpose::STANDARD.encode(cipher))
     }
-
-    async fn decrypt_from_base64(&self, encoded: &str) -> Result<Value, MeltQuoteStorageError> {
-        let cipher = general_purpose::STANDARD
-            .decode(encoded.as_bytes())
-            .map_err(|e| MeltQuoteStorageError::Backend(format!("decode encrypted_data: {e}")))?;
-        let plain = self.encryption.decrypt(&cipher).await?;
-        let value: Value = serde_json::from_slice(&plain)
-            .map_err(|e| MeltQuoteStorageError::Backend(format!("encrypted_data not JSON: {e}")))?;
-        Ok(value)
-    }
-}
-
-/// One row from `wallet.cashu_send_quotes`. Field names match the
-/// postgrest response (`snake_case` columns).
-#[derive(Debug, Clone, Deserialize)]
-struct CashuMeltQuoteRow {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    expires_at: DateTime<Utc>,
-    account_id: AccountId,
-    user_id: UserId,
-    keyset_id: String,
-    keyset_counter: i32,
-    number_of_change_outputs: i32,
-    state: String,
-    version: i32,
-    failure_reason: Option<String>,
-    transaction_id: Uuid,
-    payment_hash: String,
-    encrypted_data: String,
 }
 
 /// JSON inside `encrypted_data` (mirrors TS `CashuLightningSendDbDataSchema`).
@@ -536,83 +505,16 @@ impl CashuMeltQuoteStorage for SupabaseCashuMeltQuoteStorage {
 }
 
 impl SupabaseCashuMeltQuoteStorage {
+    /// Delegates to `crate::conversions::to_cashu_melt_quote` after
+    /// deserializing the postgrest row JSON into the codegen
+    /// `CashuSendQuotesRow`. See `to_cashu_mint_quote`'s sibling doc
+    /// in `cashu_mint_quote_storage.rs` for the extraction rationale.
     async fn row_to_quote(&self, value: Value) -> Result<CashuMeltQuote, MeltQuoteStorageError> {
-        let row: CashuMeltQuoteRow = serde_json::from_value(value).map_err(|e| {
-            MeltQuoteStorageError::Backend(format!("parse cashu_send_quote row: {e}"))
-        })?;
-        let decoded = self.decrypt_from_base64(&row.encrypted_data).await?;
-        let send: LightningSendData = serde_json::from_value(decoded)
-            .map_err(|e| MeltQuoteStorageError::Backend(format!("parse encrypted_data: {e}")))?;
-        let version = u32::try_from(row.version).map_err(|_| {
-            MeltQuoteStorageError::Backend(format!("version out of u32 range: {}", row.version))
-        })?;
-        let keyset_counter = u32::try_from(row.keyset_counter).map_err(|_| {
-            MeltQuoteStorageError::Backend(format!(
-                "keyset_counter out of u32 range: {}",
-                row.keyset_counter
-            ))
-        })?;
-        let number_of_change_outputs =
-            u32::try_from(row.number_of_change_outputs).map_err(|_| {
-                MeltQuoteStorageError::Backend(format!(
-                    "number_of_change_outputs out of u32 range: {}",
-                    row.number_of_change_outputs
-                ))
+        let row: crate::generated::tables::cashu_send_quotes::CashuSendQuotesRow =
+            serde_json::from_value(value).map_err(|e| {
+                MeltQuoteStorageError::Backend(format!("parse cashu_send_quote row: {e}"))
             })?;
-        let state = match row.state.as_str() {
-            "UNPAID" => CashuMeltQuoteState::Unpaid,
-            "PENDING" => CashuMeltQuoteState::Pending,
-            "PAID" => CashuMeltQuoteState::Paid {
-                payment_preimage: send.payment_preimage.clone().unwrap_or_default(),
-                lightning_fee: send.lightning_fee.ok_or_else(|| {
-                    MeltQuoteStorageError::Backend(
-                        "PAID quote missing lightning_fee in encrypted_data".into(),
-                    )
-                })?,
-                amount_spent: send.amount_spent.ok_or_else(|| {
-                    MeltQuoteStorageError::Backend(
-                        "PAID quote missing amount_spent in encrypted_data".into(),
-                    )
-                })?,
-                total_fee: send.total_fee.ok_or_else(|| {
-                    MeltQuoteStorageError::Backend(
-                        "PAID quote missing total_fee in encrypted_data".into(),
-                    )
-                })?,
-            },
-            "EXPIRED" => CashuMeltQuoteState::Expired,
-            "FAILED" => CashuMeltQuoteState::Failed {
-                failure_reason: row.failure_reason.unwrap_or_else(|| "unknown".to_string()),
-            },
-            other => {
-                return Err(MeltQuoteStorageError::Backend(format!(
-                    "unknown melt quote state: {other}"
-                )));
-            }
-        };
-        Ok(CashuMeltQuote {
-            id: row.id,
-            quote_id: send.melt_quote_id,
-            user_id: row.user_id,
-            account_id: row.account_id,
-            payment_request: send.payment_request,
-            payment_hash: row.payment_hash,
-            amount_requested: send.amount_requested,
-            amount_requested_in_msat: send.amount_requested_in_msat,
-            amount_received: send.amount_received,
-            lightning_fee_reserve: send.lightning_fee_reserve,
-            cashu_fee: send.cashu_send_fee,
-            proofs: Vec::new(),
-            amount_reserved: send.amount_reserved,
-            keyset_id: row.keyset_id,
-            keyset_counter,
-            number_of_change_outputs,
-            transaction_id: row.transaction_id,
-            created_at: row.created_at,
-            expires_at: row.expires_at,
-            version,
-            state,
-        })
+        crate::conversions::to_cashu_melt_quote(&row, self.encryption.as_ref()).await
     }
 }
 
@@ -706,12 +608,23 @@ mod tests {
         SupabaseCashuMeltQuoteStorage::new(base, passthrough())
     }
 
+    // `row_to_quote` is now a thin delegation to
+    // `crate::conversions::to_cashu_melt_quote`; its state-machine and
+    // encrypted-data folding tests live next to that helper in
+    // `conversions.rs`. Tests below cover what stays in this file:
+    // write-path `encrypt_to_base64`, error classifiers, hash + key
+    // helpers, and the account-row parser.
+
     #[tokio::test]
-    async fn encrypt_round_trip_via_passthrough() {
+    async fn encrypt_to_base64_round_trips_through_passthrough() {
         let storage = make_storage();
         let value = json!({ "hello": "world" });
         let encoded = storage.encrypt_to_base64(&value).await.unwrap();
-        let back = storage.decrypt_from_base64(&encoded).await.unwrap();
+        let cipher = general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        let plain = storage.encryption.decrypt(&cipher).await.unwrap();
+        let back: Value = serde_json::from_slice(&plain).unwrap();
         assert_eq!(back, value);
     }
 
@@ -772,131 +685,6 @@ mod tests {
         assert!(json_value.get("amountRequestedInMsat").is_some());
         let back: LightningSendData = serde_json::from_value(json_value).unwrap();
         assert_eq!(back.payment_preimage, Some("pre".into()));
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_unpaid_state() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "amountRequested": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "amountRequestedInMsat": 64_000u64,
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "lightningFeeReserve": Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat),
-            "cashuSendFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-            "meltQuoteId": "qid",
-            "amountReserved": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 3,
-            "number_of_change_outputs": 1,
-            "state": "UNPAID",
-            "version": 0,
-            "failure_reason": null,
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        assert_eq!(quote.quote_id, "qid");
-        assert!(matches!(quote.state, CashuMeltQuoteState::Unpaid));
-        assert_eq!(quote.keyset_counter, 3);
-        assert_eq!(quote.number_of_change_outputs, 1);
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_paid_state_with_fee_breakdown() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "amountRequested": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "amountRequestedInMsat": 64_000u64,
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "lightningFeeReserve": Money::new(Decimal::from(2u64), Currency::Btc, Unit::Sat),
-            "cashuSendFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-            "meltQuoteId": "qid",
-            "amountReserved": Money::new(Decimal::from(66u64), Currency::Btc, Unit::Sat),
-            "paymentPreimage": "abcd",
-            "lightningFee": Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat),
-            "amountSpent": Money::new(Decimal::from(65u64), Currency::Btc, Unit::Sat),
-            "totalFee": Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 4,
-            "number_of_change_outputs": 1,
-            "state": "PAID",
-            "version": 1,
-            "failure_reason": null,
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        match quote.state {
-            CashuMeltQuoteState::Paid {
-                payment_preimage,
-                lightning_fee,
-                amount_spent,
-                total_fee,
-            } => {
-                assert_eq!(payment_preimage, "abcd");
-                assert_eq!(lightning_fee.amount(), Decimal::from(1u64));
-                assert_eq!(amount_spent.amount(), Decimal::from(65u64));
-                assert_eq!(total_fee.amount(), Decimal::from(1u64));
-            }
-            other => panic!("unexpected state: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn row_to_quote_parses_failed_state_with_reason() {
-        let storage = make_storage();
-        let data = json!({
-            "paymentRequest": "lnbc...",
-            "amountRequested": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "amountRequestedInMsat": 64_000u64,
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "lightningFeeReserve": Money::new(Decimal::from(1u64), Currency::Btc, Unit::Sat),
-            "cashuSendFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-            "meltQuoteId": "qid",
-            "amountReserved": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "id": "11111111-2222-3333-4444-555555555555",
-            "created_at": "2026-05-15T00:00:00Z",
-            "expires_at": "2026-05-15T01:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 5,
-            "number_of_change_outputs": 0,
-            "state": "FAILED",
-            "version": 2,
-            "failure_reason": "Boom",
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "payment_hash": "ph",
-            "encrypted_data": encrypted,
-        });
-        let quote = storage.row_to_quote(row).await.unwrap();
-        match quote.state {
-            CashuMeltQuoteState::Failed { failure_reason } => assert_eq!(failure_reason, "Boom"),
-            other => panic!("unexpected: {other:?}"),
-        }
     }
 
     #[test]

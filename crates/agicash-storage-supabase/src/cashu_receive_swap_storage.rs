@@ -11,20 +11,18 @@
 
 use crate::SupabaseStorage;
 use agicash_cashu::{
-    CashuReceiveSwap, CashuReceiveSwapState, CashuReceiveSwapStorage, CompleteReceiveSwapResult,
-    CreateReceiveSwap, CreateReceiveSwapResult, ReceiveSwapStorageError, TokenProof,
+    CashuReceiveSwap, CashuReceiveSwapStorage, CompleteReceiveSwapResult, CreateReceiveSwap,
+    CreateReceiveSwapResult, ReceiveSwapStorageError, TokenProof,
 };
-use agicash_domain::{Account, AccountId, UserId};
+use agicash_domain::{Account, UserId};
 use agicash_money::Money;
 use agicash_traits::ProofEncryption;
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// Postgres-backed receive-swap storage.
 pub struct SupabaseCashuReceiveSwapStorage {
@@ -50,34 +48,6 @@ impl SupabaseCashuReceiveSwapStorage {
         let cipher = self.encryption.encrypt(&bytes).await?;
         Ok(general_purpose::STANDARD.encode(cipher))
     }
-
-    async fn decrypt_from_base64(&self, encoded: &str) -> Result<Value, ReceiveSwapStorageError> {
-        let cipher = general_purpose::STANDARD
-            .decode(encoded.as_bytes())
-            .map_err(|e| ReceiveSwapStorageError::Backend(format!("decode encrypted_data: {e}")))?;
-        let plain = self.encryption.decrypt(&cipher).await?;
-        let value: Value = serde_json::from_slice(&plain).map_err(|e| {
-            ReceiveSwapStorageError::Backend(format!("encrypted_data not JSON: {e}"))
-        })?;
-        Ok(value)
-    }
-}
-
-/// One row from `wallet.cashu_receive_swaps`. Field names match the postgrest
-/// response (`snake_case` columns).
-#[derive(Debug, Clone, Deserialize)]
-struct CashuReceiveSwapRow {
-    token_hash: String,
-    created_at: DateTime<Utc>,
-    account_id: AccountId,
-    user_id: UserId,
-    keyset_id: String,
-    keyset_counter: i32,
-    state: String,
-    version: i32,
-    failure_reason: Option<String>,
-    transaction_id: Uuid,
-    encrypted_data: String,
 }
 
 /// JSON shape inside `encrypted_data` (mirrors TS
@@ -345,51 +315,17 @@ impl CashuReceiveSwapStorage for SupabaseCashuReceiveSwapStorage {
 }
 
 impl SupabaseCashuReceiveSwapStorage {
+    /// Delegates to `crate::conversions::to_cashu_receive_swap` after
+    /// deserializing the postgrest row JSON into the codegen
+    /// `CashuReceiveSwapsRow`. See `to_cashu_mint_quote`'s sibling
+    /// doc in `cashu_mint_quote_storage.rs` for the extraction
+    /// rationale.
     async fn row_to_swap(&self, value: Value) -> Result<CashuReceiveSwap, ReceiveSwapStorageError> {
-        let row: CashuReceiveSwapRow = serde_json::from_value(value).map_err(|e| {
-            ReceiveSwapStorageError::Backend(format!("parse cashu_receive_swap row: {e}"))
-        })?;
-        let decoded = self.decrypt_from_base64(&row.encrypted_data).await?;
-        let receive: ReceiveData = serde_json::from_value(decoded)
-            .map_err(|e| ReceiveSwapStorageError::Backend(format!("parse encrypted_data: {e}")))?;
-        let state = match row.state.as_str() {
-            "PENDING" => CashuReceiveSwapState::Pending,
-            "COMPLETED" => CashuReceiveSwapState::Completed,
-            "FAILED" => CashuReceiveSwapState::Failed {
-                failure_reason: row.failure_reason.unwrap_or_else(|| "unknown".to_string()),
-            },
-            other => {
-                return Err(ReceiveSwapStorageError::Backend(format!(
-                    "unknown receive swap state: {other}"
-                )));
-            }
-        };
-        let keyset_counter = u32::try_from(row.keyset_counter).map_err(|_| {
-            ReceiveSwapStorageError::Backend(format!(
-                "keyset_counter out of u32 range: {}",
-                row.keyset_counter
-            ))
-        })?;
-        let version = u32::try_from(row.version).map_err(|_| {
-            ReceiveSwapStorageError::Backend(format!("version out of u32 range: {}", row.version))
-        })?;
-        Ok(CashuReceiveSwap {
-            token_hash: row.token_hash,
-            token_proofs: receive.token_proofs,
-            token_description: receive.token_description,
-            user_id: row.user_id,
-            account_id: row.account_id,
-            input_amount: receive.token_amount,
-            amount_received: receive.amount_received,
-            fee_amount: receive.cashu_receive_fee,
-            keyset_id: row.keyset_id,
-            keyset_counter,
-            output_amounts: receive.output_amounts,
-            transaction_id: row.transaction_id,
-            created_at: row.created_at,
-            version,
-            state,
-        })
+        let row: crate::generated::tables::cashu_receive_swaps::CashuReceiveSwapsRow =
+            serde_json::from_value(value).map_err(|e| {
+                ReceiveSwapStorageError::Backend(format!("parse cashu_receive_swap row: {e}"))
+            })?;
+        crate::conversions::to_cashu_receive_swap(&row, self.encryption.as_ref()).await
     }
 }
 
@@ -476,10 +412,15 @@ mod tests {
         let back: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, value);
 
-        let decoded = storage
-            .decrypt_from_base64(&encoded)
-            .await
-            .expect("decrypt");
+        // Decode + decrypt via the same `ProofEncryption` handle the
+        // storage was built with — the test's purpose is round-trip
+        // proof; the shared decrypt helper now lives in
+        // `crate::conversions` (and is exercised end-to-end there).
+        let cipher = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .unwrap();
+        let plain = storage.encryption.decrypt(&cipher).await.unwrap();
+        let decoded: Value = serde_json::from_slice(&plain).unwrap();
         assert_eq!(decoded, value);
     }
 
@@ -518,76 +459,11 @@ mod tests {
         assert_eq!(back.output_amounts, vec![64, 32, 2, 1]);
     }
 
-    #[tokio::test]
-    async fn row_to_swap_parses_postgrest_response_shape() {
-        let storage = make_storage();
-
-        let data = json!({
-            "tokenMintUrl": "https://m.test",
-            "tokenAmount": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "tokenProofs": [],
-            "tokenDescription": "memo",
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "outputAmounts": [64],
-            "cashuReceiveFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-
-        let row = json!({
-            "token_hash": "deadbeef",
-            "created_at": "2026-05-15T00:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 7,
-            "state": "PENDING",
-            "version": 0,
-            "failure_reason": null,
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "encrypted_data": encrypted,
-        });
-        let swap = storage.row_to_swap(row).await.unwrap();
-        assert_eq!(swap.token_hash, "deadbeef");
-        assert_eq!(swap.keyset_counter, 7);
-        assert!(matches!(swap.state, CashuReceiveSwapState::Pending));
-        assert_eq!(swap.output_amounts, vec![64]);
-        assert_eq!(swap.token_description.as_deref(), Some("memo"));
-    }
-
-    #[tokio::test]
-    async fn row_to_swap_parses_failed_state_with_reason() {
-        let storage = make_storage();
-
-        let data = json!({
-            "tokenMintUrl": "https://m.test",
-            "tokenAmount": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "tokenProofs": [],
-            "amountReceived": Money::new(Decimal::from(64u64), Currency::Btc, Unit::Sat),
-            "outputAmounts": [64],
-            "cashuReceiveFee": Money::new(Decimal::from(0u64), Currency::Btc, Unit::Sat),
-        });
-        let encrypted = storage.encrypt_to_base64(&data).await.unwrap();
-        let row = json!({
-            "token_hash": "h",
-            "created_at": "2026-05-15T00:00:00Z",
-            "account_id": "11111111-2222-3333-4444-555555555555",
-            "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "keyset_id": "00abcdef",
-            "keyset_counter": 0,
-            "state": "FAILED",
-            "version": 1,
-            "failure_reason": "Token already claimed",
-            "transaction_id": "11111111-2222-3333-4444-555555555555",
-            "encrypted_data": encrypted,
-        });
-        let swap = storage.row_to_swap(row).await.unwrap();
-        match swap.state {
-            CashuReceiveSwapState::Failed { failure_reason } => {
-                assert_eq!(failure_reason, "Token already claimed");
-            }
-            other => panic!("expected Failed, got: {other:?}"),
-        }
-    }
+    // `row_to_swap` is now a thin delegation to
+    // `crate::conversions::to_cashu_receive_swap`; its state-machine and
+    // encrypted-data folding tests live next to that helper in
+    // `conversions.rs`. This file keeps the write-path encrypted-data
+    // shape test and the account-row parser test.
 
     #[test]
     fn parse_account_strips_extra_cashu_proofs_field() {

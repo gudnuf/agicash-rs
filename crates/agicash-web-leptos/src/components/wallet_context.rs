@@ -839,6 +839,20 @@ impl WalletData {
                                          status): {msg}"
                                     );
                                 }
+                                Some(WalletRealtimeEvent::Change(_)) => {
+                                    // Typed-row sibling of `Event` —
+                                    // the realtime supervisor fires
+                                    // both per broadcast (see
+                                    // `WalletRealtimeEvent` doc). The
+                                    // Leptos pump's "refetch on any
+                                    // change" discipline is already
+                                    // handled by the `Event(_)` arm
+                                    // above; the typed payload is for
+                                    // the cache layer
+                                    // (`agicash-wallet`) and not for
+                                    // this signal-graph pump. No
+                                    // behavior change this lane.
+                                }
                                 None => break, // sender dropped — service gone.
                             }
                         }

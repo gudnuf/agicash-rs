@@ -10,6 +10,10 @@ description = "Supabase Realtime (Phoenix v2) client for the Agicash wallet"
 [dependencies]
 agicash-traits = { path = "../agicash-traits" }
 agicash-domain = { path = "../agicash-domain" }
+# Realtime parses each broadcast into typed `*Row` structs (see `payload.rs`).
+# `agicash-storage-supabase` is wasm-clean (Leptos already links it on wasm),
+# so depending on it from this crate keeps both targets building.
+agicash-storage-supabase = { path = "../agicash-storage-supabase" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

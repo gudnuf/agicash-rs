@@ -873,11 +873,18 @@ fn handle_realtime_event(ev: WalletRealtimeEvent, shared: &Shared, connected: &m
             // Track connection status for the fallback-tick gate.
             *connected = matches!(status, RealtimeStatus::Subscribed);
         }
-        WalletRealtimeEvent::Error(_) => {
-            // Recoverable transport error from the realtime supervisor.
-            // The supervisor is retrying internally; we have nothing
-            // to do here. (A `TerminalError` arrives as a
-            // `StatusChanged`, which the above branch sees.)
+        WalletRealtimeEvent::Error(_) | WalletRealtimeEvent::Change(_) => {
+            // `Error`: recoverable transport error from the realtime
+            //   supervisor. The supervisor is retrying internally; the
+            //   `TerminalError` case arrives via `StatusChanged` and
+            //   is handled above.
+            // `Change`: typed-row sibling of `Event` — the supervisor
+            //   fires both per broadcast (see `WalletRealtimeEvent`
+            //   doc). The driver's resumption discipline is event-name
+            //   driven and already handled by the `Event` arm above;
+            //   the typed payload is consumed by the cache layer
+            //   (`agicash-wallet`) and not by the driver.
+            // Both arms intentionally do nothing here.
         }
     }
 }

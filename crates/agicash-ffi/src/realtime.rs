@@ -161,6 +161,14 @@ pub(crate) fn dispatch_realtime_event(
         E::Event(e) => listener.on_event(e.event, e.payload_json),
         E::StatusChanged(s) => listener.on_status(s.into()),
         E::Error(m) => listener.on_error(m),
+        E::Change(_) => {
+            // Typed-row sibling of `Event` — the realtime supervisor
+            // fires both per broadcast (see `WalletRealtimeEvent`
+            // doc). iOS / Android consume the string-shaped surface
+            // through `on_event`; the typed payload is for the in-
+            // process cache layer (`agicash-wallet`) and never
+            // crosses the FFI boundary. No FFI behavior change.
+        }
     }
 }
 
