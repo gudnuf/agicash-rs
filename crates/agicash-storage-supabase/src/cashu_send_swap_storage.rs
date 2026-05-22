@@ -12,8 +12,8 @@
 
 use crate::SupabaseStorage;
 use agicash_cashu::{
-    CashuSendSwap, CashuSendSwapState, CashuSendSwapStorage, CommitProofsToSend, CreateSendSwap,
-    CreateSendSwapResult, OutputAmounts, ProofWithId, SendSwapStorageError, TokenProof,
+    CashuSendSwap, CashuSendSwapStorage, CommitProofsToSend, CreateSendSwap, CreateSendSwapResult,
+    OutputAmounts, ProofWithId, SendSwapStorageError, TokenProof,
 };
 use agicash_domain::{Account, AccountId, UserId};
 use agicash_money::Money;
@@ -21,7 +21,6 @@ use agicash_traits::ProofEncryption;
 use async_trait::async_trait;
 use base64::engine::general_purpose;
 use base64::Engine;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -52,6 +51,7 @@ impl SupabaseCashuSendSwapStorage {
         Ok(general_purpose::STANDARD.encode(cipher))
     }
 
+    #[cfg(test)]
     async fn decrypt_from_base64(&self, encoded: &str) -> Result<Value, SendSwapStorageError> {
         let cipher = general_purpose::STANDARD
             .decode(encoded.as_bytes())
@@ -63,30 +63,10 @@ impl SupabaseCashuSendSwapStorage {
     }
 }
 
-/// One row from `wallet.cashu_send_swaps`. Field names match the postgrest
-/// response (`snake_case` columns).
-#[derive(Debug, Clone, Deserialize)]
-struct CashuSendSwapRow {
-    id: Uuid,
-    created_at: DateTime<Utc>,
-    account_id: AccountId,
-    user_id: UserId,
-    keyset_id: Option<String>,
-    keyset_counter: Option<i32>,
-    state: String,
-    version: i32,
-    failure_reason: Option<String>,
-    transaction_id: Uuid,
-    encrypted_data: String,
-    requires_input_proofs_swap: bool,
-    token_hash: Option<String>,
-    #[serde(default)]
-    cashu_proofs: Vec<CashuProofRow>,
-}
-
-/// One row from `wallet.cashu_proofs` joined onto a swap. Used both for
-/// the input proofs (no `cashu_send_swap_id` matches `swap.id`) and the
-/// proofs-to-send / change proofs (set on the swap).
+/// One row from `wallet.cashu_proofs` returned by the `list_unspent`
+/// endpoint (standalone, no swap join). The swap-row → rich-type path
+/// uses the codegen `CashuProofsRow` via
+/// [`crate::conversions::to_cashu_send_swap`].
 #[derive(Debug, Clone, Deserialize)]
 struct CashuProofRow {
     id: Uuid,
@@ -99,10 +79,6 @@ struct CashuProofRow {
     dleq: Option<Value>,
     #[serde(default)]
     witness: Option<Value>,
-    #[serde(default)]
-    cashu_send_swap_id: Option<Uuid>,
-    #[serde(default)]
-    spending_cashu_send_swap_id: Option<Uuid>,
 }
 
 /// JSON shape inside `encrypted_data` for a send swap. Mirrors TS
@@ -548,6 +524,12 @@ impl SupabaseCashuSendSwapStorage {
     /// an extra `cashu_proofs` array supplied alongside (e.g. from RPC
     /// composite responses where `cashu_proofs` is split into reserved /
     /// change buckets).
+    ///
+    /// Thin wrapper around [`crate::conversions::to_cashu_send_swap`]:
+    /// merges the optional extra proof array into the row JSON, extracts
+    /// the joined `cashu_proofs` field, deserializes both into the typed
+    /// codegen rows, and delegates the actual conversion. See the helper's
+    /// rustdoc for the per-proof bucket classification + decryption seam.
     async fn row_to_swap_with_extra_proofs(
         &self,
         value: Value,
@@ -572,93 +554,24 @@ impl SupabaseCashuSendSwapStorage {
             }
         }
 
-        let row: CashuSendSwapRow = serde_json::from_value(row_value).map_err(|e| {
-            SendSwapStorageError::Backend(format!("parse cashu_send_swap row: {e}"))
-        })?;
-        let decoded = self.decrypt_from_base64(&row.encrypted_data).await?;
-        let send: SendData = serde_json::from_value(decoded)
-            .map_err(|e| SendSwapStorageError::Backend(format!("parse encrypted_data: {e}")))?;
+        // Extract the joined `cashu_proofs` (postgrest embed) into its own
+        // typed slice. The swap row itself doesn't have a `cashu_proofs`
+        // field on the codegen struct, but serde ignores unknown fields by
+        // default — no need to strip it before deserializing.
+        let proof_rows: Vec<crate::generated::tables::cashu_proofs::CashuProofsRow> =
+            match row_value.get("cashu_proofs") {
+                Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                    SendSwapStorageError::Backend(format!("parse cashu_proofs embed: {e}"))
+                })?,
+                None => Vec::new(),
+            };
+        let swap_row: crate::generated::tables::cashu_send_swaps::CashuSendSwapsRow =
+            serde_json::from_value(row_value).map_err(|e| {
+                SendSwapStorageError::Backend(format!("parse cashu_send_swap row: {e}"))
+            })?;
 
-        // TS distinguishes input_proofs from proofs_to_send by
-        // `cashu_send_swap_id`: input proofs were not added BY this swap
-        // (so cashu_send_swap_id != row.id), proofs_to_send were
-        // (cashu_send_swap_id == row.id). For DRAFT swaps (no swap done
-        // yet), only input proofs exist. For PENDING/COMPLETED swaps that
-        // didn't require an input swap, the proofs ARE the input proofs
-        // and ARE the proofs-to-send (we report them once each).
-        let mut input_proofs: Vec<TokenProof> = Vec::new();
-        let mut proofs_to_send: Vec<TokenProof> = Vec::new();
-        for p in &row.cashu_proofs {
-            let is_swap_added = p.cashu_send_swap_id == Some(row.id);
-            let is_swap_spending = p.spending_cashu_send_swap_id == Some(row.id);
-            let proof = self.decrypt_proof(p).await?;
-            if !row.requires_input_proofs_swap {
-                // Single set: include as both input + send (TS to_swap
-                // does the same via the OR condition on line 335).
-                input_proofs.push(proof.clone());
-                proofs_to_send.push(proof);
-            } else if is_swap_added && is_swap_spending {
-                proofs_to_send.push(proof);
-            } else if !is_swap_added {
-                input_proofs.push(proof);
-            }
-            // else: change proof — owned by the account; no bucket here.
-        }
-
-        let state = match row.state.as_str() {
-            "DRAFT" => CashuSendSwapState::Draft,
-            "PENDING" => CashuSendSwapState::Pending {
-                token_hash: row.token_hash.clone().unwrap_or_default(),
-                proofs_to_send: proofs_to_send.clone(),
-            },
-            "COMPLETED" => CashuSendSwapState::Completed {
-                token_hash: row.token_hash.clone().unwrap_or_default(),
-                proofs_to_send: proofs_to_send.clone(),
-            },
-            "FAILED" => CashuSendSwapState::Failed {
-                failure_reason: row
-                    .failure_reason
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
-            },
-            "REVERSED" => CashuSendSwapState::Reversed,
-            other => {
-                return Err(SendSwapStorageError::Backend(format!(
-                    "unknown send swap state: {other}"
-                )));
-            }
-        };
-
-        let keyset_counter = match row.keyset_counter {
-            Some(c) => Some(u32::try_from(c).map_err(|_| {
-                SendSwapStorageError::Backend(format!("keyset_counter out of u32 range: {c}"))
-            })?),
-            None => None,
-        };
-        let version = u32::try_from(row.version).map_err(|_| {
-            SendSwapStorageError::Backend(format!("version out of u32 range: {}", row.version))
-        })?;
-
-        Ok(CashuSendSwap {
-            id: row.id,
-            account_id: row.account_id,
-            user_id: row.user_id,
-            input_proofs,
-            input_amount: send.amount_reserved,
-            amount_received: send.amount_received,
-            cashu_receive_fee: send.cashu_receive_fee,
-            amount_to_send: send.amount_to_send,
-            cashu_send_fee: send.cashu_send_fee,
-            amount_spent: send.amount_spent,
-            total_fee: send.total_fee,
-            keyset_id: row.keyset_id,
-            keyset_counter,
-            output_amounts: send.output_amounts,
-            transaction_id: row.transaction_id,
-            created_at: row.created_at,
-            version,
-            state,
-        })
+        crate::conversions::to_cashu_send_swap(&swap_row, &proof_rows, self.encryption.as_ref())
+            .await
     }
 }
 
@@ -690,6 +603,7 @@ fn map_auth(err: agicash_traits::StorageError) -> SendSwapStorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agicash_cashu::CashuSendSwapState;
     use agicash_domain::{AccountPurpose, AccountState, AccountType, Currency};
     use agicash_money::Unit;
     use agicash_traits::PassthroughProofEncryption;
@@ -844,10 +758,16 @@ mod tests {
             "token_hash": "abc",
             "cashu_proofs": [{
                 "id": Uuid::new_v4(),
+                "user_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "account_id": "11111111-2222-3333-4444-555555555555",
                 "keyset_id": "ks1",
                 "amount": amount_enc,
                 "secret": secret_enc,
                 "unblinded_signature": "C1",
+                "public_key_y": "02deadbeef",
+                "state": "RESERVED",
+                "version": 0,
+                "created_at": "2026-05-15T00:00:00Z",
             }],
         });
         let swap = storage

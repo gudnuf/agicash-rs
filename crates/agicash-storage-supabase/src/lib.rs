@@ -24,6 +24,6 @@ pub use cashu_send_swap_storage::*;
 pub use client::*;
 pub use config::*;
 pub use conversions::{
-    to_account, to_cashu_melt_quote, to_cashu_mint_quote, to_cashu_receive_swap,
+    to_account, to_cashu_melt_quote, to_cashu_mint_quote, to_cashu_receive_swap, to_cashu_send_swap,
 };
 pub use error::*;
