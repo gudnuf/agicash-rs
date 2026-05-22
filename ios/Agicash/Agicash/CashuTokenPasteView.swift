@@ -95,9 +95,18 @@ struct CashuTokenPasteView: View {
             phase = .error("Paste a Cashu token first.")
             return
         }
+        // Step 0: extract the encoded cashu token from whatever the user
+        // pasted (URL with ?token=…/#…, cashu: URI, embedded text, or
+        // raw `cashuA…`/`cashuB…`). The downstream FFI receive is strict
+        // — passing the raw URL through would re-create the bug this
+        // extractor fixes.
+        guard let encoded = extractCashuToken(input: trimmed) else {
+            phase = .error("No Cashu token found in that text.")
+            return
+        }
         tokenFocused = false
         phase = .working
-        let outcome = await model.receive(token: trimmed)
+        let outcome = await model.receive(token: encoded)
         switch outcome {
         case .success(let result):
             phase = .success(result)

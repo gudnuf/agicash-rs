@@ -25,10 +25,10 @@ use std::str::FromStr;
 ///
 /// Scans the input for the **first** substring matching the cashu
 /// token charset (`cashu[AB]` followed by base64-url-safe characters
-/// + optional `=`/`==` padding). The candidate is then validated by
-/// calling [`cdk::nuts::Token::from_str`] — if structural decoding
-/// fails, the function returns `None` (it does **not** keep scanning
-/// for another candidate; this matches the React reference).
+/// and optional `=`/`==` padding). The candidate is then validated
+/// by calling [`cdk::nuts::Token::from_str`]. If structural decoding
+/// fails the function returns `None` — it does not keep scanning for
+/// another candidate (matches the React reference).
 ///
 /// Returns `Some(substring)` (the verbatim slice, **not** a
 /// re-canonicalized re-encoding — lets callers show the user "what
