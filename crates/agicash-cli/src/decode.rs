@@ -5,9 +5,11 @@
 //! so an agent can inspect an artifact before deciding to act on it. The
 //! input type is auto-detected from the string:
 //!
-//!   - `cashuA…` / `cashuB…` → a Cashu token, decoded via
-//!     [`cdk::nuts::Token::from_str`] (V3 JSON / V4 CBOR). Proof amounts
-//!     are summed offline — no mint round-trip.
+//!   - contains `cashuA…` / `cashuB…` substring → a Cashu token,
+//!     extracted via [`agicash_cashu::extract_cashu_token`] (URL with
+//!     hash/query, `cashu:` URI, embedded text all work) then decoded
+//!     via [`cdk::nuts::Token::from_str`] (V3 JSON / V4 CBOR). Proof
+//!     amounts are summed offline — no mint round-trip.
 //!   - starts with `lnbc`/`lntb`/`lnbcrt`/`lntbs` → a BOLT-11 invoice,
 //!     decoded via [`cdk::Bolt11Invoice`].
 //!   - `user@domain` → a LUD-16 Lightning Address, validated offline via
@@ -88,7 +90,18 @@ struct LightningAddressDecoded {
 /// JSON to stdout. Offline; never touches the network or a session.
 pub fn cmd_decode(input: &str) -> Result<(), DecodeCmdError> {
     let trimmed = input.trim();
-    let json = if is_cashu_token(trimmed) {
+    // Step 1: try cashu extraction first. Handles raw `cashuA…`/`cashuB…`
+    // plus URLs (`?token=…`, `#…`), the `cashu:` URI scheme, and tokens
+    // embedded in arbitrary text. Returns the verbatim encoded token slice
+    // that `decode_token` can hand to `cdk::nuts::Token::from_str`.
+    let json = if let Some(encoded) = agicash_cashu::extract_cashu_token(trimmed) {
+        decode_token(&encoded)?
+    } else if starts_with_cashu_prefix(trimmed) {
+        // The input clearly looks like a bare cashu token (starts
+        // with `cashuA`/`cashuB`) but the extractor's structural
+        // validation said no. Hand it to `decode_token` so the user
+        // gets a precise "invalid Cashu token: …" message instead of
+        // the catch-all "unrecognized input".
         decode_token(trimmed)?
     } else if is_bolt11(trimmed) {
         decode_invoice(trimmed)?
@@ -101,7 +114,11 @@ pub fn cmd_decode(input: &str) -> Result<(), DecodeCmdError> {
     Ok(())
 }
 
-fn is_cashu_token(s: &str) -> bool {
+/// True iff the string begins with one of the Cashu token prefixes.
+/// Used as a fallback after `extract_cashu_token` returns None so a
+/// bare-but-malformed `cashuB…` paste produces a typed
+/// `invalid-token` error rather than `unrecognized-input`.
+fn starts_with_cashu_prefix(s: &str) -> bool {
     s.starts_with("cashuA") || s.starts_with("cashuB")
 }
 
@@ -228,14 +245,6 @@ mod tests {
     // A real mainnet BOLT-11 invoice for 100 sat (1 µBTC). From `cdk`
     // test fixtures.
     const BOLT11: &str = "lnbc1u1p53kkd9pp5ve8pd9zr60yjyvs6tn77mndavzrl5lwd2gx5hk934f6q8jwguzgsdqqcqzzsxqyz5vqrzjqvueefmrckfdwyyu39m0lf24sqzcr9vcrmxrvgfn6empxz7phrjxvrttncqq0lcqqyqqqqlgqqqqqqgq2qsp5482y73fxmlvg4t66nupdaph93h7dcmfsg2ud72wajf0cpk3a96rq9qxpqysgqujexd0l89u5dutn8hxnsec0c7jrt8wz0z67rut0eah0g7p6zhycn2vff0ts5vwn2h93kx8zzqy3tzu4gfhkya2zpdmqelg0ceqnjztcqma65pr";
-
-    #[test]
-    fn detects_cashu_token() {
-        assert!(is_cashu_token("cashuAabc"));
-        assert!(is_cashu_token("cashuBxyz"));
-        assert!(!is_cashu_token("lnbc1u1p"));
-        assert!(!is_cashu_token("alice@example.com"));
-    }
 
     #[test]
     fn detects_bolt11_across_networks() {
