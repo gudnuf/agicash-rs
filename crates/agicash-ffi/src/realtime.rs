@@ -1,23 +1,25 @@
 //! FFI realtime event surface.
 //!
 //! The Rust realtime client's only upward output is a (re)connected
-//! signal plus opaque `(event_name, payload_json)` broadcasts. iOS /
-//! Android register a [`WalletEventListener`]; the platform routes
-//! `on_connected` → balance/account refetch (the no-replay catch-up,
-//! spec §5.5) and `on_event` → the same refetch (the wallet layer
-//! demuxes by event name exactly as the React `useTrackWalletChanges`
-//! does). Leptos does NOT use this surface — it consumes
-//! `agicash-realtime` directly (it links the Rust crates, not the FFI).
+//! signal plus opaque `(event_name, payload_json)` broadcasts, plus a
+//! typed [`agicash_realtime::WalletChange`] payload that feeds the
+//! in-process cache layer (`agicash-wallet::cache`). iOS / Android
+//! register a [`WalletEventListener`]; the platform routes
+//! `on_cache_change` → cache-backed re-read for the affected slice
+//! (the React `useTrackWalletChanges` analog), and `on_status` /
+//! `on_error` drive the banner. Leptos does NOT use this surface — it
+//! consumes `agicash-realtime` + `agicash-wallet::cache` directly (it
+//! links the Rust crates, not the FFI).
 //!
-//! `WalletEventListener` is the first `UniFFI` `callback_interface` in
-//! this crate. `UniFFI` marshals callbacks across the FFI boundary; the
-//! Swift/Kotlin object MUST be safe to invoke from a background thread
-//! (the realtime supervisor runs on a tokio task — see
+//! `WalletEventListener` is a `UniFFI` `callback_interface`. `UniFFI`
+//! marshals callbacks across the FFI boundary; the Swift/Kotlin object
+//! MUST be safe to invoke from a background thread (the realtime
+//! supervisor runs on a tokio task — see
 //! [`crate::AgicashWallet::start_wallet_events`]). `UniFFI`'s generated
 //! `Box<dyn WalletEventListener>` foreign shim is `Send + Sync`, which
 //! is why the trait carries those bounds: the bridge holds the listener
-//! behind an `Arc` and invokes it from the spawned supervisor task, not
-//! the thread that called `start_wallet_events`.
+//! behind an `Arc` and invokes it from the spawned supervisor + cache
+//! pump tasks, not the thread that called `start_wallet_events`.
 use agicash_realtime::RealtimeStatus;
 
 /// Lifecycle status forwarded for UI (spinner / "reconnecting" banner).
@@ -62,95 +64,174 @@ impl From<RealtimeStatus> for RealtimeStatusFfi {
     }
 }
 
-/// Lifecycle state of one in-flight money-state row, surfaced through
-/// the FFI as a stable uppercase string (matches the DB `state` column
-/// and the wire shape iOS/Android already parse from `on_event`).
-pub type PendingItemState = String;
-
-/// One in-flight (pending / unresolved) money-state row, flattened to
-/// the minimal `(id, state)` pair the FFI surface needs.
+/// FFI-local mirror of `agicash_wallet::CacheKind` — which cache slice
+/// changed. Mirror (not re-export) so the wallet crate stays free of
+/// `uniffi` deps; the [`From`] impl below is exhaustive over every
+/// variant so a new kind can't silently drop on the FFI floor.
 ///
-/// The full money/proof payload stays Rust-internal — a client that
-/// wants the detail polls by `id` through the existing per-quote FFI
-/// methods (`poll_mint_quote`, `check_send_swap_claimed`, …). This
-/// record only has to tell the client *which* rows are still in flight
-/// and *what state* they are in, which is all the realtime-reconnect
-/// catch-up needs to refresh a stale "waiting…" list.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct PendingItemFfi {
-    /// The row's primary-key UUID, stringified.
-    pub id: String,
-    /// Uppercase lifecycle state (`UNPAID` / `PAID` / `PENDING` /
-    /// `DRAFT`).
-    pub state: PendingItemState,
+/// Variant names match the DB-naming convention (smell S9):
+/// `CashuReceiveQuotes` is the React-side "mint quotes",
+/// `CashuSendQuotes` is the React-side "melt quotes". Receive / send
+/// swap names match both sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum CacheKindFfi {
+    /// `wallet.accounts` rows.
+    Accounts,
+    /// `wallet.transactions` rows.
+    Transactions,
+    /// Derived: count of `wallet.transactions` with
+    /// `acknowledgment_status = 'pending'`.
+    UnacknowledgedTransactionCount,
+    /// `wallet.cashu_receive_quotes` rows (DB-naming for "mint quotes").
+    CashuReceiveQuotes,
+    /// `wallet.cashu_send_quotes` rows (DB-naming for "melt quotes").
+    CashuSendQuotes,
+    /// `wallet.cashu_receive_swaps` rows.
+    CashuReceiveSwaps,
+    /// `wallet.cashu_send_swaps` rows.
+    CashuSendSwaps,
+    /// Derived: per-account cached balance.
+    AccountBalance,
 }
 
-/// FFI projection of `agicash_wallet::PendingStateSnapshot` — every
-/// in-flight money-state row the signed-in user still owns, fetched in
-/// one shot on a realtime (re)connect (slice 12e Lane 3, Gap-D).
+impl From<agicash_wallet::CacheKind> for CacheKindFfi {
+    fn from(k: agicash_wallet::CacheKind) -> Self {
+        use agicash_wallet::CacheKind as K;
+        match k {
+            K::Accounts => Self::Accounts,
+            K::Transactions => Self::Transactions,
+            K::UnacknowledgedTransactionCount => Self::UnacknowledgedTransactionCount,
+            K::CashuReceiveQuotes => Self::CashuReceiveQuotes,
+            K::CashuSendQuotes => Self::CashuSendQuotes,
+            K::CashuReceiveSwaps => Self::CashuReceiveSwaps,
+            K::CashuSendSwaps => Self::CashuSendSwaps,
+            K::AccountBalance => Self::AccountBalance,
+        }
+    }
+}
+
+/// FFI-local mirror of `agicash_wallet::RowId` — identity of one
+/// cached row, stringified across the FFI boundary so iOS/Android
+/// don't have to model `Uuid` / `AccountId` directly.
 ///
-/// Four flat lists keyed by money-flow kind. An empty list is the
-/// canonical "nothing in flight" state.
+/// Mirror (not re-export) for the same reason as [`CacheKindFfi`]:
+/// keeps `uniffi` out of the wallet crate.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum RowIdFfi {
+    /// `wallet.accounts.id` (UUID, stringified).
+    Account { id: String },
+    /// Generic UUID-keyed row (transactions, quotes, send swaps), stringified.
+    Uuid { id: String },
+    /// `wallet.cashu_receive_swaps.token_hash` — already a string on the
+    /// domain type; no UUID for receive-swap rows.
+    TokenHash { hash: String },
+}
+
+impl From<&agicash_wallet::RowId> for RowIdFfi {
+    fn from(r: &agicash_wallet::RowId) -> Self {
+        use agicash_wallet::RowId as R;
+        match r {
+            R::Account(id) => Self::Account { id: id.to_string() },
+            R::Uuid(id) => Self::Uuid { id: id.to_string() },
+            R::TokenHash(h) => Self::TokenHash { hash: h.clone() },
+        }
+    }
+}
+
+/// FFI-local mirror of `agicash_wallet::CacheUpdate` — one cache
+/// mutation tick. Lightweight by design: `(kind, optional row id)` lets
+/// the consumer decide whether it cares without re-reading the cache,
+/// and tells it which row changed if it does.
+///
+/// Heavy payloads do NOT cross the FFI bridge — the consumer reads the
+/// new value back from the cache via the existing FFI methods
+/// (e.g. `AgicashWallet::list_accounts`, which is now cache-backed).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct PendingStateSnapshotFfi {
-    /// UNPAID / PAID mint quotes — Lightning receives still in flight.
-    pub mint_quotes: Vec<PendingItemFfi>,
-    /// PENDING receive swaps — inbound Cashu tokens still being claimed.
-    pub receive_swaps: Vec<PendingItemFfi>,
-    /// UNPAID / PENDING melt quotes — Lightning sends still in flight.
-    pub melt_quotes: Vec<PendingItemFfi>,
-    /// DRAFT / PENDING send swaps — outbound tokens not yet claimed.
-    pub send_swaps: Vec<PendingItemFfi>,
+pub struct CacheUpdateFfi {
+    /// Which table slice mutated.
+    pub kind: CacheKindFfi,
+    /// Row identity, when the mutation was row-scoped. `None` for
+    /// derived/aggregate mutations (e.g. unacknowledged-count, balance
+    /// recompute without a single row id).
+    pub id: Option<RowIdFfi>,
+}
+
+impl From<&agicash_wallet::CacheUpdate> for CacheUpdateFfi {
+    fn from(u: &agicash_wallet::CacheUpdate) -> Self {
+        Self {
+            kind: u.kind.into(),
+            id: u.id.as_ref().map(RowIdFfi::from),
+        }
+    }
 }
 
 /// Implemented on the Swift/Kotlin side; the wallet calls these on
 /// realtime activity. Registered via
 /// [`crate::AgicashWallet::start_wallet_events`] and dropped (with the
-/// supervisor task aborted) by
+/// supervisor + cache pump tasks aborted) by
 /// [`crate::AgicashWallet::stop_wallet_events`].
 ///
-/// All methods are invoked from the realtime supervisor's tokio
-/// task — never from the calling thread — so the foreign implementation
-/// must be thread-safe. UniFFI enforces `Send + Sync` on the boxed
-/// foreign object; the bridge additionally never re-enters the listener
-/// (each callback is a fire-and-forget notification, not a request).
+/// All methods are invoked from background tokio tasks — never from the
+/// thread that called `start_wallet_events` — so the foreign
+/// implementation must be thread-safe. UniFFI enforces `Send + Sync` on
+/// the boxed foreign object; the bridge additionally never re-enters
+/// the listener (each callback is a fire-and-forget notification, not
+/// a request).
+///
+/// The cache layer (`agicash-wallet::cache`, shipped at master
+/// `1b4f191b`) is the source of truth: every realtime `Change` event
+/// is applied to the cache by the apply pump, and the dispatch pump
+/// fires [`on_cache_change`] so the consumer can re-read the cache
+/// slice. Legacy `on_event` / `on_connected` "refetch on signal" paths
+/// were deleted in the FFI cache-consumer migration — the cache + the
+/// Lane-D resumption driver own catch-up.
 #[uniffi::export(callback_interface)]
 pub trait WalletEventListener: Send + Sync {
-    /// Channel (re)connected & joined. The platform MUST refetch wallet
-    /// + balance state — there is no replay; this is the catch-up hook
-    /// that replaces the deleted Tier-1 pollers.
+    /// Channel (re)connected & joined. Observability only — the cache
+    /// + Lane-D resumption driver handle the post-reconnect catch-up;
+    /// the consumer does NOT need to refetch on this signal. (Mirrors
+    /// the Leptos `Connected` arm semantics — see the Leptos cache-
+    /// consumer migration design §2.1.)
     fn on_connected(&self);
     /// A DB-originated broadcast. `event` ∈ {ACCOUNT_CREATED,
     /// ACCOUNT_UPDATED, TRANSACTION_CREATED, TRANSACTION_UPDATED,
     /// CASHU_RECEIVE_QUOTE_*, ...}. `payload_json` is the raw jsonb the
     /// trigger sent (opaque to transport; parsed by the caller).
+    ///
+    /// Observability only — paired with [`on_cache_change`] one-for-one
+    /// (the realtime supervisor fires `Event` + `Change` for every
+    /// broadcast). Consumers should drive UI off `on_cache_change`; this
+    /// callback is left in place so log-level taps on the FFI surface
+    /// keep working.
     fn on_event(&self, event: String, payload_json: String);
     /// Status transitions for UI affordances.
     fn on_status(&self, status: RealtimeStatusFfi);
     /// Non-fatal/observability error string.
     fn on_error(&self, message: String);
-    /// The wallet's in-flight money state, refetched after an
-    /// `on_connected` (re)connect catch-up (slice 12e Lane 3, Gap-D).
+    /// One cache slice mutated — re-read the corresponding cache-backed
+    /// FFI method (e.g. `list_accounts` for [`CacheKindFfi::Accounts`])
+    /// to get the new value. The `id` (when present) lets the consumer
+    /// filter to one row if it's tracking row-level identity.
     ///
-    /// Fired right after `on_connected` whenever the post-reconnect
-    /// `refresh_pending_state()` succeeds — the platform uses it to
-    /// clear stale "waiting…" rows that resolved while the channel was
-    /// down. A `refresh_pending_state()` *failure* is swallowed (logged,
-    /// non-fatal): the balance refetch in `on_connected` already keeps
-    /// the UI alive, and the next reconnect retries. Until iOS/Android
-    /// wire pending-list UI consumption (a follow-up), a logging-only
-    /// stub here is acceptable — it mirrors the pre-banner state of the
-    /// `on_status` callback.
-    fn on_pending_state_refreshed(&self, snapshot: PendingStateSnapshotFfi);
+    /// Fires from a tokio task subscribed to the cache's broadcast
+    /// channel (`agicash_wallet::WalletClient::cache_updates`). One tick
+    /// per cache mutation; ordered with respect to mutations on a single
+    /// slice; bounded — a slow listener that overruns the channel
+    /// capacity sees missed ticks dropped (the cache itself stays
+    /// authoritative, the next tick still triggers a re-read).
+    fn on_cache_change(&self, update: CacheUpdateFfi);
 }
 
-/// Map one realtime event onto the listener. This is the entire
-/// FFI-side bridge: the supervisor pump in
-/// [`crate::AgicashWallet::start_wallet_events`] calls this for every
-/// `WalletRealtimeEvent` drained off the service's `async_broadcast`
-/// receiver. Factored out (rather than inlined in the pump) so it is
-/// hermetically smoke-testable: a fake listener + a synthetic event,
-/// no socket / tokio task / live stack required.
+/// Map one realtime event onto the listener. Pure dispatch — does NOT
+/// touch the cache (the apply path lives in the pump in
+/// [`crate::AgicashWallet::start_wallet_events`], which destructures
+/// `WalletRealtimeEvent::Change(boxed)` separately and feeds it into
+/// `WalletClient::apply_realtime_change` before calling this for the
+/// listener-visible side of the event).
+///
+/// Factored out (rather than inlined in the pump) so it is hermetically
+/// smoke-testable: a fake listener + a synthetic event, no socket /
+/// tokio task / live stack required.
 pub(crate) fn dispatch_realtime_event(
     listener: &dyn WalletEventListener,
     ev: agicash_realtime::WalletRealtimeEvent,
@@ -162,56 +243,28 @@ pub(crate) fn dispatch_realtime_event(
         E::StatusChanged(s) => listener.on_status(s.into()),
         E::Error(m) => listener.on_error(m),
         E::Change(_) => {
-            // Typed-row sibling of `Event` — the realtime supervisor
-            // fires both per broadcast (see `WalletRealtimeEvent`
-            // doc). iOS / Android consume the string-shaped surface
-            // through `on_event`; the typed payload is for the in-
-            // process cache layer (`agicash-wallet`) and never
-            // crosses the FFI boundary. No FFI behavior change.
+            // The typed-row sibling of `Event`. The pump handles
+            // `Change` separately — it consumes the boxed payload and
+            // feeds it into the cache's `apply_realtime_change` BEFORE
+            // calling this function with the other variants. So if a
+            // `Change` reaches here it means the caller bypassed the
+            // pump's apply step (e.g. a test); no listener method
+            // corresponds to it.
         }
     }
 }
 
-/// Realtime-(re)connect catch-up: refetch the user's in-flight money
-/// state from the facade and push it to the listener
-/// (slice 12e Lane 3, Gap-D).
-///
-/// The realtime channel ships no replay, so on every `Connected` the
-/// pump runs this right after `dispatch_realtime_event` fires
-/// `on_connected`. It calls the facade's `refresh_pending_state()`
-/// (a pure storage read, no mint round-trip) and, on success, projects
-/// the snapshot through [`crate::convert::pending_state_snapshot_to_ffi`]
-/// and dispatches it via [`WalletEventListener::on_pending_state_refreshed`].
-///
-/// A `refresh_pending_state()` **failure is swallowed** (logged,
-/// non-fatal): the platform's balance refetch in `on_connected` already
-/// keeps the UI alive, and the next reconnect retries the catch-up.
-/// Returning `()` (never an error) keeps the pump loop unbreakable —
-/// one failed catch-up must never tear down the realtime supervisor.
-///
-/// Factored out of the pump so it is unit-testable in isolation: it
-/// takes the facade + listener as trait objects, no socket / tokio
-/// supervisor / live stack required.
-pub(crate) async fn dispatch_pending_state_refresh(
-    facade: &agicash_wallet::WalletClient,
+/// Dispatch one cache-update tick to the listener. Pure projection of
+/// the wallet-crate [`agicash_wallet::CacheUpdate`] onto the FFI
+/// [`CacheUpdateFfi`] mirror. Lives next to [`dispatch_realtime_event`]
+/// for the same reason: it's the entire FFI-side bridge for the cache
+/// path, factored out so a hermetic test can drive it without a
+/// running cache.
+pub(crate) fn dispatch_cache_update(
     listener: &dyn WalletEventListener,
+    update: &agicash_wallet::CacheUpdate,
 ) {
-    match facade.refresh_pending_state().await {
-        Ok(snapshot) => {
-            listener.on_pending_state_refreshed(crate::convert::pending_state_snapshot_to_ffi(
-                &snapshot,
-            ));
-        }
-        Err(e) => {
-            // Non-fatal: balance refetch in `on_connected` keeps the UI
-            // alive; the next reconnect retries. Never break the pump.
-            tracing::warn!(
-                target: "agicash_ffi::realtime",
-                "refresh_pending_state on reconnect failed (non-fatal, \
-                 retries next reconnect): {e}"
-            );
-        }
-    }
+    listener.on_cache_change(update.into());
 }
 
 /// Builds the native (`tokio-tungstenite`) transport on every

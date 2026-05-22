@@ -2,28 +2,30 @@ import Foundation
 import Observation
 import os
 
-/// Bridges the Rust realtime event stream (`WalletEventListener` callback
-/// interface, regenerated into the FFI bindings in slice 10 Stage 3) to
-/// the existing `refreshAccounts` path.
+/// Bridges the Rust realtime + cache event stream (`WalletEventListener`
+/// callback interface) to the cache-backed `refreshAccountsFromCache`
+/// path on the view model.
 ///
-/// The core is the source of truth: a DB-originated broadcast (or a
-/// (re)connect catch-up) only needs to trigger a single balance/accounts
-/// refetch — the same refresh every send/receive already performs. So
-/// every signal here collapses to one `onChange()` call rather than
-/// trying to apply a diff from the payload.
+/// The cache (`agicash-wallet::cache`, shipped at master `1b4f191b`) is
+/// the source of truth: every realtime `Change` event is applied to the
+/// cache by the Rust-side apply pump, and the dispatch pump fires
+/// `onCacheChange(update)` here. The bridge dispatches by
+/// `update.kind` — for slices the iOS UI consumes (today: only
+/// `.accounts` + `.accountBalance`), it triggers a cache-backed re-read.
+/// Other kinds are no-ops until UI lands for them.
 ///
-/// `onConnected` is the no-replay catch-up: Supabase Realtime has no
-/// backlog, so on first join *and* on every reconnect we refetch once to
-/// close the gap. This is precisely what replaces the deleted Tier-1
-/// 4s/scenePhase poll — instead of polling every 4s on the off chance
-/// something changed, we refetch exactly when the channel says "you may
-/// have missed something" (join) or "something changed" (broadcast).
+/// `onConnected` / `onEvent` are observability only post-migration: the
+/// cache + Lane-D resumption driver own catch-up, so the bridge does
+/// NOT refetch on these signals anymore (mirror of the Leptos cache-
+/// consumer migration — `Connected` is a tracing breadcrumb).
 ///
 /// `onStatus` / `onError` are observability only — logged, never
 /// escalated. A dropped channel is non-fatal by construction: the Rust
-/// side keeps reconnecting and will emit `onConnected` again, at which
-/// point the catch-up refetch runs. Nothing here ever touches `phase`,
-/// so a realtime fault can never reach the fatal sign-out teardown.
+/// side keeps reconnecting; on reconnect the resumption driver's sweep
+/// writes any caught-up rows, which surface as `Change` events through
+/// the cache → `onCacheChange`, which re-reads the cache slice.
+/// Nothing here ever touches `phase`, so a realtime fault can never
+/// reach the fatal sign-out teardown.
 ///
 /// `@unchecked Sendable`: stored members are immutable `@Sendable`
 /// closures; each closure hops to the `@MainActor` before touching any
@@ -33,30 +35,31 @@ final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
         subsystem: "app.agicash.rust", category: "realtime"
     )
 
-    private let onChange: @Sendable () -> Void
+    private let onCacheUpdate: @Sendable (CacheUpdateFfi) -> Void
     private let onStatusChange: @Sendable (RealtimeStatusFfi) -> Void
 
     init(
-        onChange: @escaping @Sendable () -> Void,
+        onCacheUpdate: @escaping @Sendable (CacheUpdateFfi) -> Void,
         onStatusChange: @escaping @Sendable (RealtimeStatusFfi) -> Void
     ) {
-        self.onChange = onChange
+        self.onCacheUpdate = onCacheUpdate
         self.onStatusChange = onStatusChange
     }
 
-    /// Channel (re)connected & joined. No replay → refetch once to
-    /// catch up. This is the catch-up that replaces the Tier-1 poll.
+    /// Channel (re)connected & joined. Observability only — the cache
+    /// + Lane-D resumption driver own the post-reconnect catch-up. The
+    /// bridge does NOT refetch on this signal post-migration.
     func onConnected() {
-        Self.log.info("realtime connected — catch-up refetch")
-        onChange()
+        Self.log.info("realtime connected (cache + driver own catch-up)")
     }
 
-    /// A DB-originated broadcast. We don't diff the payload — the core
-    /// row is already authoritative; just trigger the same refresh a
-    /// local send/receive performs.
+    /// A DB-originated broadcast. Observability only post-migration —
+    /// the Rust-side cache apply pump destructures the typed `Change`
+    /// sibling of this event and writes it into the cache; the cache
+    /// then broadcasts a `CacheUpdate` that the consumer sees through
+    /// `onCacheChange`. No need to refetch from this callback.
     func onEvent(event: String, payloadJson: String) {
         Self.log.debug("realtime event \(event, privacy: .public)")
-        onChange()
     }
 
     /// UI-affordance status transitions. Forwarded to the view model so
@@ -73,21 +76,15 @@ final class WalletEventBridge: WalletEventListener, @unchecked Sendable {
         Self.log.error("realtime error: \(message, privacy: .public)")
     }
 
-    /// In-flight money-state snapshot, refetched after an `onConnected`
-    /// (re)connect catch-up (slice 12e Lane 3, Gap-D). Logging-only for
-    /// now — mirrors the pre-banner state of `onStatus`. Wiring the
-    /// pending-list to UI (clearing stale "waiting…" rows) is a scoped
-    /// follow-up; until then this just records the four list counts.
-    func onPendingStateRefreshed(snapshot: PendingStateSnapshotFfi) {
-        Self.log.info(
-            """
-            realtime pending-state refreshed — \
-            mintQuotes=\(snapshot.mintQuotes.count, privacy: .public) \
-            receiveSwaps=\(snapshot.receiveSwaps.count, privacy: .public) \
-            meltQuotes=\(snapshot.meltQuotes.count, privacy: .public) \
-            sendSwaps=\(snapshot.sendSwaps.count, privacy: .public)
-            """
-        )
+    /// One cache slice mutated. Forwarded to the view model, which
+    /// dispatches by `update.kind` and triggers a cache-backed re-read
+    /// for slices the UI consumes today (accounts + per-account
+    /// balances). Slices without a UI consumer yet (transactions,
+    /// pending quotes/swaps) are no-ops here — the cache stays current
+    /// for free; UI will pull from it when the feature lands.
+    func onCacheChange(update: CacheUpdateFfi) {
+        Self.log.debug("cache update kind=\(String(describing: update.kind), privacy: .public)")
+        onCacheUpdate(update)
     }
 }
 
@@ -934,15 +931,15 @@ final class WalletViewModel {
     /// the same reason `refreshAccounts` short-circuits — the FFI call
     /// would just fail against an absent backend.
     ///
-    /// The refresh closure uses `refreshAccounts(background: true)`: a
-    /// realtime-driven refetch is exactly the "unattended re-sync" the
-    /// `background` flag exists for. A send/receive sheet (and an
-    /// in-flight Lightning payment) may be presented when a broadcast
-    /// lands; a transient `listAccounts` blip on that route must keep
-    /// the last-known balance and must NOT escalate to `phase = .error`
-    /// (which `AuthGateView` turns into the full signed-in teardown).
-    /// Only a genuine auth-expiry still escalates — identical discipline
-    /// to the poll this replaces.
+    /// The cache-update closure dispatches by `update.kind` and calls
+    /// `refreshAccounts(background: true)` for slices the UI consumes
+    /// (today: `.accounts` + `.accountBalance`). The `background` flag
+    /// gives this unattended-resync route the tiered-error discipline
+    /// it needs: a transient `listAccounts` blip while a send/receive
+    /// sheet or in-flight Lightning payment is presented must keep the
+    /// last-known balance on screen and must NOT escalate to
+    /// `phase = .error` (which `AuthGateView` turns into the full
+    /// signed-in teardown). Only a genuine auth-expiry still escalates.
     ///
     /// `startWalletEvents` itself is wrapped in `try?`: failing to open
     /// the channel is non-fatal (no realtime ≈ the pre-slice-10 world,
@@ -952,9 +949,9 @@ final class WalletViewModel {
         if isDemoMode { return }
         if eventBridge != nil { return }
         let bridge = WalletEventBridge(
-            onChange: { [weak self] in
+            onCacheUpdate: { [weak self] update in
                 Task { @MainActor [weak self] in
-                    await self?.refreshAccounts(background: true)
+                    await self?.handleCacheChange(update)
                 }
             },
             onStatusChange: { [weak self] status in
@@ -978,6 +975,31 @@ final class WalletViewModel {
             // cleanly retry, and stay signed-in with manual refresh.
             eventBridge = nil
             _ = error
+        }
+    }
+
+    /// Cache-update dispatch on the iOS side. Mirrors the Leptos pattern
+    /// (`feat(leptos): migrate WalletData off legacy refetch onto cache
+    /// layer`, master `a569df4a`): dispatch by `kind`, no-op for slices
+    /// without a UI consumer yet.
+    ///
+    /// `refreshAccounts(background: true)` is the existing tiered-error
+    /// re-read; under the migration it's now cache-backed at the FFI
+    /// (`AgicashWallet::list_accounts` → `WalletClient::accounts()`), so
+    /// the call is fast after the first populate.
+    private func handleCacheChange(_ update: CacheUpdateFfi) async {
+        switch update.kind {
+        case .accounts, .accountBalance:
+            await refreshAccounts(background: true)
+        case .cashuReceiveQuotes,
+             .cashuSendQuotes,
+             .cashuReceiveSwaps,
+             .cashuSendSwaps,
+             .transactions,
+             .unacknowledgedTransactionCount:
+            // No UI consumer yet — the cache stays current for free; UI
+            // will pull from it when the feature lands.
+            break
         }
     }
 
