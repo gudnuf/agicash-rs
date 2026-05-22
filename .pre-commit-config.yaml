@@ -81,13 +81,21 @@ repos:
       # triggers CI. Pushes may be slower than commits; that is the
       # accepted trade. Mirrors CI `cargo clippy --workspace
       # --all-targets -- -D warnings`.
+      #
+      # Why `cd crates` instead of `--manifest-path crates/Cargo.toml`:
+      # rustup picks the toolchain from the *current working directory*,
+      # not from the manifest path. The workspace pins 1.88.0 via
+      # crates/rust-toolchain.toml; running from the repo root made
+      # rustup fall back to whichever toolchain happens to be on PATH
+      # (e.g. host 1.95), which enforces lints 1.88 doesn't and breaks
+      # legitimate pushes. Mirrors CI's `working-directory: crates`.
       - id: cargo-clippy
         name: cargo clippy -D warnings (crates workspace)
         description: >-
           Same lint gate as CI. Pre-push only so `git commit` stays
           fast; warm shared cargo cache keeps the push reasonable.
         language: system
-        entry: cargo clippy --manifest-path crates/Cargo.toml --workspace --all-targets -- -D warnings
+        entry: bash -c "cd crates && cargo clippy --workspace --all-targets -- -D warnings"
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
