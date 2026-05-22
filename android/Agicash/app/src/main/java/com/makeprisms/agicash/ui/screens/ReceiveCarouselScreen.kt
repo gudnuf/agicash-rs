@@ -72,6 +72,7 @@ import com.makeprisms.agicash.ui.theme.Radius
 import com.makeprisms.agicash.ui.theme.Spacing
 import com.makeprisms.agicash.wallet.WalletViewModel
 import kotlinx.coroutines.delay
+import uniffi.agicash_ffi.extractCashuToken
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import uniffi.agicash_ffi.MintQuoteFfiState
@@ -266,9 +267,19 @@ private fun CashuTokenPastePage(
                         phase = CashuPastePhase.Error("Paste a Cashu token first.")
                         return@CashuPasteFormCard
                     }
+                    // Step 0: extract the encoded cashu token from whatever
+                    // the user pasted (URL with ?token=…/#…, cashu: URI,
+                    // embedded prose, or raw cashuA…/cashuB…). The
+                    // downstream FFI receive is strict — passing the raw
+                    // URL through re-creates the wrap-paste bug.
+                    val encoded = extractCashuToken(trimmed)
+                    if (encoded == null) {
+                        phase = CashuPastePhase.Error("No Cashu token found in that text.")
+                        return@CashuPasteFormCard
+                    }
                     phase = CashuPastePhase.Working
                     scope.launch {
-                        phase = when (val o = viewModel.receive(trimmed)) {
+                        phase = when (val o = viewModel.receive(encoded)) {
                             is WalletViewModel.ReceiveOutcome.Success ->
                                 CashuPastePhase.Success(o.result)
                             is WalletViewModel.ReceiveOutcome.Failure ->
