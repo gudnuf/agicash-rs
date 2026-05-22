@@ -47,6 +47,7 @@
 
 pub mod auth;
 pub mod builder;
+pub mod cache;
 pub mod claim_check;
 pub mod client;
 pub mod config;
@@ -58,6 +59,7 @@ pub mod types;
 
 pub use auth::{AuthClient, Session};
 pub use builder::WalletClientBuilder;
+pub use cache::{CacheKind, CacheUpdate, RowId, WalletCache};
 pub use client::WalletClient;
 pub use config::{SessionStorageChoice, WalletConfig};
 pub use discriminator::{AuthErrorCode, CashuDiscriminator};

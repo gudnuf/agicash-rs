@@ -15,11 +15,13 @@ agicash-cashu = { path = "../agicash-cashu" }
 agicash-exchange-rate = { path = "../agicash-exchange-rate" }
 agicash-lightning-address = { path = "../agicash-lightning-address" }
 agicash-storage-supabase = { path = "../agicash-storage-supabase" }
+agicash-realtime = { path = "../agicash-realtime" }
 async-trait = { workspace = true }
 cdk = { workspace = true }
 chrono = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
+parking_lot = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,6 +65,9 @@ tier2-e2e = ["agicash-testing/tier2-e2e"]
 agicash-testing = { path = "../agicash-testing" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
+# Cache layer tests build base64-of-passthrough-cipher encrypted_data
+# bodies to exercise the storage `toX` helpers end-to-end.
+base64 = { workspace = true }
 
 [lints]
 workspace = true

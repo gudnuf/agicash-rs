@@ -58,6 +58,13 @@ pub struct WalletClient {
     pub(crate) mint_quote_service: Arc<CashuMintQuoteService>,
     pub(crate) melt_quote_service: Arc<CashuMeltQuoteService>,
     pub(crate) exchange_rate: Option<Arc<dyn ExchangeRateProvider>>,
+    /// Cache layer — mirrors React's TanStack Query surface.
+    ///
+    /// Lazy-populated on first read of each cache slice; subsequently
+    /// patched in-place from typed realtime `Change` events fed in via
+    /// [`Self::apply_realtime_change`]. See [`crate::cache`] for the
+    /// surface + design.
+    pub(crate) cache: crate::cache::WalletCache,
 }
 
 impl std::fmt::Debug for WalletClient {
@@ -1685,6 +1692,159 @@ fn money_to_msat(amount: &Money) -> Result<u64, WalletError> {
 // granularly.
 #[allow(dead_code)]
 type _MeltErr = MeltQuoteError;
+
+// ---------------------------------------------------------------------------
+// Cache-backed reads (slice — cache layer, 2026-05-22).
+//
+// Mirrors the React app's TanStack Query surface: lazy-populate on first
+// read, then read instantly from cache forever; realtime `Change` events
+// (fed in via `apply_realtime_change` from the FFI / Leptos pump) patch
+// the cache in place.
+//
+// The pre-existing `list_accounts` / `list_pending_*` methods stay as
+// cache-backed wrappers so existing consumers (FFI, Leptos, iOS, Android,
+// CLI) see zero behavioral change while they migrate. Smell S8 (the
+// four list_* duplication) collapses into the wrappers below.
+//
+// Naming convention: new methods use DB names
+// (`pending_cashu_receive_quotes`, NOT `pending_mint_quotes`) per smell
+// S9. Legacy methods keep their existing names.
+// ---------------------------------------------------------------------------
+impl WalletClient {
+    /// Direct accessor for the underlying cache. Most consumers should
+    /// use the convenience methods below; this hatches out for FFI /
+    /// Leptos consumers who want to attach a long-lived
+    /// `subscribe_updates()` observer.
+    #[must_use]
+    pub fn cache(&self) -> &crate::cache::WalletCache {
+        &self.cache
+    }
+
+    /// Apply one typed realtime [`agicash_realtime::WalletChange`] to
+    /// the cache. Idempotent; never panics; never breaks the pump.
+    ///
+    /// The FFI / Leptos realtime pump destructures
+    /// [`agicash_realtime::WalletRealtimeEvent::Change(boxed)`] and
+    /// calls this with the inner `WalletChange`. `Connected` /
+    /// `StatusChanged` / `Error` flavors of the realtime event flow
+    /// through their existing pump paths unchanged.
+    ///
+    /// Migration discipline: the cache lane does NOT modify the FFI or
+    /// Leptos crates; the one-line wire-in (`wallet.apply_realtime_change(*c).await`
+    /// inside the existing `Change(_)` arm) is a separate follow-up
+    /// lane per the design doc § 7.
+    pub async fn apply_realtime_change(&self, change: agicash_realtime::WalletChange) {
+        self.cache.apply(change).await;
+    }
+
+    /// Subscribe to cache-update ticks. One receiver per consumer.
+    ///
+    /// See [`crate::cache::CacheUpdate`] for the payload. Mirror of the
+    /// React app's `useEffect` over a TanStack `useQuery` result.
+    #[must_use]
+    pub fn cache_updates(&self) -> tokio::sync::broadcast::Receiver<crate::cache::CacheUpdate> {
+        self.cache.subscribe_updates()
+    }
+
+    // -- Accounts ------------------------------------------------------
+
+    /// Cache-backed list of accounts with computed balance.
+    ///
+    /// First call populates the account list from storage and computes
+    /// each account's balance once. Subsequent calls return from cache
+    /// in constant time. Realtime `Change` events keep both the account
+    /// rows and the cached balances current.
+    ///
+    /// Folds in smell S7 (proof-balance memoization).
+    pub async fn accounts(&self) -> Result<Vec<AccountSummary>, WalletError> {
+        let session = self.require_session().await?;
+        let accounts = self
+            .cache
+            .accounts_or_populate(self.user_storage.as_ref(), session.user_id)
+            .await
+            .map_err(WalletError::Storage)?;
+        let mut out = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            let balance = if let Some(b) = self.cache.account_balance(account.id) {
+                b
+            } else {
+                let b = compute_cashu_balance(self.cashu_send_storage.as_ref(), &account).await?;
+                self.cache.put_account_balance(account.id, b);
+                b
+            };
+            out.push(AccountSummary::from_account(&account, balance));
+        }
+        Ok(out)
+    }
+
+    // -- Cashu receive quotes (rust: mint quotes) ---------------------
+
+    /// Cache-backed list of in-flight receive quotes (DB-naming for
+    /// "mint quotes" — UNPAID / PAID rows). Folds S8.
+    pub async fn pending_cashu_receive_quotes(&self) -> Result<Vec<CashuMintQuote>, WalletError> {
+        let session = self.require_session().await?;
+        self.cache
+            .pending_cashu_receive_quotes_or_populate(
+                self.cashu_mint_quote_storage.as_ref(),
+                session.user_id,
+            )
+            .await
+            .map_err(WalletError::Storage)
+    }
+
+    // -- Cashu send quotes (rust: melt quotes) ------------------------
+
+    /// Cache-backed list of unresolved send quotes (DB-naming for
+    /// "melt quotes" — UNPAID / PENDING rows). Folds S8.
+    pub async fn unresolved_cashu_send_quotes(&self) -> Result<Vec<CashuMeltQuote>, WalletError> {
+        let session = self.require_session().await?;
+        self.cache
+            .unresolved_cashu_send_quotes_or_populate(
+                self.cashu_melt_quote_storage.as_ref(),
+                session.user_id,
+            )
+            .await
+            .map_err(WalletError::Storage)
+    }
+
+    // -- Cashu receive swaps ------------------------------------------
+
+    /// Cache-backed list of pending receive swaps. Folds S8.
+    pub async fn pending_cashu_receive_swaps(&self) -> Result<Vec<CashuReceiveSwap>, WalletError> {
+        let session = self.require_session().await?;
+        self.cache
+            .pending_cashu_receive_swaps_or_populate(
+                self.cashu_receive_storage.as_ref(),
+                session.user_id,
+            )
+            .await
+            .map_err(WalletError::Storage)
+    }
+
+    // -- Cashu send swaps ---------------------------------------------
+
+    /// Cache-backed list of unresolved send swaps. Folds S8.
+    pub async fn unresolved_cashu_send_swaps(&self) -> Result<Vec<CashuSendSwap>, WalletError> {
+        let session = self.require_session().await?;
+        self.cache
+            .unresolved_cashu_send_swaps_or_populate(
+                self.cashu_send_storage.as_ref(),
+                session.user_id,
+            )
+            .await
+            .map_err(WalletError::Storage)
+    }
+
+    /// Cached unacknowledged transaction count. Returns `0` until
+    /// `TransactionStorage` ships (the populate path is a no-op until
+    /// then; the count IS maintained eagerly from realtime
+    /// `TransactionUpdated.previous_acknowledgment_status` deltas once
+    /// transactions start flowing through the cache).
+    #[must_use]
+    pub fn unacknowledged_transaction_count(&self) -> u32 {
+        self.cache.unacknowledged_transaction_count()
+    }
+}
 
 #[cfg(test)]
 mod tests {
