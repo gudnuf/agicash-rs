@@ -201,6 +201,122 @@ pub fn auth_status_from_facade(s: &agicash_wallet::AuthStatus) -> AuthStatusWasm
     }
 }
 
+/// `ReceiveFlowStatus` (i.e. `agicash_cashu::ReceiveStatus` re-exported)
+/// → `ReceiveStatusWasm`. Three variants; the dedicated
+/// `AlreadyClaimed` state has no status — surfaced via the parent
+/// `ReceiveFlowStateWasm::AlreadyClaimed` variant instead. Mirrors
+/// `ffi::receive_flow::ReceiveStatusFfi::from(ReceiveFlowStatus)`.
+#[must_use]
+fn receive_flow_status_from_inner(
+    s: &agicash_cashu::ReceiveFlowStatus,
+) -> crate::types::ReceiveStatusWasm {
+    match s {
+        agicash_cashu::ReceiveFlowStatus::Received => crate::types::ReceiveStatusWasm::Received,
+        agicash_cashu::ReceiveFlowStatus::AlreadyFailed => {
+            crate::types::ReceiveStatusWasm::AlreadyFailed
+        }
+        agicash_cashu::ReceiveFlowStatus::Pending => crate::types::ReceiveStatusWasm::Pending,
+    }
+}
+
+/// `agicash_cashu::ReceiveFlowResult` → `ReceiveFlowResultWasm`.
+/// Mirrors `ffi::receive_flow::ReceiveFlowResultFfi::from`. The
+/// inner result already carries decimal strings (matching the FFI's
+/// pre-stringified shape), so this is a field-for-field copy with a
+/// status remap.
+#[must_use]
+pub fn receive_flow_result_from_inner(
+    r: agicash_cashu::ReceiveFlowResult,
+) -> crate::types::ReceiveFlowResultWasm {
+    crate::types::ReceiveFlowResultWasm {
+        status: receive_flow_status_from_inner(&r.status),
+        amount: r.amount,
+        fee: r.fee,
+        unit: r.unit,
+        currency: r.currency,
+        account_id: r.account_id,
+        mint_url: r.mint_url,
+        token_hash: r.token_hash,
+    }
+}
+
+/// `agicash_cashu::MintConfirmation` → `MintConfirmationWasm`.
+/// Verbatim `ffi::receive_flow::MintConfirmationFfi::from`.
+#[must_use]
+fn mint_confirmation_from_inner(
+    m: agicash_cashu::MintConfirmation,
+) -> crate::types::MintConfirmationWasm {
+    crate::types::MintConfirmationWasm {
+        mint_url: m.mint_url,
+        mint_name: m.mint_name,
+        unit: m.unit,
+        currency: m.currency,
+        amount: m.amount,
+        fee: m.fee,
+    }
+}
+
+/// `agicash_cashu::AlreadyClaimedInfo` → `AlreadyClaimedInfoWasm`.
+/// Verbatim `ffi::receive_flow::AlreadyClaimedInfoFfi::from`.
+#[must_use]
+fn already_claimed_info_from_inner(
+    i: agicash_cashu::AlreadyClaimedInfo,
+) -> crate::types::AlreadyClaimedInfoWasm {
+    crate::types::AlreadyClaimedInfoWasm {
+        unit: i.unit,
+        currency: i.currency,
+        account_id: i.account_id,
+        mint_url: i.mint_url,
+        token_hash: i.token_hash,
+    }
+}
+
+/// `agicash_cashu::ReceiveFlowState` → `ReceiveFlowStateWasm`.
+/// Variant-for-variant 1:1 mirror of
+/// `ffi::receive_flow::ReceiveFlowStateFfi::from`. The output
+/// serializes to a tagged-discriminator JSON object the Leptos layer
+/// pattern-matches on.
+#[must_use]
+pub fn receive_flow_state_from_inner(
+    s: agicash_cashu::ReceiveFlowState,
+) -> crate::types::ReceiveFlowStateWasm {
+    use agicash_cashu::ReceiveFlowState as S;
+    match s {
+        S::Idle => crate::types::ReceiveFlowStateWasm::Idle,
+        S::Parsing => crate::types::ReceiveFlowStateWasm::Parsing,
+        S::NeedsMintConfirmation(c) => crate::types::ReceiveFlowStateWasm::NeedsMintConfirmation {
+            confirmation: mint_confirmation_from_inner(c),
+        },
+        S::AddingMint { mint_url } => crate::types::ReceiveFlowStateWasm::AddingMint { mint_url },
+        S::Swapping {
+            account_id,
+            mint_url,
+        } => crate::types::ReceiveFlowStateWasm::Swapping {
+            account_id,
+            mint_url,
+        },
+        S::Done(result) => crate::types::ReceiveFlowStateWasm::Done {
+            result: receive_flow_result_from_inner(result),
+        },
+        S::AlreadyClaimed(info) => crate::types::ReceiveFlowStateWasm::AlreadyClaimed {
+            info: already_claimed_info_from_inner(info),
+        },
+        S::Failed { reason, code } => crate::types::ReceiveFlowStateWasm::Failed { reason, code },
+    }
+}
+
+/// `agicash_cashu::ReceiveFlowError` → `JsValue`. Mirrors
+/// `ffi::receive_flow::receive_flow_error_to_ffi` at the wasm
+/// boundary: a JS `Error` whose message preserves the Display string.
+/// The state-machine itself translates most failure paths to a
+/// `Failed` state — `Err(...)` is reserved for invalid-event +
+/// auth/storage issues, exactly as the FFI does.
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn receive_flow_error_to_js(e: agicash_cashu::ReceiveFlowError) -> JsValue {
+    JsValue::from_str(&e.to_string())
+}
+
 /// Facade `SendTokenClaimStatus` → `SendClaimStatusWasm`. Verbatim the
 /// FFI's `From<SendTokenClaimStatus> for SendSwapClaimSnapshot`
 /// (`agicash-ffi/src/convert.rs:316`) — trivial 1:1; the facade type
