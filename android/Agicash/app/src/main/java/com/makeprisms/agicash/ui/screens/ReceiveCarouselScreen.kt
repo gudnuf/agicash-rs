@@ -72,12 +72,22 @@ import com.makeprisms.agicash.ui.theme.Radius
 import com.makeprisms.agicash.ui.theme.Spacing
 import com.makeprisms.agicash.wallet.WalletViewModel
 import kotlinx.coroutines.delay
-import uniffi.agicash_ffi.extractCashuToken
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import uniffi.agicash_ffi.AlreadyClaimedInfoFfi
+import uniffi.agicash_ffi.FfiException
+import uniffi.agicash_ffi.MintConfirmationFfi
 import uniffi.agicash_ffi.MintQuoteFfiState
 import uniffi.agicash_ffi.MintQuoteHandle
+import uniffi.agicash_ffi.ReceiveFlow
+import uniffi.agicash_ffi.ReceiveFlowEventFfi
+import uniffi.agicash_ffi.ReceiveFlowResultFfi
+import uniffi.agicash_ffi.ReceiveFlowStateFfi
 import uniffi.agicash_ffi.ReceiveResult
+import uniffi.agicash_ffi.ReceiveStatus
+import uniffi.agicash_ffi.ReceiveStatusFfi
+import uniffi.agicash_ffi.extractCashuToken
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Top-level Receive surface. Compose analogue of
@@ -194,18 +204,59 @@ private fun TabIndicatorBar(
 
 // ---- Cashu token paste page ----
 
+/**
+ * View-level phase for the Cashu paste page. Mirrors iOS
+ * `CashuTokenPasteView.Phase` (`ios/Agicash/Agicash/CashuTokenPasteView.swift`):
+ * the FFI `ReceiveFlowStateFfi` states map 1:1 here, with two extras
+ * ([Entry], [Working]) that exist only on the UI side of the seam.
+ */
 private sealed interface CashuPastePhase {
+    /** Form is editable; user can paste + tap Receive. */
     data object Entry : CashuPastePhase
+
+    /**
+     * Receive was tapped — extracting the encoded token, constructing
+     * the `ReceiveFlow` handle, and dispatching `Start`. Covers `Idle`
+     * and `Parsing` from the FFI state machine.
+     */
     data object Working : CashuPastePhase
+
+    /**
+     * Pasted token is from a mint the user hasn't added. The
+     * `MintConfirmationCard` is shown; user can accept ("Add Mint and
+     * Claim") or cancel.
+     */
+    data class ConfirmingMint(val confirmation: MintConfirmationFfi) : CashuPastePhase
+
+    /** Mint-add side effect is running. Spinner shown. */
+    data object AddingMint : CashuPastePhase
+
+    /** Receive-swap side effect is running. Spinner shown. */
+    data object Swapping : CashuPastePhase
+
+    /** Terminal success. Replaces the form with a success card. */
     data class Success(val result: ReceiveResult) : CashuPastePhase
+
+    /** Recoverable failure. Surfaces inline under the form. */
     data class Error(val message: String) : CashuPastePhase
 }
 
 /**
- * Paste a Cashu token and claim it. Mirrors iOS
- * `CashuTokenPasteView`'s state machine: entry → working → success
- * (auto-dismisses the whole carousel after 2s, or Done) / error
- * (inline, retry-in-place).
+ * Paste a Cashu token and claim it. Drives the
+ * [uniffi.agicash_ffi.ReceiveFlow] state machine — pasting a token from
+ * an unknown mint surfaces a confirmation card ("Add Mint and Claim") so
+ * the user can accept the new mint inline. Mirrors iOS
+ * `CashuTokenPasteView` (cross-account-ios @ `8b630a5`) and React's
+ * `<ReceiveToken/>` page
+ * (`app/features/receive/receive-cashu-token.tsx` lines 333-339, the
+ * `isReceiveAccountKnown=false` branch where the CTA copy switches to
+ * "Add Mint and Claim").
+ *
+ * **Cross-account fix (2026-05-22):** previously this page called
+ * `WalletViewModel.receive(token)`, which short-circuited with the raw
+ * FFI error `"no matching account for mint <url> — add the mint first"`
+ * when the token came from a mint the user hadn't added. Now drives
+ * `ReceiveFlow` instead.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -215,6 +266,12 @@ private fun CashuTokenPastePage(
 ) {
     var token by rememberSaveable { mutableStateOf("") }
     var phase by remember { mutableStateOf<CashuPastePhase>(CashuPastePhase.Entry) }
+    // Live `ReceiveFlow` handle for the current interaction. Constructed
+    // on submit, dropped when the view returns to Entry or terminates.
+    // Held as `remember` (not `rememberSaveable`) because the Rust handle
+    // is process-local; saved state restoration would carry a stale
+    // reference. Mirrors iOS `@State private var flow: ReceiveFlow?`.
+    var flow by remember { mutableStateOf<ReceiveFlow?>(null) }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
 
@@ -222,6 +279,51 @@ private fun CashuTokenPastePage(
         LaunchedEffect(phase) {
             delay(2000)
             onDismissCarousel()
+        }
+    }
+
+    // Translate a `ReceiveFlowStateFfi` snapshot into our local `Phase`
+    // and run follow-up actions (refresh accounts on terminal success).
+    suspend fun render(state: ReceiveFlowStateFfi) {
+        when (state) {
+            is ReceiveFlowStateFfi.Idle -> {
+                // The flow starts in Idle but the very next event drives
+                // it forward; if we observe it map to entry so the user
+                // can try again.
+                phase = CashuPastePhase.Entry
+                flow = null
+            }
+            is ReceiveFlowStateFfi.Parsing -> phase = CashuPastePhase.Working
+            is ReceiveFlowStateFfi.NeedsMintConfirmation ->
+                phase = CashuPastePhase.ConfirmingMint(state.confirmation)
+            is ReceiveFlowStateFfi.AddingMint -> phase = CashuPastePhase.AddingMint
+            is ReceiveFlowStateFfi.Swapping -> phase = CashuPastePhase.Swapping
+            is ReceiveFlowStateFfi.Done -> {
+                phase = CashuPastePhase.Success(receiveResultFromFlow(state.result))
+                // Refresh so Home's balance/accounts list reflects the
+                // new proofs without forcing a pull-to-refresh. Mirrors
+                // what `receive(token:)` used to do.
+                viewModel.refreshAccounts()
+                flow = null
+            }
+            is ReceiveFlowStateFfi.AlreadyClaimed -> {
+                phase = CashuPastePhase.Success(receiveResultFromAlreadyClaimed(state.info))
+                flow = null
+            }
+            is ReceiveFlowStateFfi.Failed -> {
+                phase = CashuPastePhase.Error(state.reason)
+                flow = null
+            }
+        }
+    }
+
+    fun handleError(e: Throwable) {
+        flow = null
+        phase = when (e) {
+            is FfiException.Auth -> CashuPastePhase.Error("auth/${e.code}: ${e.message}")
+            is FfiException.Storage -> CashuPastePhase.Error("storage/${e.code}: ${e.message}")
+            is FfiException.Internal -> CashuPastePhase.Error(e.message ?: "internal error")
+            else -> CashuPastePhase.Error("unexpected: ${e.message}")
         }
     }
 
@@ -237,14 +339,54 @@ private fun CashuTokenPastePage(
                 amount = p.result.amount,
                 unit = p.result.unit,
                 subline = p.result.mintUrl,
-                headline = when (p.result.status.name) {
-                    "RECEIVED" -> "Token received"
-                    "ALREADY_CLAIMED" -> "Already claimed"
-                    "PENDING" -> "Pending"
-                    else -> "Token unavailable"
+                headline = when (p.result.status) {
+                    ReceiveStatus.RECEIVED -> "Token received"
+                    ReceiveStatus.ALREADY_CLAIMED -> "Already claimed"
+                    ReceiveStatus.PENDING -> "Pending"
+                    ReceiveStatus.ALREADY_FAILED -> "Token unavailable"
                 },
                 onDone = onDismissCarousel,
             )
+            is CashuPastePhase.ConfirmingMint -> MintConfirmationCard(
+                confirmation = p.confirmation,
+                onConfirm = {
+                    val activeFlow = flow
+                    if (activeFlow == null) {
+                        phase = CashuPastePhase.Error(
+                            "Receive flow was lost. Please paste the token again.",
+                        )
+                        return@MintConfirmationCard
+                    }
+                    phase = CashuPastePhase.AddingMint
+                    scope.launch {
+                        try {
+                            val next = activeFlow.dispatch(ReceiveFlowEventFfi.ConfirmAddMint)
+                            render(next)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            handleError(e)
+                        }
+                    }
+                },
+                onCancel = {
+                    val activeFlow = flow
+                    scope.launch {
+                        // Best-effort: the cancel transition is internal
+                        // bookkeeping; we don't need to surface the
+                        // resulting state, just drop the handle.
+                        if (activeFlow != null) {
+                            runCatching {
+                                activeFlow.dispatch(ReceiveFlowEventFfi.CancelAddMint)
+                            }
+                        }
+                        flow = null
+                        phase = CashuPastePhase.Entry
+                    }
+                },
+            )
+            is CashuPastePhase.AddingMint -> CenteredProgress("Adding mint…")
+            is CashuPastePhase.Swapping -> CenteredProgress("Claiming token…")
             else -> CashuPasteFormCard(
                 token = token,
                 onTokenChange = {
@@ -267,11 +409,12 @@ private fun CashuTokenPastePage(
                         phase = CashuPastePhase.Error("Paste a Cashu token first.")
                         return@CashuPasteFormCard
                     }
-                    // Step 0: extract the encoded cashu token from whatever
-                    // the user pasted (URL with ?token=…/#…, cashu: URI,
-                    // embedded prose, or raw cashuA…/cashuB…). The
-                    // downstream FFI receive is strict — passing the raw
-                    // URL through re-creates the wrap-paste bug.
+                    // Step 0: extract the encoded cashu token from
+                    // whatever the user pasted (URL with ?token=…/#…,
+                    // cashu: URI, embedded prose, or raw
+                    // cashuA…/cashuB…). The downstream FFI receive is
+                    // strict — passing the raw URL through re-creates
+                    // the wrap-paste bug.
                     val encoded = extractCashuToken(trimmed)
                     if (encoded == null) {
                         phase = CashuPastePhase.Error("No Cashu token found in that text.")
@@ -279,14 +422,189 @@ private fun CashuTokenPastePage(
                     }
                     phase = CashuPastePhase.Working
                     scope.launch {
-                        phase = when (val o = viewModel.receive(encoded)) {
-                            is WalletViewModel.ReceiveOutcome.Success ->
-                                CashuPastePhase.Success(o.result)
-                            is WalletViewModel.ReceiveOutcome.Failure ->
-                                CashuPastePhase.Error(o.message)
+                        // Construct a fresh flow handle. Failure here is
+                        // auth/transient (no session, FFI init issue) —
+                        // surface and bail.
+                        val activeFlow = when (
+                            val o = viewModel.makeReceiveFlow()
+                        ) {
+                            is WalletViewModel.ReceiveFlowOutcome.Success -> {
+                                flow = o.flow
+                                o.flow
+                            }
+                            is WalletViewModel.ReceiveFlowOutcome.Failure -> {
+                                phase = CashuPastePhase.Error(o.message)
+                                return@launch
+                            }
+                        }
+                        try {
+                            val next = activeFlow.dispatch(
+                                ReceiveFlowEventFfi.Start(encoded),
+                            )
+                            render(next)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            handleError(e)
                         }
                     }
                 },
+            )
+        }
+    }
+}
+
+/**
+ * Convert a [ReceiveFlowResultFfi] to the legacy [ReceiveResult] shape
+ * so the existing [ReceiveSuccessCard] renders unchanged. The two types
+ * are structurally identical except [ReceiveStatusFfi] has three
+ * variants (the `AlreadyClaimed` case lives on [ReceiveFlowStateFfi]
+ * instead) — map each variant 1:1. Mirrors iOS
+ * `receiveResult(fromFlow:)`.
+ */
+private fun receiveResultFromFlow(result: ReceiveFlowResultFfi): ReceiveResult {
+    val status = when (result.status) {
+        ReceiveStatusFfi.RECEIVED -> ReceiveStatus.RECEIVED
+        ReceiveStatusFfi.ALREADY_FAILED -> ReceiveStatus.ALREADY_FAILED
+        ReceiveStatusFfi.PENDING -> ReceiveStatus.PENDING
+    }
+    return ReceiveResult(
+        status = status,
+        amount = result.amount,
+        fee = result.fee,
+        unit = result.unit,
+        currency = result.currency,
+        accountId = result.accountId,
+        mintUrl = result.mintUrl,
+        tokenHash = result.tokenHash,
+    )
+}
+
+/**
+ * Synthesize a [ReceiveResult] for the [ReceiveFlowStateFfi.AlreadyClaimed]
+ * state. The info doesn't carry amount/fee (per design — re-rendering
+ * "0 sats" would be misleading); pass empty strings and let
+ * [ReceiveSuccessCard] surface the "already claimed" headline via the
+ * status enum. Mirrors iOS `receiveResult(fromAlreadyClaimed:)`.
+ */
+private fun receiveResultFromAlreadyClaimed(info: AlreadyClaimedInfoFfi): ReceiveResult =
+    ReceiveResult(
+        status = ReceiveStatus.ALREADY_CLAIMED,
+        amount = "",
+        fee = "",
+        unit = info.unit,
+        currency = info.currency,
+        accountId = info.accountId,
+        mintUrl = info.mintUrl,
+        tokenHash = info.tokenHash,
+    )
+
+/**
+ * Confirmation card shown when the pasted token is from a mint the user
+ * hasn't added yet. Mirrors React's `<ReceiveToken/>` "Add Mint and
+ * Claim" branch (`app/features/receive/receive-cashu-token.tsx` lines
+ * 333-339) and the iOS sibling `MintConfirmationCard`
+ * (`ios/Agicash/Agicash/CashuTokenPasteView.swift` @ `cross-account-ios`).
+ *
+ * Mobile form factor doesn't host React's `<AccountSelector/>` — Slice 2
+ * scope is source-mint-only (the Rust `ReceiveFlow` state machine
+ * doesn't surface alternative destinations yet, per
+ * `2026-05-22-cross-account-audit.md`). So this card collapses the React
+ * picker into a single mint preview plus the same CTA pair.
+ *
+ * Visual rhythm matches [CashuPasteFormCard] / [ReceiveSuccessCard]:
+ * card chrome via [BrandCard], header + body block, primary
+ * "Add Mint and Claim" + ghost "Cancel" — the same shape the receive
+ * surface uses across all phases.
+ */
+@Composable
+private fun MintConfirmationCard(
+    confirmation: MintConfirmationFfi,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    BrandCard {
+        Column(verticalArrangement = Arrangement.spacedBy(Spacing.l)) {
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                Text(
+                    "Add this mint?",
+                    style = BrandTypography.title,
+                    color = BrandColors.cardForeground,
+                )
+                Text(
+                    "This token is from a mint you haven't added yet. Add it to claim the funds.",
+                    style = BrandTypography.label,
+                    color = BrandColors.mutedForeground,
+                )
+            }
+
+            // Mint identity block — mirrors AddMintSuccessCard's geometry:
+            // big name, monospaced URL underneath.
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(Spacing.s),
+            ) {
+                Text(
+                    confirmation.mintName,
+                    style = BrandTypography.title,
+                    color = BrandColors.cardForeground,
+                    maxLines = 1,
+                )
+                Text(
+                    confirmation.mintUrl,
+                    style = BrandTypography.caption,
+                    color = BrandColors.mutedForeground,
+                    maxLines = 1,
+                )
+            }
+
+            // Amount block — mirrors ReceiveSuccessCard so pre-claim and
+            // post-claim cards feel like the same visual family.
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(Spacing.xs),
+            ) {
+                Text(
+                    "Claiming",
+                    style = BrandTypography.caption,
+                    color = BrandColors.mutedForeground,
+                )
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(
+                        confirmation.amount,
+                        style = BrandTypography.numericInline,
+                        color = BrandColors.cardForeground,
+                    )
+                    Spacer(Modifier.size(6.dp))
+                    Text(
+                        confirmation.unit,
+                        style = BrandTypography.label,
+                        color = BrandColors.mutedForeground,
+                    )
+                }
+                if (confirmation.fee.isNotEmpty() && confirmation.fee != "0") {
+                    Text(
+                        "Mint fee: ${confirmation.fee} ${confirmation.unit}",
+                        style = BrandTypography.caption,
+                        color = BrandColors.mutedForeground,
+                    )
+                }
+            }
+
+            // CTA stack — primary "Add Mint and Claim" (exact React +
+            // iOS copy) + ghost "Cancel". Same shape as
+            // CashuPasteFormCard's Receive button.
+            BrandButton(
+                label = "Add Mint and Claim",
+                onClick = onConfirm,
+                variant = BrandButtonVariant.Primary,
+            )
+            BrandButton(
+                label = "Cancel",
+                onClick = onCancel,
+                variant = BrandButtonVariant.Ghost,
             )
         }
     }
@@ -727,10 +1045,17 @@ private fun ReceiveSuccessCard(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(Spacing.s),
             ) {
-                Row(verticalAlignment = Alignment.Bottom) {
-                    Text(amount, style = BrandTypography.numericInline, color = BrandColors.cardForeground)
-                    Spacer(Modifier.size(6.dp))
-                    Text(unit, style = BrandTypography.label, color = BrandColors.mutedForeground)
+                // Only render the amount line when we have one. The
+                // `AlreadyClaimed` state synthesizes an empty `amount`
+                // because the FFI deliberately omits it (re-rendering
+                // "0 sats" would be misleading). Mirrors iOS
+                // `SuccessCard`.
+                if (amount.isNotEmpty()) {
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text(amount, style = BrandTypography.numericInline, color = BrandColors.cardForeground)
+                        Spacer(Modifier.size(6.dp))
+                        Text(unit, style = BrandTypography.label, color = BrandColors.mutedForeground)
+                    }
                 }
                 Text(
                     subline,

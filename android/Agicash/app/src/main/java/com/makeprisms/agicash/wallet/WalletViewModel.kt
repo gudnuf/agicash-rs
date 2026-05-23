@@ -32,6 +32,7 @@ import uniffi.agicash_ffi.MintQuoteHandle
 import uniffi.agicash_ffi.CacheKindFfi
 import uniffi.agicash_ffi.CacheUpdateFfi
 import uniffi.agicash_ffi.RealtimeStatusFfi
+import uniffi.agicash_ffi.ReceiveFlow
 import uniffi.agicash_ffi.ReceiveResult
 import uniffi.agicash_ffi.SendQuotePreview
 import uniffi.agicash_ffi.SendSwapClaimState
@@ -884,6 +885,49 @@ class WalletViewModel(application: Application) : AndroidViewModel(application) 
             return ReceiveOutcome.Failure("unexpected: ${e.message}")
         } finally {
             _isWorking.value = false
+        }
+    }
+
+    /**
+     * Outcome shape for [makeReceiveFlow]. Success carries a freshly
+     * constructed [ReceiveFlow] handle the view drives via `dispatch`;
+     * failure carries a presentation-ready string already mapped through
+     * [ffiErrorMessage]. Mirrors iOS `WalletViewModel.ReceiveFlowOutcome`.
+     *
+     * The handle is per-interaction — each tap of "Receive" gets a new
+     * flow. The view owns the handle for its lifetime (a `remember`
+     * mutable state); when the view goes away the Rust side drops the
+     * inner service.
+     */
+    sealed interface ReceiveFlowOutcome {
+        data class Success(val flow: ReceiveFlow) : ReceiveFlowOutcome
+        data class Failure(val message: String) : ReceiveFlowOutcome
+    }
+
+    /**
+     * Construct a fresh [ReceiveFlow] handle for an interactive Cashu
+     * receive. Mirrors iOS `makeReceiveFlow()` — the Rust state machine
+     * encodes the unknown-mint branching as
+     * `NeedsMintConfirmation` → `ConfirmAddMint` → `AddingMint` →
+     * `Swapping` → `Done`, mirroring React's
+     * `useReceiveCashuTokenAccounts` + `claimTokenMutation` pair
+     * (`app/features/receive/receive-cashu-token.tsx`).
+     *
+     * The view calls this once per receive interaction (one tap of
+     * "Receive") and holds the returned handle for the duration of the
+     * flow.
+     */
+    suspend fun makeReceiveFlow(): ReceiveFlowOutcome {
+        val w = wallet ?: return ReceiveFlowOutcome.Failure("Wallet not ready.")
+        return try {
+            val flow = withContext(Dispatchers.IO) { w.receiveFlow() }
+            ReceiveFlowOutcome.Success(flow)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: FfiException) {
+            ReceiveFlowOutcome.Failure(ffiErrorMessage(e))
+        } catch (e: Throwable) {
+            ReceiveFlowOutcome.Failure("unexpected: ${e.message}")
         }
     }
 
