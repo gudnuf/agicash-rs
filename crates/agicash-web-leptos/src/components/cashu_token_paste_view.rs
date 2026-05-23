@@ -6,20 +6,25 @@
 //! affordance on the field label, inline destructive error line under the
 //! textarea, primary "Receive" button at the bottom).
 //!
-//! Behaviour (12d: receive un-mocked):
+//! Behaviour (cross-account receive — `agicash-rs/master` 27afefae):
 //!   - The textarea + `Preview` button parse the token client-side using
 //!     `cdk::nuts::Token::from_str` (wasm-clean — no network).
-//!   - The `Receive` button is **real** as of slice 12d: it calls
-//!     `AgicashWasmWallet::receive_token(preview.raw)` over the
-//!     `WalletClient::from_config` core. `Ok` → success card, `Err` →
-//!     inline error (edit + retry).
-//!   - "Mint already added?" is now a **real** UX hint: the preview
-//!     flow asks `AgicashWasmWallet::list_accounts()` whether the
-//!     token's mint is one of the user's existing Cashu accounts (12c
-//!     `receive_flow()` + `add_mint_account` landed). The real
-//!     `receive_token` still handles unknown mints per the facade's
-//!     one-shot semantics — the lookup only drives the "Add mint
-//!     first?" CTA, it does NOT gate the receive.
+//!   - The `Receive` button drives the wasm `ReceiveFlow` state machine
+//!     (`AgicashWasmWallet::makeReceiveFlow()`):
+//!     `Idle → Parsing → NeedsMintConfirmation → AddingMint → Swapping
+//!     → Done | AlreadyClaimed | Failed`.
+//!     Mirrors iOS (`8b630a54`) + Android (`77e7ce13`). When the pasted
+//!     token is from a mint the user hasn't added, the flow surfaces a
+//!     `NeedsMintConfirmation` card with copy "Add this mint?" + primary
+//!     CTA "Add Mint and Claim" + ghost "Cancel" — same copy iOS +
+//!     Android use, sourced from React's `<ReceiveToken/>` page
+//!     (`app/features/receive/receive-cashu-token.tsx` lines 333-339,
+//!     the `!isReceiveAccountKnown && purpose === 'transactional'`
+//!     branch where the CTA copy switches to "Add Mint and Claim").
+//!   - "Mint already added?" remains a UX hint on the Preview card,
+//!     driven by `AgicashWasmWallet::list_accounts()`. It is not load-
+//!     bearing: clicking Receive on an unknown mint now lands at the
+//!     confirmation card instead of a raw error, regardless of the hint.
 
 // The view body is long but linear; splitting into private sub-components
 // would just add indirection without reuse benefit.
@@ -62,27 +67,55 @@ struct TokenPreview {
     mint_known: bool,
 }
 
-/// Result rendered on the success card after a (mocked) redeem completes.
+/// Result rendered on the success card after the redeem completes.
+/// `amount` may be empty when the flow lands in `AlreadyClaimed` —
+/// re-rendering "0 sats" would be misleading (the FFI/WASM deliberately
+/// omits an amount for that variant), so `SuccessCard` skips the
+/// amount block when it's blank. Mirrors iOS `SuccessCard` /
+/// `AlreadyClaimed` handling (`8b630a54`).
 #[derive(Clone, Debug)]
 struct ReceiveResult {
-    amount: u64,
+    /// Decimal amount string (e.g. "10"), or empty for `AlreadyClaimed`.
+    amount: String,
     unit: String,
     mint_url: String,
 }
 
-/// View state machine. Matches iOS `Phase` 1:1 with a `Preview` sub-state
-/// inserted between `Entry` and `Working` (the iOS view skips Preview and
-/// jumps straight from paste → Working because it has carousel-level
-/// chrome that gives a continuous "receive" affordance; the web flow
-/// needs an explicit Preview so the user sees what they're about to
-/// claim before committing).
+/// Mint-confirmation card data — the payload that surfaces when the
+/// `ReceiveFlow` state machine pauses on `NeedsMintConfirmation`. Local
+/// deserialize target for the JSON envelope `AgicashReceiveFlow` emits
+/// (`{ "kind": "needsMintConfirmation", "confirmation": { … } }`). Field
+/// shape mirrors `agicash_wasm::MintConfirmationWasm` 1:1 (which itself
+/// mirrors `agicash-cashu::MintConfirmation`). Decoded via
+/// `serde_wasm_bindgen::from_value` — same idiom this file already uses
+/// for `AccountWasm` in `fetch_mint_known`.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MintConfirmationData {
+    mint_url: String,
+    mint_name: String,
+    unit: String,
+    #[allow(dead_code)]
+    currency: String,
+    amount: String,
+    fee: String,
+}
+
+/// View state machine. Mirrors iOS `Phase` (`8b630a54`):
+///   `entry → working → (confirmingMint? → addingMint?) → swapping →
+///    success | error`
+/// with a Leptos-only `Preview` sub-state inserted between `Entry` and
+/// `Working` (iOS jumps straight from paste → Working because it has
+/// carousel-level chrome that gives a continuous "receive" affordance;
+/// the web flow needs an explicit Preview so the user sees what they're
+/// about to claim before committing).
 ///
-/// `Success` is constructed only on the real wasm receive path (12d:
-/// `cfg(target_arch = "wasm32")` — the browser is the only shipping
+/// `Success` is constructed only on the real wasm receive path
+/// (`cfg(target_arch = "wasm32")` — the browser is the only shipping
 /// target). The native `rlib` (workspace unit-test build) has no
-/// browser wallet so it constructs only entry/preview/working/error;
-/// the variant is still pattern-matched by the `view!` render arms. The
-/// `allow(dead_code)` is therefore native-only + honest.
+/// browser wallet so it constructs only entry/preview/error;
+/// the variant is still pattern-matched by the `view!` render arms.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, Debug)]
 enum Phase {
@@ -91,12 +124,24 @@ enum Phase {
     /// Token parsed successfully — preview card visible, Receive button
     /// armed.
     Preview(TokenPreview),
-    /// Receive in flight — spinner on the button, fields locked.
+    /// Receive in flight — spinner on the button, fields locked. Covers
+    /// the `Parsing` state from the `ReceiveFlow` state machine.
     Working(TokenPreview),
+    /// Token's source mint isn't in the user's accounts. Renders the
+    /// `MintConfirmationCard` with "Add Mint and Claim" / Cancel CTAs.
+    /// Mirrors iOS `confirmingMint(MintConfirmationFfi)`.
+    ConfirmingMint(MintConfirmationData),
+    /// Between confirm tap and the mint being added (typically 1-3 s).
+    /// Indeterminate-progress card. Mirrors iOS `addingMint`.
+    AddingMint,
+    /// Between mint-added and swap completion (typically 1-3 s).
+    /// Indeterminate-progress card. Mirrors iOS `swapping`.
+    Swapping,
     /// Redeem complete — success card with amount + mint url + Done.
     Success(ReceiveResult),
-    /// Parse error or (eventually) redeem error. Shown inline under the
-    /// textarea; user can edit and retry without dismissing.
+    /// Parse error or receive error. Shown inline under the textarea
+    /// (Entry) or as a destructive header line in the form re-entered
+    /// after a Cancel; user can edit and retry without dismissing.
     Error(String),
 }
 
@@ -112,6 +157,21 @@ pub fn CashuTokenPasteView() -> impl IntoView {
 
     let token_text = RwSignal::new(String::new());
     let phase: RwSignal<Phase> = RwSignal::new(Phase::Entry);
+    // Long-lived `AgicashReceiveFlow` handle scoped to the current
+    // interaction. Each Receive-button click constructs a fresh flow
+    // and stores it here; the confirm/cancel handlers re-read it to
+    // dispatch the next event into the same Rust-side state machine.
+    // `LocalStorage` (not the default `SyncStorage`) because the wasm
+    // `AgicashReceiveFlow` wraps an `Rc<Mutex<...>>` (non-`Send`); the
+    // value is pinned to the JS main thread where it was constructed,
+    // same idiom `wallet_context::WalletData` uses for the non-`Send`
+    // realtime/driver handles. Native (`rlib`) builds don't see the
+    // wasm wallet so this field is wasm-only.
+    #[cfg(target_arch = "wasm32")]
+    let active_flow: StoredValue<
+        Option<std::rc::Rc<agicash_wasm::AgicashReceiveFlow>>,
+        leptos::prelude::LocalStorage,
+    > = StoredValue::new_local(None);
 
     // ---- Handlers ---------------------------------------------------------
 
@@ -141,8 +201,14 @@ pub fn CashuTokenPasteView() -> impl IntoView {
             Phase::Preview(_) | Phase::Error(_) | Phase::Success(_) => {
                 phase.set(Phase::Entry);
             }
-            // Don't yank the user out of an in-flight Working state.
-            Phase::Entry | Phase::Working(_) => {}
+            // Don't yank the user out of an in-flight state — Working,
+            // ConfirmingMint, AddingMint, Swapping each represent a
+            // committed receive interaction the user is mid-stream on.
+            Phase::Entry
+            | Phase::Working(_)
+            | Phase::ConfirmingMint(_)
+            | Phase::AddingMint
+            | Phase::Swapping => {}
         }
     };
 
@@ -176,31 +242,59 @@ pub fn CashuTokenPasteView() -> impl IntoView {
         let config = config.get_value();
 
         spawn_local(async move {
-            // 12d: real SDK boundary (was a 1.5 s mock sleep).
-            // `Ok` → `Phase::Success`; `Err(msg)` → `Phase::Error`
-            // (user can edit + retry). The facade handles unknown
-            // mints per its one-shot semantics — no `KNOWN_MINTS`
-            // pre-check (that mocked preview is a pure UX hint;
-            // interactive add-mint confirmation is 12c receive-flow
-            // scope, NOT implemented here).
+            // Drives the `ReceiveFlow` state machine — mirrors iOS
+            // `CashuTokenPasteView.submit()` (8b630a54) and Android
+            // `ReceiveCarouselScreen.submit()` (77e7ce13). The one-shot
+            // `receive_token` path it replaced dead-ended with the raw
+            // "no matching account for mint <url>" error on unknown
+            // mints; the flow lets the user confirm + add the mint
+            // inline.
             #[cfg(target_arch = "wasm32")]
             {
-                match crate::components::wallet_context::seed_wasm_wallet(&config).await {
-                    Ok(wallet) => match wallet.receive_token(preview.raw.clone()).await {
-                        Ok(r) => phase.set(Phase::Success(ReceiveResult {
-                            amount: r.amount.trim().parse::<u64>().unwrap_or(0),
-                            unit: r.unit.clone(),
-                            mint_url: r.mint_url.clone(),
-                        })),
-                        Err(e) => phase.set(Phase::Error(
+                use std::rc::Rc;
+
+                // `seed_wasm_wallet` is the canonical session-threaded
+                // composition root the other 4 button-click sites use
+                // (see `wallet_context::seed_wasm_wallet`). It calls
+                // `setSession` immediately after `new()` so the
+                // facade's `require_session()` guard inside
+                // `WalletClient::receive_flow()` passes.
+                let wallet =
+                    match crate::components::wallet_context::seed_wasm_wallet(&config).await {
+                        Ok(w) => w,
+                        Err(e) => {
+                            phase.set(Phase::Error(
+                                e.as_string()
+                                    .unwrap_or_else(|| "wallet init failed".to_string()),
+                            ));
+                            return;
+                        }
+                    };
+
+                // Each click of Receive gets a fresh flow handle —
+                // flows are not persisted across constructions
+                // (verbatim FFI/WASM semantics).
+                let flow = match wallet.make_receive_flow().await {
+                    Ok(f) => Rc::new(f),
+                    Err(e) => {
+                        phase.set(Phase::Error(
+                            e.as_string()
+                                .unwrap_or_else(|| "receive flow init failed".to_string()),
+                        ));
+                        return;
+                    }
+                };
+                active_flow.set_value(Some(flow.clone()));
+
+                match flow.start(preview.raw.clone()).await {
+                    Ok(js) => render_flow_state(js, phase, active_flow),
+                    Err(e) => {
+                        active_flow.set_value(None);
+                        phase.set(Phase::Error(
                             e.as_string()
                                 .unwrap_or_else(|| "receive failed".to_string()),
-                        )),
-                    },
-                    Err(e) => phase.set(Phase::Error(
-                        e.as_string()
-                            .unwrap_or_else(|| "receive failed".to_string()),
-                    )),
+                        ));
+                    }
                 }
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -212,6 +306,64 @@ pub fn CashuTokenPasteView() -> impl IntoView {
                     "wallet unavailable (native build)".to_string(),
                 ));
             }
+        });
+    };
+
+    // User said yes to "Add Mint and Claim". Dispatches `ConfirmAddMint`
+    // into the live flow — the Rust side runs `add_mint` + the receive
+    // swap in sequence and reports back through state transitions.
+    // Mirrors iOS `confirmAddMint()` (8b630a54).
+    let on_confirm_add_mint = move |_ev| {
+        spawn_local(async move {
+            #[cfg(target_arch = "wasm32")]
+            {
+                let Some(flow) = active_flow.with_value(Clone::clone) else {
+                    phase.set(Phase::Error(
+                        "Receive flow was lost. Please paste the token again.".to_string(),
+                    ));
+                    return;
+                };
+                phase.set(Phase::AddingMint);
+                match flow.confirm_add_mint().await {
+                    Ok(js) => render_flow_state(js, phase, active_flow),
+                    Err(e) => {
+                        active_flow.set_value(None);
+                        phase.set(Phase::Error(
+                            e.as_string()
+                                .unwrap_or_else(|| "add-mint failed".to_string()),
+                        ));
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                phase.set(Phase::Error(
+                    "wallet unavailable (native build)".to_string(),
+                ));
+            }
+        });
+    };
+
+    // User declined the mint-add. Dispatch `CancelAddMint` so the Rust
+    // side closes the flow cleanly, then return to Entry so the user
+    // can paste a different token (or close the page). Mirrors iOS
+    // `cancelAddMint()` (8b630a54).
+    let on_cancel_add_mint = move |_ev| {
+        spawn_local(async move {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(flow) = active_flow.with_value(Clone::clone) {
+                    // Best-effort: the cancel transition is internal
+                    // bookkeeping; we don't need to surface its
+                    // resulting state, just drop it.
+                    let _ = flow.cancel_add_mint().await;
+                }
+                active_flow.set_value(None);
+            }
+            phase.set(Phase::Entry);
+            // Clear the textarea so the user paints a fresh paste,
+            // matching iOS's `tokenFocused = true` re-entry rhythm.
+            token_text.set(String::new());
         });
     };
 
@@ -307,6 +459,26 @@ pub fn CashuTokenPasteView() -> impl IntoView {
                         is_working=true
                         on_receive=on_receive
                         on_add_mint=on_add_mint.clone()
+                    />
+                }.into_any(),
+                Phase::ConfirmingMint(confirmation) => view! {
+                    <MintConfirmationCard
+                        confirmation=confirmation
+                        is_working=false
+                        on_confirm=on_confirm_add_mint
+                        on_cancel=on_cancel_add_mint
+                    />
+                }.into_any(),
+                Phase::AddingMint => view! {
+                    <ProgressCard
+                        title="Adding mint".to_string()
+                        subtitle="Setting up your new Cashu account…".to_string()
+                    />
+                }.into_any(),
+                Phase::Swapping => view! {
+                    <ProgressCard
+                        title="Claiming token".to_string()
+                        subtitle="Finalizing the receive swap…".to_string()
                     />
                 }.into_any(),
                 Phase::Success(result) => view! {
@@ -517,8 +689,163 @@ where
     }
 }
 
-/// Success card shown after a (mocked) redeem completes. Mirrors iOS
-/// `SuccessCard`.
+/// Confirmation card shown when the pasted token is from a mint the
+/// user hasn't added yet — the `NeedsMintConfirmation` state from the
+/// `ReceiveFlow` machine. Same copy + CTA pair iOS (8b630a54) and
+/// Android (77e7ce13) use, sourced from React's `<ReceiveToken/>` page
+/// (`app/features/receive/receive-cashu-token.tsx` lines 333-339, the
+/// `!isReceiveAccountKnown && purpose === 'transactional'` branch where
+/// the CTA copy switches to `"Add Mint and Claim"`).
+///
+/// Tailwind classes mirror the React app's design language (the
+/// canonical source per `feedback_visual_parity_all_clients`). Card
+/// chrome: `rounded-lg bg-card text-card-foreground border` + shadow,
+/// matching React's `<Card/>` primitive
+/// (`app/components/ui/card.tsx`). Buttons mirror React's
+/// `<Button variant="default"/>` (primary) and
+/// `<Button variant="ghost"/>` (cancel) — `bg-primary
+/// text-primary-foreground hover:bg-primary/90 h-10 px-4 rounded-md
+/// text-sm font-medium` for primary,
+/// `hover:bg-accent hover:text-accent-foreground` for ghost.
+/// Numeric amount uses `font-[var(--font-numeric)] tabular-nums` —
+/// React renders the equivalent via the Teko-family `font-numeric`
+/// utility bound in `style/tailwind.in.css`.
+#[component]
+fn MintConfirmationCard<C, X>(
+    confirmation: MintConfirmationData,
+    is_working: bool,
+    on_confirm: C,
+    on_cancel: X,
+) -> impl IntoView
+where
+    C: Fn(leptos::ev::MouseEvent) + 'static,
+    X: Fn(leptos::ev::MouseEvent) + 'static,
+{
+    let mint_name = confirmation.mint_name.clone();
+    let mint_url = confirmation.mint_url.clone();
+    let amount = confirmation.amount.clone();
+    let unit = confirmation.unit.clone();
+    let fee = confirmation.fee.clone();
+    let show_fee = !fee.is_empty() && fee != "0";
+    let fee_label = format!("Mint fee: {fee} {unit_label}", unit_label = &unit);
+
+    view! {
+        <div class="w-full max-w-sm rounded-lg border bg-card text-card-foreground \
+                    shadow-xs p-8 flex flex-col gap-4">
+            // Card header — same rhythm as the iOS/Android sibling
+            // (title + supporting caption) so the language reads
+            // consistently across the receive surface.
+            <div class="flex flex-col gap-1">
+                <h2 class="text-2xl font-semibold m-0 text-card-foreground">
+                    "Add this mint?"
+                </h2>
+                <p class="text-sm m-0 text-muted-foreground">
+                    "This token is from a mint you haven't added yet. \
+                     Add it to claim the funds."
+                </p>
+            </div>
+
+            // Mint identity block — name above, URL below. Same shape
+            // as iOS's `AddMintSuccessCard`-derived block.
+            <div class="flex flex-col items-center gap-2">
+                <p class="text-base font-semibold m-0 text-card-foreground \
+                          text-center truncate w-full">
+                    {mint_name}
+                </p>
+                <p class="text-xs m-0 text-muted-foreground text-center \
+                          break-all w-full">
+                    {mint_url}
+                </p>
+            </div>
+
+            // Amount block — mirrors the SuccessCard's amount rendering
+            // so the pre-claim and post-claim cards read as one visual
+            // family. `font-numeric` (Teko) + tabular-nums matches the
+            // React `<Money/>` component's display rhythm.
+            <div class="flex flex-col items-center gap-1">
+                <p class="text-xs m-0 text-muted-foreground">"Claiming"</p>
+                <div class="flex items-baseline justify-center gap-1.5">
+                    <span class="text-5xl font-semibold leading-none \
+                                 text-card-foreground font-numeric tabular-nums">
+                        {amount}
+                    </span>
+                    <span class="text-base text-muted-foreground">{unit.clone()}</span>
+                </div>
+                {show_fee.then(|| view! {
+                    <p class="text-xs m-0 text-muted-foreground">{fee_label}</p>
+                })}
+            </div>
+
+            // CTA stack — primary "Add Mint and Claim" (exact React +
+            // iOS + Android copy) + ghost "Cancel". Tailwind classes
+            // mirror React's `<Button/>` shadcn primitive shape:
+            // primary = bg-primary/text-primary-foreground, ghost =
+            // transparent with hover background. Disabled-during-work
+            // styling matches the `disabled:opacity-50` shadcn pattern.
+            <button
+                class="inline-flex items-center justify-center h-10 px-4 \
+                       rounded-md text-sm font-medium bg-primary \
+                       text-primary-foreground hover:bg-primary/90 \
+                       disabled:opacity-50 disabled:cursor-not-allowed \
+                       transition-opacity cursor-pointer"
+                disabled=is_working
+                on:click=on_confirm
+            >
+                "Add Mint and Claim"
+            </button>
+            <button
+                class="inline-flex items-center justify-center h-10 px-4 \
+                       rounded-md text-sm font-medium bg-transparent \
+                       text-card-foreground border border-border \
+                       hover:bg-accent hover:text-accent-foreground \
+                       disabled:opacity-50 disabled:cursor-not-allowed \
+                       transition-colors cursor-pointer"
+                disabled=is_working
+                on:click=on_cancel
+            >
+                "Cancel"
+            </button>
+        </div>
+    }
+}
+
+/// Indeterminate-progress card shown during the `AddingMint` and
+/// `Swapping` phases (typically 1-3 s each). Mirrors iOS
+/// `ProgressCard` (8b630a54). Uses the same Tailwind card chrome as
+/// `MintConfirmationCard` so the visual rhythm carries across the
+/// state machine. Spinner is a CSS-only `animate-spin` ring — pure
+/// utility-class, no `<ProgressView/>`-style platform dependency.
+#[component]
+fn ProgressCard(title: String, subtitle: String) -> impl IntoView {
+    view! {
+        <div class="w-full max-w-sm rounded-lg border bg-card text-card-foreground \
+                    shadow-xs p-8 flex flex-col items-center gap-4">
+            <div class="flex flex-col items-center gap-1">
+                <h2 class="text-2xl font-semibold m-0 text-card-foreground \
+                           text-center">
+                    {title}
+                </h2>
+                <p class="text-sm m-0 text-muted-foreground text-center">
+                    {subtitle}
+                </p>
+            </div>
+            // Pure-Tailwind indeterminate spinner — animate-spin (built
+            // into Tailwind core) + a ring made from a transparent
+            // top border on a foreground-colored circle. Mirrors the
+            // React app's <Spinner/> shape (border-2 + animate-spin).
+            <div class="h-10 w-10 rounded-full border-2 border-muted-foreground \
+                        border-t-transparent animate-spin my-4"
+                 aria-label="loading"
+                 role="status"/>
+        </div>
+    }
+}
+
+/// Success card shown after the redeem completes. Mirrors iOS
+/// `SuccessCard`. Handles the `AlreadyClaimed` case by suppressing the
+/// amount block when `result.amount` is empty — re-rendering "0 sats"
+/// would be misleading (the WASM `AlreadyClaimedInfoWasm` deliberately
+/// omits an amount; see `crates/agicash-wasm/src/types.rs`).
 #[component]
 fn SuccessCard<D>(result: ReceiveResult, on_done: D) -> impl IntoView
 where
@@ -557,18 +884,29 @@ where
         tokens::COLOR_MUTED_FOREGROUND,
     );
 
+    let subhead = if result.amount.is_empty() {
+        "This token was already claimed."
+    } else {
+        "Proofs added to your wallet."
+    };
+    let show_amount = !result.amount.is_empty();
+    let amount = result.amount.clone();
+    let unit = result.unit.clone();
+
     view! {
         <div style=card_style>
             <div>
                 <h2 style=title_style>"Token received"</h2>
-                <p style=subhead_style>"Proofs added to your wallet."</p>
+                <p style=subhead_style>{subhead}</p>
             </div>
 
             <div style="display:flex; flex-direction:column; align-items:center; gap:8px;">
-                <div style=amount_row_style>
-                    <span style=amount_style>{format_amount(result.amount)}</span>
-                    <span style=unit_style>{result.unit}</span>
-                </div>
+                {show_amount.then(|| view! {
+                    <div style=amount_row_style>
+                        <span style=amount_style>{amount}</span>
+                        <span style=unit_style>{unit}</span>
+                    </div>
+                })}
                 <p style=mint_style>{result.mint_url}</p>
             </div>
 
@@ -692,6 +1030,144 @@ async fn fetch_mint_known(config: &AppConfig, mint_url: &str) -> bool {
         .filter(|a| a.account_type == "cashu")
         .filter_map(|a| a.mint_url.as_deref());
     mint_in_accounts(mint_url, cashu_mint_urls)
+}
+
+/// Tagged-union deserialize target for the `AgicashReceiveFlow` state
+/// envelope (`{ "kind": "<variant>", … }`). Mirrors the Serialize-only
+/// `agicash_wasm::types::ReceiveFlowStateWasm` 1:1 — local
+/// `Deserialize`-only twin so the Rust/JS round-trip stays a JSON shape
+/// across the `serde_wasm_bindgen` boundary (same idiom the existing
+/// `AccountMintUrl` struct uses against `AccountWasm`). Tag is `kind`,
+/// variants are `camelCase` per the wasm crate's `#[serde(...)]`
+/// attribute on `ReceiveFlowStateWasm`.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum ReceiveFlowStateView {
+    Idle,
+    Parsing,
+    NeedsMintConfirmation {
+        confirmation: MintConfirmationData,
+    },
+    AddingMint {
+        #[allow(dead_code)]
+        mint_url: String,
+    },
+    Swapping {
+        #[allow(dead_code)]
+        account_id: String,
+        #[allow(dead_code)]
+        mint_url: String,
+    },
+    Done {
+        result: ReceiveFlowResultView,
+    },
+    AlreadyClaimed {
+        info: AlreadyClaimedInfoView,
+    },
+    Failed {
+        reason: String,
+        #[allow(dead_code)]
+        code: String,
+    },
+}
+
+/// `Done` payload mirror — `agicash_wasm::types::ReceiveFlowResultWasm`.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ReceiveFlowResultView {
+    #[allow(dead_code)]
+    status: String,
+    amount: String,
+    #[allow(dead_code)]
+    fee: String,
+    unit: String,
+    #[allow(dead_code)]
+    currency: String,
+    #[allow(dead_code)]
+    account_id: String,
+    mint_url: String,
+    #[allow(dead_code)]
+    token_hash: String,
+}
+
+/// `AlreadyClaimed` payload mirror —
+/// `agicash_wasm::types::AlreadyClaimedInfoWasm`. The info deliberately
+/// omits amount/fee (re-rendering "0 sats" would be misleading); the
+/// success card renders an empty amount block in that case.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct AlreadyClaimedInfoView {
+    unit: String,
+    #[allow(dead_code)]
+    currency: String,
+    #[allow(dead_code)]
+    account_id: String,
+    mint_url: String,
+    #[allow(dead_code)]
+    token_hash: String,
+}
+
+/// Decode a `ReceiveFlow` state envelope `JsValue` into our local
+/// `Phase` and patch the `phase` signal. Mirrors iOS `render(state:)`
+/// (`8b630a54`). Drops the active-flow handle on terminal states so
+/// the Rust side can free the inner service.
+#[cfg(target_arch = "wasm32")]
+fn render_flow_state(
+    js: wasm_bindgen::JsValue,
+    phase: RwSignal<Phase>,
+    active_flow: StoredValue<
+        Option<std::rc::Rc<agicash_wasm::AgicashReceiveFlow>>,
+        leptos::prelude::LocalStorage,
+    >,
+) {
+    let state: ReceiveFlowStateView = match serde_wasm_bindgen::from_value(js) {
+        Ok(s) => s,
+        Err(e) => {
+            active_flow.set_value(None);
+            phase.set(Phase::Error(format!("decode receive flow state: {e}")));
+            return;
+        }
+    };
+    match state {
+        ReceiveFlowStateView::Idle => {
+            // Shouldn't normally surface here (flow starts in Idle but
+            // the very next event drives it forward). Treat as a
+            // soft-reset.
+            active_flow.set_value(None);
+            phase.set(Phase::Entry);
+        }
+        ReceiveFlowStateView::Parsing => {
+            // Transient — leave the Working card up.
+        }
+        ReceiveFlowStateView::NeedsMintConfirmation { confirmation } => {
+            phase.set(Phase::ConfirmingMint(confirmation));
+        }
+        ReceiveFlowStateView::AddingMint { .. } => phase.set(Phase::AddingMint),
+        ReceiveFlowStateView::Swapping { .. } => phase.set(Phase::Swapping),
+        ReceiveFlowStateView::Done { result } => {
+            active_flow.set_value(None);
+            phase.set(Phase::Success(ReceiveResult {
+                amount: result.amount,
+                unit: result.unit,
+                mint_url: result.mint_url,
+            }));
+        }
+        ReceiveFlowStateView::AlreadyClaimed { info } => {
+            active_flow.set_value(None);
+            phase.set(Phase::Success(ReceiveResult {
+                amount: String::new(),
+                unit: info.unit,
+                mint_url: info.mint_url,
+            }));
+        }
+        ReceiveFlowStateView::Failed { reason, .. } => {
+            active_flow.set_value(None);
+            phase.set(Phase::Error(reason));
+        }
+    }
 }
 
 /// Spawn the real account-list lookup for `preview`'s mint and patch
