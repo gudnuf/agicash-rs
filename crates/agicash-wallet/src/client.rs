@@ -31,7 +31,15 @@ use agicash_cashu::{
 use agicash_domain::{Account, AccountId, AccountState, AccountType, Currency};
 use agicash_exchange_rate::ExchangeRateProvider;
 use agicash_money::{Money, Unit};
-use agicash_traits::{CashuProvider, UserStorage};
+use agicash_traits::{CashuProvider, TokenProvider, UserStorage};
+
+/// Cfg-gated `Arc<dyn TokenProvider …>` alias the facade stores and
+/// hands to `SupabaseStorage::new`. Mirrors that ctor's own cfg:
+/// `Send + Sync` on native, neither on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+pub type TokenProviderArc = Arc<dyn TokenProvider + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+pub type TokenProviderArc = Arc<dyn TokenProvider>;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::nut02::Id as KeysetId;
 use cdk::nuts::{CurrencyUnit, Proof, Token};
@@ -58,6 +66,22 @@ pub struct WalletClient {
     pub(crate) mint_quote_service: Arc<CashuMintQuoteService>,
     pub(crate) melt_quote_service: Arc<CashuMeltQuoteService>,
     pub(crate) exchange_rate: Option<Arc<dyn ExchangeRateProvider>>,
+    /// Shared JWT provider — the SAME `Arc` `from_config` hands to
+    /// `SupabaseStorage`. Exposed via [`Self::token_provider`] so shell
+    /// code (FFI storage, Leptos realtime, CLI Supabase wiring) can
+    /// stop constructing parallel `OpenSecretTokenProvider` instances
+    /// and route through the facade's single auth surface.
+    ///
+    /// Trait-object bounds are cfg-gated to match `SupabaseStorage::new`'s
+    /// own cfg: `Send + Sync` on native, neither on wasm32 (the browser
+    /// is single-threaded; `OpenSecretTokenProvider` itself is `!Send`
+    /// there). Mirrors the same pattern `cashu_provider` / `auth` use.
+    ///
+    /// Optional because callers using [`crate::WalletClientBuilder`]
+    /// directly (test harnesses) may not have a real token provider;
+    /// they can `.token_provider(...)` an explicit stub if their tests
+    /// need it. Production `from_config` always populates this.
+    pub(crate) token_provider: Option<TokenProviderArc>,
     /// Cache layer — mirrors React's TanStack Query surface.
     ///
     /// Lazy-populated on first read of each cache slice; subsequently
@@ -128,6 +152,25 @@ impl WalletClient {
             .get_session()
             .await?
             .ok_or(WalletError::Unauthenticated)
+    }
+
+    /// Shared JWT provider — the SAME `Arc<dyn TokenProvider>` the
+    /// facade installed on its `SupabaseStorage` in
+    /// [`Self::from_config_async`] / [`Self::from_config`].
+    ///
+    /// Binding shells use this to wire their OWN storage / realtime
+    /// JWT sources off ONE auth surface (closes Defect 3 in the
+    /// session-loading audit — no more parallel shell-resident
+    /// `OpenSecretClient` instances getting out-of-sync with the
+    /// facade after `set_session` / `try_restore_session`).
+    ///
+    /// Returns `None` for wallets composed via
+    /// [`crate::WalletClientBuilder`] without an explicit
+    /// `.token_provider(...)` call (e.g. some test harnesses). Production
+    /// `from_config` / `from_config_async` always populate this.
+    #[must_use]
+    pub fn token_provider(&self) -> Option<TokenProviderArc> {
+        self.token_provider.as_ref().map(Arc::clone)
     }
 }
 
