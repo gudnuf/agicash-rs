@@ -1,10 +1,14 @@
 //! Main FFI wallet object.
 //!
-//! Holds shared `OpenSecretClient` + `SupabaseStorage` instances and a tiny
-//! in-memory session slot. Persistence lives on the Swift side: after a
-//! successful login the consumer reads `Session.refresh_token` and stores it
-//! in iOS Keychain; on subsequent app launches it calls `set_session(...)` to
-//! rehydrate the wallet before any other method.
+//! Holds a composed `WalletClient` facade + a thin shell-resident
+//! `SupabaseStorage` (built from the facade's `token_provider()` so there
+//! is ONE auth surface in the process — no parallel `OpenSecretClient`
+//! after the session-loading FFI migration). Persistence lives on the
+//! Swift side for iOS: after a successful login the consumer reads
+//! `Session.refresh_token` and stores it in iOS Keychain; on subsequent
+//! app launches it calls `set_session(...)` to rehydrate the wallet
+//! before any other method. On Android the persistence is FFI-resident
+//! (`set_session_storage_dir` + `try_restore_session`).
 //!
 //! Auth methods mirror the CLI (`crates/agicash-cli/src/auth.rs`) but return
 //! structured `Session` / `AuthStatus` values instead of printing JSON. The
@@ -22,9 +26,6 @@ use crate::receive::ReceiveResult;
 use crate::receive_flow::ReceiveFlow;
 use crate::session::{AuthStatus, Session};
 use crate::user::UserFfi;
-use agicash_auth_opensecret::{
-    auth_error_from_opensecret, OpenSecretClient, OpenSecretConfig, OpenSecretTokenProvider,
-};
 use agicash_cashu::{
     CashuMeltQuote, CashuMeltQuoteService, CashuMeltQuoteState, CashuMeltQuoteStorage,
     CashuSendSwapService, CashuSendSwapStorage, CdkCashuProvider, MeltOutcome, MeltQuoteError,
@@ -39,9 +40,9 @@ use agicash_storage_supabase::{
 };
 use agicash_traits::{
     CashuProvider, CashuProviderError, PassthroughProofEncryption, PersistedSession,
-    ProofEncryption, SessionStorage, TokenProvider, UpdateUserDefaults, UserStorage,
+    ProofEncryption, SessionStorage, UpdateUserDefaults, UserStorage,
 };
-use agicash_wallet::{SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
+use agicash_wallet::{AuthClient, SessionStorageChoice, TokenVersion, WalletClient, WalletConfig};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -94,7 +95,6 @@ where
 
 #[derive(uniffi::Object)]
 pub struct AgicashWallet {
-    client: OpenSecretClient,
     storage: Arc<SupabaseStorage>,
     // 12c Task 7: the `receive_swap_service` field was removed — Task 6
     // re-pointed `receive_flow` onto `WalletClient::receive_flow()`,
@@ -178,13 +178,14 @@ pub struct AgicashWallet {
     driver_handle: Arc<RwLock<Option<Arc<agicash_driver::DriverHandle>>>>,
     /// The composed facade — THE single composition root for this
     /// binding shell. The delegated business methods route here; the
-    /// shell-resident platform layer (the `OpenSecretClient` `client`
-    /// field, session slot, session-storage backend, realtime
-    /// supervisor, observability) stays on `self` per spec §6. Named
-    /// `facade` (not `client`) because the pre-existing
-    /// `client: OpenSecretClient` field is kept byte-for-byte for the
-    /// shell-resident methods (Hard Rule 7) and the names would clash.
-    /// The facade owns the `OpenSecretAuthClient` (via its `auth`
+    /// shell-resident platform layer (session slot, session-storage
+    /// backend, realtime supervisor, observability) stays on `self` per
+    /// spec §6. Post-session-loading-FFI migration: the shell-resident
+    /// `OpenSecretClient` is GONE. `self.storage` and the realtime JWT
+    /// and `cashu_seed` now route through the facade's shared
+    /// `Arc<dyn TokenProvider>` (via `WalletClient::token_provider`)
+    /// and `self.facade_auth` (`Arc<OpenSecretAuthClient>`). The facade
+    /// owns the `OpenSecretAuthClient` (via its `auth`
     /// `Arc<dyn AuthClient>`), so its session slot — shared with
     /// `self.session` — stays alive without a separate field.
     facade: Arc<WalletClient>,
@@ -192,10 +193,9 @@ pub struct AgicashWallet {
 
 impl std::fmt::Debug for AgicashWallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `OpenSecretClient` already redacts itself; the session is sensitive
-        // material (refresh token) so we never print its contents.
+        // The session is sensitive material (refresh token) so we never
+        // print its contents.
         f.debug_struct("AgicashWallet")
-            .field("client", &self.client)
             .field("storage", &self.storage)
             .field(
                 "session_loaded",
@@ -241,27 +241,49 @@ impl AgicashWallet {
 
         let client_id = Uuid::parse_str(&opensecret_client_id_uuid)
             .map_err(|e| FfiError::internal(format!("invalid opensecret_client_id_uuid: {e}")))?;
-        // Capture the endpoint args for the facade `from_config` BEFORE
-        // the existing wiring moves them into OpenSecretConfig /
-        // SupabaseStorageConfig. `client_id` is a `Copy` Uuid, reused
-        // directly. This dual-feeds the SAME values to both the kept
-        // (shell-resident) wiring and the new facade root with zero
-        // change to the ctor signature.
-        let opensecret_url_for_facade = opensecret_url.clone();
-        let supabase_url_for_facade = supabase_url.clone();
-        let supabase_anon_key_for_facade = supabase_anon_key.clone();
-        let auth_cfg = OpenSecretConfig {
-            base_url: opensecret_url,
-            client_id,
-        };
-        let client = OpenSecretClient::new(auth_cfg)?;
 
         let storage_cfg = SupabaseStorageConfig {
-            url: supabase_url,
-            anon_key: supabase_anon_key,
+            url: supabase_url.clone(),
+            anon_key: supabase_anon_key.clone(),
         };
-        let token_provider: Arc<dyn TokenProvider + Send + Sync> =
-            Arc::new(OpenSecretTokenProvider::new(client.clone()));
+
+        // Build the composed facade FIRST. This is THE single
+        // composition root the delegated methods route through AND the
+        // source of the shared `Arc<dyn TokenProvider>` the shell-
+        // resident `SupabaseStorage` below consumes (closes Defect 3 of
+        // the 2026-05-22 session-loading audit — no parallel
+        // `OpenSecretClient` in the FFI).
+        //
+        // `SessionStorageChoice::InMemory` matches today's construction-
+        // time state (the FFI installs Android storage post-construction
+        // via `set_session_storage_dir`, which stays shell-resident per
+        // Hard Rule 7 — at construction `session_storage` is `None`).
+        // Cold-start restore on Android runs through `try_restore_session`
+        // after `set_session_storage_dir`, which is the FFI's
+        // structural `from_config_async` auto-load equivalent.
+        let (facade, facade_auth) = WalletClient::from_config(WalletConfig {
+            opensecret_url: opensecret_url.clone(),
+            opensecret_client_id: client_id,
+            supabase_url: supabase_url.clone(),
+            supabase_anon_key: supabase_anon_key.clone(),
+            session_storage: SessionStorageChoice::InMemory,
+        })
+        .map_err(|e| FfiError::internal(format!("from_config: {e}")))?;
+
+        // Shell-resident `SupabaseStorage` for the two facade-gap
+        // operations (`get_user`, `set_default_account` →
+        // `update_user_defaults`) plus the per-account balance reads in
+        // `prepare_send_quote` / `prepare_melt_quote` / `create_melt_quote`
+        // and the underlying cashu send-swap + melt-quote stores.
+        //
+        // Built from the SAME `Arc<dyn TokenProvider>` the facade
+        // installed on its own `SupabaseStorage` (via
+        // `WalletClient::token_provider`) — ONE auth surface in the
+        // process. The previous parallel `OpenSecretTokenProvider::new(
+        // shell_client.clone())` is gone.
+        let token_provider = facade
+            .token_provider()
+            .expect("WalletClient::from_config always populates token_provider");
         let storage = Arc::new(SupabaseStorage::new(storage_cfg, token_provider)?);
 
         // Cashu wiring mirrors `crates/agicash-cli/src/composition.rs`
@@ -304,21 +326,6 @@ impl AgicashWallet {
             Arc::clone(&cashu_provider),
         ));
 
-        // Build the composed facade from the SAME inputs. This is the
-        // single composition root the delegated methods route through.
-        // `SessionStorageChoice::InMemory` matches today's construction-
-        // time state (the FFI installs Android storage post-construction
-        // via `set_session_storage_dir`, which stays shell-resident per
-        // Hard Rule 7 — at construction `session_storage` is `None`).
-        let (facade, facade_auth) = WalletClient::from_config(WalletConfig {
-            opensecret_url: opensecret_url_for_facade,
-            opensecret_client_id: client_id,
-            supabase_url: supabase_url_for_facade,
-            supabase_anon_key: supabase_anon_key_for_facade,
-            session_storage: SessionStorageChoice::InMemory,
-        })
-        .map_err(|e| FfiError::internal(format!("from_config: {e}")))?;
-
         // Load-bearing no-op invariant (spec §6 / note ‡): the shell's
         // `self.session` slot IS the facade's `OpenSecretAuthClient`
         // slot (one shared `Arc`). This is the whole point of
@@ -349,7 +356,6 @@ impl AgicashWallet {
         ));
 
         Ok(Arc::new(Self {
-            client,
             storage,
             send_swap_storage,
             send_swap_service,
@@ -396,14 +402,13 @@ impl AgicashWallet {
         )
         .await?;
         drop(contract);
-        // F9: keep the shell-resident `self.client` in session-sync with
-        // the facade. The session contract only seeds the facade's
-        // internal `OpenSecretClient`; without this call the shell client
-        // (used by `self.storage`'s token provider AND realtime's token
-        // provider) stays empty and every shell-storage / realtime path
-        // hits "No refresh token available". Mirrors the CLI fix
-        // (`dfecd5e6` — `sync_shell_client` in `composition.rs`).
-        self.sync_shell_client(&refresh_token).await?;
+        // Post-session-loading-FFI migration: `self.storage`'s token
+        // provider IS the facade's shared `Arc<dyn TokenProvider>` (via
+        // `WalletClient::token_provider`), and realtime now consumes
+        // the same `facade.token_provider()` in `start_wallet_events`.
+        // The session contract's `set_session` seeds the ONE
+        // `OpenSecretClient` behind both; no separate shell-client
+        // re-sync is needed.
         // Hard Rule 7 ‡: mirror into the shell-resident slot so realtime /
         // auth_status keep working unchanged (same write the old body did).
         *self.session.write().await = Some(PersistedSession {
@@ -498,36 +503,18 @@ impl AgicashWallet {
                     user_id: s.user_id.as_uuid(),
                     refresh_token: s.refresh_token.clone(),
                 };
-                // F9: keep the shell-resident `self.client` in session-sync
-                // with the facade on cold-start restore. The session
-                // contract only seeded the facade's internal
-                // `OpenSecretClient`; without this call the shell client
-                // (used by `self.storage`'s token provider AND realtime's
-                // token provider) stays empty and Send-post-relaunch +
-                // realtime delivery on Android fail with "No refresh
-                // token available". On shell-refresh failure we treat the
-                // restore as a stale-token (`Ok(None)`) — same shape the
-                // session contract uses internally — and clear the
-                // on-disk blob so the next launch doesn't retry a dead
-                // token. Mirrors the CLI `dfecd5e6` shape.
-                if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
-                    tracing::warn!(
-                        target: "agicash_ffi::wallet",
-                        error = %e,
-                        "try_restore_session: shell client refresh failed, treating as stale (clearing blob)"
-                    );
-                    // Roll back the facade-side restore too so we don't
-                    // leave the two clients in disagreement: clear the
-                    // shared session slot + persistence. (The contract's
-                    // internal `set_session` already succeeded against
-                    // the facade, but a stale shell refresh almost
-                    // certainly means the facade refresh used a
-                    // not-actually-stale token whose access copy will
-                    // expire; cheaper to drop and re-sign-in.)
-                    *self.session.write().await = None;
-                    self.clear_persisted_session().await;
-                    return Ok(None);
-                }
+                // Post-session-loading-FFI migration: `self.storage`'s
+                // token provider IS the facade's shared
+                // `Arc<dyn TokenProvider>` (via
+                // `WalletClient::token_provider`), and realtime now
+                // consumes the same `facade.token_provider()`. The
+                // session contract's `restore_session` already seeded
+                // the ONE `OpenSecretClient` behind both. The stale-
+                // refresh recovery the prior implementation drove via
+                // `sync_shell_client` is now folded into the contract
+                // itself — a dead refresh during `restore_session`
+                // returns `Ok(None)` with the on-disk blob cleared
+                // before we ever get here.
                 // Hard Rule 7 ‡ mirror so realtime / auth_status see it.
                 *self.session.write().await = Some(persisted.clone());
                 tracing::info!(
@@ -562,19 +549,12 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        // F9: best-effort shell-client session-sync. A failure here doesn't
-        // fail the auth — the facade-side session is already live and
-        // persisted — but matters for the same-process realtime / shell-
-        // storage paths (`prepare_send_quote`, etc.) so they don't hit
-        // "No refresh token available" on the user's first action. Same
-        // best-effort shape the CLI uses in `persist_session` (dfecd5e6).
-        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
-            tracing::warn!(
-                target: "agicash_ffi::wallet",
-                error = %e,
-                "auth_guest: shell client sync failed (continuing — facade is live)"
-            );
-        }
+        // Post-session-loading-FFI migration: `self.storage` + realtime
+        // share the facade's `Arc<dyn TokenProvider>` (via
+        // `WalletClient::token_provider`). The facade's own
+        // `auth_guest` already seeded its `OpenSecretClient`; that is
+        // the SAME client `self.storage`'s token provider consults, so
+        // no parallel shell-client sync is needed.
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -589,15 +569,8 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        // F9: best-effort shell-client session-sync. See `auth_guest` for
-        // rationale.
-        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
-            tracing::warn!(
-                target: "agicash_ffi::wallet",
-                error = %e,
-                "auth_login: shell client sync failed (continuing — facade is live)"
-            );
-        }
+        // Post-session-loading-FFI migration: shared token provider —
+        // see `auth_guest` for rationale.
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -627,15 +600,8 @@ impl AgicashWallet {
         };
         *self.session.write().await = Some(persisted.clone());
         self.persist_session(&persisted).await;
-        // F9: best-effort shell-client session-sync. See `auth_guest` for
-        // rationale.
-        if let Err(e) = self.sync_shell_client(&persisted.refresh_token).await {
-            tracing::warn!(
-                target: "agicash_ffi::wallet",
-                error = %e,
-                "auth_signup: shell client sync failed (continuing — facade is live)"
-            );
-        }
+        // Post-session-loading-FFI migration: shared token provider —
+        // see `auth_guest` for rationale.
         Ok(crate::convert::session_from_facade(s))
     }
 
@@ -1340,7 +1306,16 @@ impl AgicashWallet {
             .ok_or_else(|| FfiError::internal("no matching account for quote"))?
             .clone();
 
-        let seed = self.client.get_cashu_seed().await?;
+        // Post-session-loading-FFI migration: seed flows through the
+        // facade's shared `OpenSecretAuthClient` (the SAME auth client
+        // the facade itself uses for `cashu_seed` in `begin_send_lightning`
+        // / `poll_send_lightning`). Returns `WalletError`, routed
+        // through the centralized `wallet_error_to_ffi` mapper.
+        let seed = self
+            .facade_auth
+            .cashu_seed()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
         let outcome = self
             .melt_quote_service
             .initiate_melt(&account, quote, &seed)
@@ -1402,7 +1377,13 @@ impl AgicashWallet {
             .ok_or_else(|| FfiError::internal("no matching account for quote"))?
             .clone();
 
-        let seed = self.client.get_cashu_seed().await?;
+        // Post-session-loading-FFI migration: seed via shared auth
+        // client — see `execute_melt_quote` for rationale.
+        let seed = self
+            .facade_auth
+            .cashu_seed()
+            .await
+            .map_err(crate::convert::wallet_error_to_ffi)?;
         // Zero poll-interval + zero timeout → exactly one mint status
         // check, then return. Same "single status check" contract
         // `poll_mint_quote` gets from `poll_until_paid(0, 0)`.
@@ -1485,10 +1466,12 @@ impl AgicashWallet {
     /// caller demuxes).
     ///
     /// The supervisor runs on a tokio task; the user JWT comes from the
-    /// **same** `OpenSecretTokenProvider` the wallet builds for storage
-    /// (`new`, wrapped through `TokenProviderJwtSource`), so the
-    /// realtime `access_token` rotates with the rest of the session. A
-    /// prior subscription (if any) is replaced + aborted.
+    /// **same** shared `Arc<dyn TokenProvider>` the facade installed on
+    /// its `SupabaseStorage` (via `WalletClient::token_provider`,
+    /// wrapped through `TokenProviderJwtSource`), so the realtime
+    /// `access_token` rotates with the rest of the session — one auth
+    /// surface in the process. A prior subscription (if any) is
+    /// replaced + aborted.
     ///
     /// Errors with `FfiError::Auth { UNAUTHENTICATED }` if no session is
     /// loaded (there is no user id to scope the channel to).
@@ -1502,12 +1485,14 @@ impl AgicashWallet {
         })?;
         let user_id = session.user_id.to_string();
 
-        // Reuse the wallet's OpenSecret session: the realtime channel
-        // `access_token` is the same third-party JWT storage uses
-        // (spec §2.2/§5.6). Rebuilt from `self.client` exactly as the
-        // storage token provider is in `new`.
-        let token_provider: Arc<dyn TokenProvider + Send + Sync> =
-            Arc::new(OpenSecretTokenProvider::new(self.client.clone()));
+        // Reuse the facade's shared `Arc<dyn TokenProvider>` — the SAME
+        // `OpenSecretTokenProvider` `self.storage` consumes (spec
+        // §2.2/§5.6). Post-session-loading-FFI migration: no separate
+        // parallel `OpenSecretClient` to rebuild from.
+        let token_provider = self
+            .facade
+            .token_provider()
+            .expect("WalletClient::from_config always populates token_provider");
         let jwt: Arc<dyn agicash_realtime::client::JwtSource> = Arc::new(
             agicash_realtime::service::TokenProviderJwtSource(token_provider),
         );
@@ -1773,49 +1758,6 @@ impl AgicashWallet {
                 );
             }
         }
-    }
-
-    /// Drive the shell-resident `self.client` to a usable access token
-    /// from a refresh token (handshake → `set_tokens`(empty access,
-    /// refresh) → `refresh_token`). Mirrors `sync_shell_client` in
-    /// `agicash-cli/src/composition.rs` (`dfecd5e6`) and the Leptos
-    /// `session_seeded_opensecret_client` helper (`f89c0c79`).
-    ///
-    /// Why this exists (F9): the FFI holds TWO `OpenSecretClient`
-    /// instances with independent `Arc<OpensecretInner>` session
-    /// managers — `self.client` (built at `new`, used by `self.storage`'s
-    /// token provider AND by `start_wallet_events`' realtime token
-    /// provider) AND the facade's internal client (built inside
-    /// `WalletClient::from_config`, used by `self.facade.*` methods).
-    /// The session contract's `set_session` / `restore_session` only seed
-    /// the facade's client; the shell client stays empty unless this
-    /// helper runs. Without it on Android cold-start restore, every
-    /// shell-storage path (`prepare_send_quote`, `prepare_melt_quote`,
-    /// `start_mint_quote`, `complete_mint_quote`, `execute_melt_quote`,
-    /// `poll_*_quote`, `get_user`, `set_default_account`) and the
-    /// realtime token-mint fail with `"token provider: auth backend
-    /// error: Authentication error: No refresh token available"` (F9
-    /// Send-post-relaunch + realtime delivery divergence symptoms).
-    ///
-    /// On `refresh_token()` failure we surface the error to the caller
-    /// (which on the restore path treats it the same way the session
-    /// contract treats a stale token — `Ok(None)` + clear-on-disk via
-    /// the contract's own path); we deliberately do NOT clear the shell
-    /// session slot here because the facade slot owns lifecycle (`set_session`
-    /// already mirrors into `self.session` and the contract enforces
-    /// clear-on-fail for the facade).
-    async fn sync_shell_client(&self, refresh_token: &str) -> Result<(), FfiError> {
-        self.client.ensure_handshake().await?;
-        self.client
-            .inner()
-            .set_tokens(String::new(), Some(refresh_token.to_string()))
-            .map_err(|e| FfiError::from(auth_error_from_opensecret(e)))?;
-        self.client
-            .inner()
-            .refresh_token()
-            .await
-            .map_err(|e| FfiError::from(auth_error_from_opensecret(e)))?;
-        Ok(())
     }
 }
 
