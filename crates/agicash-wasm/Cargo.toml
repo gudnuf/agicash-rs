@@ -35,6 +35,11 @@ uuid = { workspace = true }
 # Guest-registration RNG path on wasm needs the `js` getrandom backend
 # (same as agicash-web-leptos). Additive feature; safe.
 getrandom = { workspace = true, features = ["js"] }
+# wasm-safe tokio surface only — `sync` for the async `Mutex` the
+# receive-flow handle holds across `.await` (the FFI uses the same
+# tokio Mutex; std::sync::Mutex isn't `.await`-safe). Mirrors the
+# target-gated tokio feature set in `agicash-cashu/Cargo.toml`.
+tokio = { version = "1.42", default-features = false, features = ["sync"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

@@ -14,6 +14,8 @@ mod native_stub {
 #[cfg(target_arch = "wasm32")]
 mod convert;
 #[cfg(target_arch = "wasm32")]
+mod receive_flow;
+#[cfg(target_arch = "wasm32")]
 mod types;
 
 #[cfg(target_arch = "wasm32")]
@@ -260,9 +262,41 @@ mod wasm_impl {
                 .map_err(crate::convert::wallet_error_to_js)?;
             Ok(crate::convert::auth_status_from_facade(&s))
         }
+
+        /// Construct a fresh interactive receive-flow handle. Mirrors
+        /// the FFI `AgicashWallet::receive_flow` accessor
+        /// (`crates/agicash-ffi/src/wallet.rs:896`). Each call returns
+        /// a new orchestrator — flows are not persisted across
+        /// constructions.
+        ///
+        /// The returned `AgicashReceiveFlow` exposes the
+        /// `Idle → Parsing → NeedsMintConfirmation → AddingMint →
+        /// Swapping → Done | AlreadyClaimed | Failed` state machine
+        /// the Leptos `cashu_token_paste_view` switches on (mirrors
+        /// the iOS + Android wiring that already shipped against the
+        /// FFI surface). The service is built by
+        /// `WalletClient::receive_flow()` from the facade's deps —
+        /// session-threading is the facade's job (it calls
+        /// `require_session()` and returns
+        /// `WalletError::Unauthenticated` if the wallet's session slot
+        /// is empty, so the Leptos consumer must `setSession` first,
+        /// exactly as iOS does on the FFI side).
+        #[wasm_bindgen(js_name = makeReceiveFlow)]
+        pub async fn make_receive_flow(
+            &self,
+        ) -> Result<crate::receive_flow::AgicashReceiveFlow, JsValue> {
+            let service = self
+                .client
+                .receive_flow()
+                .await
+                .map_err(crate::convert::wallet_error_to_js)?;
+            Ok(crate::receive_flow::AgicashReceiveFlow::new(service))
+        }
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub use receive_flow::AgicashReceiveFlow;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_impl::AgicashWasmWallet;
 
@@ -271,8 +305,9 @@ pub use wasm_impl::AgicashWasmWallet;
 // Mirrors how the FFI crate re-exports its `*Ffi` records.
 #[cfg(target_arch = "wasm32")]
 pub use types::{
-    AccountWasm, AuthStatusWasm, ReceiveResultWasm, ReceiveStatusWasm, SendClaimStateWasm,
-    SendClaimStatusWasm, SendQuotePreviewWasm, SendSwapHandleWasm, SessionWasm,
+    AccountWasm, AlreadyClaimedInfoWasm, AuthStatusWasm, MintConfirmationWasm,
+    ReceiveFlowResultWasm, ReceiveFlowStateWasm, ReceiveResultWasm, ReceiveStatusWasm,
+    SendClaimStateWasm, SendClaimStatusWasm, SendQuotePreviewWasm, SendSwapHandleWasm, SessionWasm,
 };
 
 use wasm_bindgen::prelude::*;

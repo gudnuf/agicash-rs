@@ -172,6 +172,98 @@ pub struct SendClaimStatusWasm {
     pub failure_reason: Option<String>,
 }
 
+// ---- receive-flow surface ----
+//
+// Mirror of FFI `receive_flow::*Ffi` (`crates/agicash-ffi/src/receive_flow.rs`).
+// The flow's data-carrying state + event enums cannot be expressed as
+// `#[wasm_bindgen]` C-like enums (wasm-bindgen does not support
+// variant-payload enums). Instead they round-trip as JSON `JsValue`s
+// via `serde_wasm_bindgen` — the same idiom `listAccounts` uses for
+// `Vec<AccountWasm>`. The wasm shell exposes individual event methods
+// (`start`, `confirmAddMint`, …) rather than a single `dispatch(event)`
+// so the JS side never constructs a tagged-union by hand. State
+// returns from each method as a tagged-discriminator JSON object the
+// Leptos `match` arms branch on (`{ "kind": "needsMintConfirmation",
+// "confirmation": {…} }` etc.).
+
+/// JSON-shaped mirror of `MintConfirmation` /
+/// FFI `MintConfirmationFfi`. Field set + types verbatim the FFI
+/// record; emitted/consumed via `serde_wasm_bindgen`. Not
+/// `#[wasm_bindgen]` — only the outer state envelope crosses the
+/// boundary as JSON.
+#[derive(Clone, Debug, Serialize)]
+pub struct MintConfirmationWasm {
+    pub mint_url: String,
+    pub mint_name: String,
+    pub unit: String,
+    pub currency: String,
+    pub amount: String,
+    pub fee: String,
+}
+
+/// JSON-shaped mirror of `AlreadyClaimedInfo` /
+/// FFI `AlreadyClaimedInfoFfi`. Deliberately omits any amount field —
+/// see the inner type's doc for the rationale.
+#[derive(Clone, Debug, Serialize)]
+pub struct AlreadyClaimedInfoWasm {
+    pub unit: String,
+    pub currency: String,
+    pub account_id: String,
+    pub mint_url: String,
+    pub token_hash: String,
+}
+
+/// JSON-shaped mirror of `ReceiveFlowResult` /
+/// FFI `ReceiveFlowResultFfi`. Status is the SAME `ReceiveStatusWasm`
+/// enum the one-shot `receiveToken` surface uses, so Leptos can
+/// `match` on a single `status` shape across both code paths.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReceiveFlowResultWasm {
+    pub status: ReceiveStatusWasm,
+    pub amount: String,
+    pub fee: String,
+    pub unit: String,
+    pub currency: String,
+    pub account_id: String,
+    pub mint_url: String,
+    pub token_hash: String,
+}
+
+/// JSON-shaped mirror of `ReceiveFlowState` /
+/// FFI `ReceiveFlowStateFfi`. Tagged-union JSON shape:
+/// `{ "kind": "<variant>", …payload }`. Variant tags + payloads track
+/// the FFI surface 1:1 (`Idle`, `Parsing`,
+/// `NeedsMintConfirmation { confirmation }`, `AddingMint { mint_url
+/// }`, `Swapping { account_id, mint_url }`, `Done { result }`,
+/// `AlreadyClaimed { info }`, `Failed { reason, code }`); see
+/// `crates/agicash-ffi/src/receive_flow.rs::ReceiveFlowStateFfi`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ReceiveFlowStateWasm {
+    Idle,
+    Parsing,
+    NeedsMintConfirmation {
+        confirmation: MintConfirmationWasm,
+    },
+    AddingMint {
+        mint_url: String,
+    },
+    Swapping {
+        account_id: String,
+        mint_url: String,
+    },
+    Done {
+        result: ReceiveFlowResultWasm,
+    },
+    AlreadyClaimed {
+        info: AlreadyClaimedInfoWasm,
+    },
+    Failed {
+        reason: String,
+        code: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
