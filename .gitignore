@@ -47,6 +47,12 @@ result-*
 /target-devsim
 /crates/target
 /crates/**/pkg
+
+# Leptos PWA — Tailwind v4 OUTPUT (`style/main.css`). The input file
+# `style/tailwind.in.css` IS tracked; the output is regenerated on every
+# `aweb` from the input + `src/**/*.rs` class strings. See
+# `nix/shells/default.nix#aweb` for the pipeline.
+/crates/agicash-web-leptos/style/main.css
 # Per-machine cargo cache config (shared CARGO_TARGET_DIR + sccache wrapper).
 # Generated locally for cross-worktree build caching; absolute macOS paths
 # inside break CI on Linux runners. See feedback_dev_loop_cache memory note.

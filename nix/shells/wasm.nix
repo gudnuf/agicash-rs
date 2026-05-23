@@ -28,6 +28,14 @@ pkgs.mkShell {
     pkgs.wasm-bindgen-cli_0_2_121
     pkgs.binaryen
     pkgs.nodejs_22
+    # `bun` provides the `bunx` runner used by the leptos PWA build to
+    # invoke `@tailwindcss/cli` (Tailwind v4) on `style/tailwind.in.css`,
+    # producing `style/main.css`. Pinned through nixpkgs (matches the
+    # `nodejs_22` precedent) so the dev loop stays reproducible across
+    # machines instead of relying on whatever `bun` the operator happens
+    # to have on $PATH. The `aweb` script-bin in `default.nix` runs the
+    # Tailwind step before `wasm-pack build`.
+    pkgs.bun
     pkgs.clang_21
     pkgs.llvm_21
   ];
@@ -65,6 +73,7 @@ pkgs.mkShell {
       echo "  wasm-pack:    $(wasm-pack --version 2>/dev/null || echo 'not found')"
       echo "  wasm-bindgen: $(wasm-bindgen --version 2>/dev/null || echo 'not found')"
       echo "  wasm-opt:     $(wasm-opt --version 2>/dev/null | head -1 || echo 'not found')"
+      echo "  bun:          $(bun --version 2>/dev/null || echo 'not found')"
       echo "  CC (wasm32):  $CC_wasm32_unknown_unknown"
     fi
   '';

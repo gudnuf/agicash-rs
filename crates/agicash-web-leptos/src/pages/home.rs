@@ -109,24 +109,15 @@ pub fn HomePage() -> impl IntoView {
 
     let accounts = wallet.accounts;
 
-    let page_style = format!(
-        "display:flex; flex-direction:column; align-items:center; \
-         justify-content:space-between; flex:1; \
-         padding:{} {} {} {}; gap:{};",
-        // iOS uses Spacing.hero (48px) above the hero and Spacing.xxl
-        // below the action grid (.padding(.bottom, .xxl)). Side padding
-        // matches the L (16px) default. The space-between layout pushes
-        // the action grid toward the bottom of the available area while
-        // the hero floats up.
-        tokens::SPACE_HERO,
-        tokens::SPACE_L,
-        tokens::SPACE_XXL,
-        tokens::SPACE_L,
-        tokens::SPACE_XXXL,
-    );
+    // Page shell is now Tailwind v4. iOS uses Spacing.hero (48px) above
+    // the hero and Spacing.xxl (24px) below; side padding matches the L
+    // (16px) default. Tailwind's `pt-12` = 48px, `pb-6` = 24px, `px-4`
+    // = 16px; `gap-8` = 32px (= Spacing.xxxl). The space-between layout
+    // pushes the action grid toward the bottom of the available area
+    // while the hero floats up.
 
     view! {
-        <div style=page_style>
+        <div class="flex flex-col items-center justify-between flex-1 pt-12 px-4 pb-6 gap-8">
             {move || match accounts.get() {
                 LoadState::Idle | LoadState::Loading => {
                     Either::Left(view! { <BalanceLoading/> })

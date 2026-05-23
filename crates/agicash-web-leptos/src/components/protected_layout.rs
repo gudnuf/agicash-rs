@@ -27,7 +27,6 @@ use leptos_router::NavigateOptions;
 
 use crate::app::{AccessToken, SessionRehydrating};
 use crate::components::{BottomNav, RealtimeStatusBanner};
-use crate::tokens;
 
 #[component]
 pub fn ProtectedLayout() -> impl IntoView {
@@ -55,29 +54,27 @@ pub fn ProtectedLayout() -> impl IntoView {
         }
     });
 
-    let shell_style = format!(
-        "display:flex; flex-direction:column; min-height:100dvh; \
-         background:{}; color:{}; font-family:{};",
-        tokens::COLOR_BACKGROUND,
-        tokens::COLOR_FOREGROUND,
-        tokens::FONT_PRIMARY,
-    );
-
-    // Content area pads the bottom by the nav height so fixed nav doesn't
-    // occlude scrolled content. Nav height = 64px (8 + 40 button + 16).
-    let content_style = "flex:1 1 auto; padding-bottom:64px; \
-        display:flex; flex-direction:column;"
-        .to_string();
+    // Shell + content padding are now expressed as Tailwind v4 classes
+    // resolved against the design-token bundle in
+    // `style/tailwind.in.css`. `bg-background` + `text-foreground` pick
+    // up the BTC-track palette via the `.btc` class on `<body>` (see
+    // `index.html`). `min-h-dvh` matches the previous inline
+    // `min-height:100dvh`. `font-mono` resolves to `var(--font-mono)`,
+    // which the Tailwind input rebinds to "Kode Mono" via the
+    // `--font-primary` theme token (loaded from Google Fonts in
+    // `index.html`). The `pb-16` on the content area reserves room for
+    // the fixed `BottomNav` (64px = 16 spacing units), same intent as
+    // the previous inline padding-bottom:64px.
 
     view! {
-        <div style=shell_style>
+        <div class="flex flex-col min-h-dvh bg-background text-foreground font-mono">
             // Connection-status strip: hidden in the steady-state
             // `Subscribed` (and first-paint Idle/Connecting) case, so
             // it adds zero chrome cost when realtime is healthy. See
             // `RealtimeStatusBanner` for the visual states + retry
             // affordance.
             <RealtimeStatusBanner/>
-            <div style=content_style>
+            <div class="flex flex-col flex-1 pb-16">
                 <Outlet/>
             </div>
             <BottomNav/>

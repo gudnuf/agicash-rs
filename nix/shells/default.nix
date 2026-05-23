@@ -31,17 +31,33 @@ let
   agicashBins = [
     (mkAgicashBin "acli"         ''exec cargo run --manifest-path "$manifest" -p agicash-cli -- "$@"'')
     (mkAgicashBin "acli_keyring" ''exec cargo run --manifest-path "$manifest" -p agicash-cli --features keyring-storage -- "$@"'')
-    # `aweb` builds the leptos PWA wasm bundle via wasm-pack and
-    # (optionally) serves the crate dir as static files. The old SSR
-    # path (cargo-leptos + axum) was ripped on 2026-05-17 in favour of
-    # a pure CSR cdylib + browser-side opensecret calls. Run `aweb` to
-    # one-shot build; pass `--serve` to also start a
-    # `python3 -m http.server 3000` from the crate dir. The crate dir
-    # is the static-files root: index.html, style/, public/, and
-    # wasm-pack's pkg/ all live there. Note this needs the wasm dev
-    # shell — run `nix develop .#wasm` first.
+    # `aweb` builds the leptos PWA in two stages:
+    #
+    #   1. Tailwind v4 CSS — `bunx @tailwindcss/cli` scans `src/**/*.rs`
+    #      for class strings and emits `style/main.css` from
+    #      `style/tailwind.in.css` (the verbatim port of the React app's
+    #      `app/tailwind.css`). Bun is pinned in `wasm.nix`. The first
+    #      invocation downloads the `@tailwindcss/cli` package into the
+    #      crate's local `node_modules` (bun's cache); subsequent runs
+    #      are warm and finish in ~100ms.
+    #   2. `wasm-pack build --target web --out-dir pkg --dev` — builds
+    #      the cdylib + js glue for browser CSR. The old SSR path
+    #      (cargo-leptos + axum) was ripped on 2026-05-17 in favour of
+    #      pure CSR + browser-side opensecret calls.
+    #
+    # `--serve` additionally starts `python3 -m http.server 3000` from
+    # the crate dir. The crate dir is the static-files root: index.html,
+    # style/, public/, and wasm-pack's pkg/ all live there.
+    #
+    # Needs the wasm devshell — run `nix develop .#wasm` first.
     (mkAgicashBin "aweb" ''
       crate="$root/crates/agicash-web-leptos"
+      tw_version="@tailwindcss/cli@4.1.18"
+      (cd "$crate" \
+        && bunx "$tw_version" \
+             -i style/tailwind.in.css \
+             -o style/main.css \
+             --content "src/**/*.rs") || exit $?
       (cd "$crate" && wasm-pack build --target web --out-dir pkg --dev) || exit $?
       if [ "''${1:-}" = "--serve" ]; then
         (cd "$crate" && exec python3 -m http.server 3000)
