@@ -5,9 +5,10 @@
 //!     1. `agicash auth guest` registers a guest user against the local
 //!        `OpenSecret` enclave (`OPENSECRET_BASE_URL`) and stores the refresh
 //!        token in the keyring.
-//!     2. A fresh process runs `agicash account list`. `composition::
-//!        rehydrate_session()` reads the refresh token from the keyring,
-//!        runs `refresh_token()` on the in-memory SDK, then
+//!     2. A fresh process runs `agicash account list`.
+//!        `WalletClient::from_config_async` auto-loads the refresh token
+//!        from the keyring (via `SessionStorageChoice::Custom(keyring)`),
+//!        runs the `OpenSecret` handshake + refresh, then
 //!        `OpenSecretTokenProvider::get_jwt()` mints a third-party JWT.
 //!     3. `SupabaseStorage` attaches that JWT as the `Authorization`
 //!        bearer; local Supabase verifies it with HS256 against the JWT
@@ -35,8 +36,9 @@ mod gated {
     use super::common::*;
 
     /// `auth guest` → `account list` end-to-end, no service-role shortcut.
-    /// A fresh process for `account list` exercises the keyring-rehydration
-    /// path (see `composition::rehydrate_session`).
+    /// A fresh process for `account list` exercises the keyring auto-load
+    /// path inside `WalletClient::from_config_async` (via
+    /// `SessionStorageChoice::Custom(keyring)`).
     #[test]
     fn account_list_e2e_against_real_auth_chain() {
         if !env_ready() {

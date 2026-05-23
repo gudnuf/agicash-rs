@@ -16,7 +16,7 @@ use agicash_traits::{AuthError, StorageError};
 use auth::AuthCmdError;
 use clap::Parser;
 use cli::{AccountCommand, AuthCommand, Cli, Command, MintCommand, ReceiveCommand, SendCommand};
-use composition::{build_deps, rehydrate_session};
+use composition::build_deps;
 use decode::DecodeCmdError;
 use mint::MintCmdError;
 use receive::ReceiveCmdError;
@@ -258,16 +258,19 @@ async fn run(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Single composition root: the `WalletClient` facade via
-    // `from_config` (+ the CLI-shell-resident keyring & thin
-    // UserStorage handle), all wired from one endpoint config.
+    // `from_config_async` (+ the CLI-shell-resident keyring handle for
+    // the `auth` subcommands & thin `UserStorage` handle for the two
+    // `account` ops the facade does not surface), all wired from one
+    // endpoint config.
+    //
+    // `from_config_async` auto-loads any persisted session from the
+    // keyring into the facade's in-memory slot on the way out, so every
+    // subcommand inherits a live session across processes without a
+    // separate `rehydrate_session` two-step. A stale refresh token
+    // causes `build_deps` to clear the keyring and re-compose against
+    // an empty session — `auth status`/`auth logout` then run and
+    // report the resulting logged-out state, matching prior behavior.
     let deps = build_deps().await?;
-    // Hydrate the facade session from the keyring once at startup so
-    // every subcommand inherits a live session when one persists across
-    // processes. `set_session` (inside the facade) does the OpenSecret
-    // handshake+refresh; a failed refresh clears the keyring inside the
-    // helper; we swallow the error so `auth status`/`auth logout` still
-    // run and report the resulting logged-out state.
-    let _ = rehydrate_session(&deps).await;
 
     match args.cmd {
         Some(Command::Version | Command::Decode { .. }) => unreachable!("handled above"),

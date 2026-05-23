@@ -1,37 +1,36 @@
 //! CLI composition root.
 //!
-//! Single composition root: [`WalletClient::from_config`] — the SAME
-//! `from_config` the FFI shell consumes (spec §6 platform-layer
-//! carve-out). The CLI is a real client, so it takes the real
-//! OpenSecret/Supabase/CDK path; the eight bespoke `build_*` dep-bundle
-//! functions + the contained per-flow duplicate that previously
-//! re-wired Supabase/OpenSecret/CDK by hand are gone.
+//! Single composition root: [`WalletClient::from_config_async`] — the SAME
+//! `from_config_async` the FFI/Leptos shells will consume (spec §6
+//! platform-layer carve-out, session-loading-full-shape plan 2026-05-22).
+//! The CLI is a real client, so it takes the real OpenSecret/Supabase/CDK
+//! path; the eight bespoke `build_*` dep-bundle functions + the per-flow
+//! duplicate that re-wired Supabase/OpenSecret/CDK by hand are gone.
 //!
 //! Two things stay CLI-shell-resident, exactly mirroring how the FFI
 //! shell keeps its own `storage` handle alongside the `facade`:
 //!
-//! 1. **Keyring session persistence.** `from_config` only installs an
-//!    `InMemory` (or Android) session slot. The CLI is a fresh process
-//!    per invocation, so it owns persistence the way the iOS shell owns
-//!    Keychain: the keyring backend is selected here, the session is
-//!    rehydrated into the facade on startup
-//!    ([`rehydrate_session`]) via `WalletClient::set_session`, and the
-//!    keyring is written/cleared by the `auth` subcommands.
+//! 1. **Keyring session persistence.** The CLI is a fresh process per
+//!    invocation, so it owns persistence the way the iOS shell owns
+//!    Keychain. The same keyring `Arc` is handed to the facade via
+//!    `SessionStorageChoice::Custom(keyring)` (so `from_config_async`
+//!    auto-loads any persisted session on the way out) AND retained on
+//!    [`CliDeps`] so the `auth` subcommands can read/clear/persist
+//!    directly.
 //! 2. **A thin `UserStorage` handle.** `account list` emits the raw
-//!    `Account` rows and `account default` calls
-//!    `update_user_defaults` — neither is on the facade surface (the
-//!    facade's `set_default_account` is `Unsupported` in slice 12).
-//!    Built from the SAME endpoint config so there is exactly one
-//!    wiring of `OpenSecret` + `Supabase`, no duplicate.
+//!    `Account` rows and `account default` calls `update_user_defaults`
+//!    — neither is on the facade surface (the facade's
+//!    `set_default_account` is `Unsupported` in slice 12). Built from
+//!    the SAME `Arc<dyn TokenProvider>` the facade installed on its
+//!    `SupabaseStorage` (via [`WalletClient::token_provider`]) — there
+//!    is exactly one auth surface in the process, no parallel
+//!    `OpenSecretClient`.
 
 #[cfg(feature = "keyring-storage")]
 use agicash_auth_opensecret::KeyringSessionStorage;
-use agicash_auth_opensecret::{
-    auth_error_from_opensecret, InMemorySessionStorage, OpenSecretClient, OpenSecretConfig,
-    OpenSecretTokenProvider, DEFAULT_SERVICE,
-};
+use agicash_auth_opensecret::{InMemorySessionStorage, OpenSecretConfig, DEFAULT_SERVICE};
 use agicash_storage_supabase::{SupabaseStorage, SupabaseStorageConfig};
-use agicash_traits::{AuthError, PersistedSession, SessionStorage, StorageError, TokenProvider};
+use agicash_traits::{AuthError, PersistedSession, SessionStorage, StorageError};
 use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig, WalletError};
 use std::sync::Arc;
 
@@ -45,14 +44,6 @@ pub struct CliDeps {
     pub wallet: Arc<WalletClient>,
     pub keyring: Arc<dyn SessionStorage>,
     pub user_storage: Arc<SupabaseStorage>,
-    /// The shell-resident `OpenSecretClient` that backs `user_storage`'s
-    /// token provider. Distinct from the facade's internal client (the
-    /// facade does not expose its own — spec §6 keeps the platform layer
-    /// shell-resident). Kept in session-sync with the facade by
-    /// [`rehydrate_session`] running the SAME handshake + `set_tokens` +
-    /// refresh the pre-migration `auth::rehydrate_session` ran, so the
-    /// two facade-gap `account` ops stay authenticated.
-    os_client: OpenSecretClient,
 }
 
 impl std::fmt::Debug for CliDeps {
@@ -81,42 +72,80 @@ impl From<WalletError> for CompositionError {
 /// `OPENSECRET_CLIENT_ID`, `SUPABASE_URL`/`VITE_SUPABASE_URL`,
 /// `SUPABASE_ANON_KEY`/`VITE_SUPABASE_ANON_KEY`).
 ///
-/// The facade is constructed through [`WalletClient::from_config`] with
-/// `SessionStorageChoice::InMemory` — identical to the FFI shell. The
-/// keyring backend (selected via the same fallback chain the CLI always
-/// used) lives on the shell side and is consulted by
-/// [`rehydrate_session`] + the `auth` subcommands.
+/// The facade is constructed through [`WalletClient::from_config_async`]
+/// with `SessionStorageChoice::Custom(keyring)` so a persisted session
+/// is auto-loaded into the in-memory slot on the way out — no separate
+/// `rehydrate_session` two-step. The same keyring `Arc` is retained on
+/// [`CliDeps`] for the `auth` subcommands.
+///
+/// **Failure policy (clear-on-stale):** if the auto-load step inside
+/// `from_config_async` fails (stale refresh token, transient auth
+/// backend error), this clears the keyring entry and re-constructs the
+/// wallet against an empty session. Matches the pre-migration
+/// `auth::rehydrate_session` "dead refresh token doesn't get retried"
+/// semantic exactly. Genuine env/wiring errors (bad config, no
+/// reachable `OpenSecret`) still propagate.
 pub async fn build_deps() -> Result<CliDeps, CompositionError> {
     let os_cfg = OpenSecretConfig::from_env()?;
     let sb_cfg = SupabaseStorageConfig::from_env()?;
+    let keyring = build_session_storage().await;
 
-    let (wallet, _facade_auth) = WalletClient::from_config(WalletConfig {
+    let make_cfg = || WalletConfig {
         opensecret_url: os_cfg.base_url.clone(),
         opensecret_client_id: os_cfg.client_id,
         supabase_url: sb_cfg.url.clone(),
         supabase_anon_key: sb_cfg.anon_key.clone(),
-        session_storage: SessionStorageChoice::InMemory,
-    })?;
+        session_storage: SessionStorageChoice::Custom(Arc::clone(&keyring)),
+    };
+
+    let (wallet, _facade_auth) = match WalletClient::from_config_async(make_cfg()).await {
+        Ok(out) => out,
+        Err(e) if is_stale_session_error(&e) => {
+            // Stale persisted session (refresh token rejected, auth
+            // backend blip). Clear the keyring so a dead token isn't
+            // retried, then re-compose with an empty session — same
+            // behavior as the pre-migration `rehydrate_session` swallow
+            // + clear path.
+            if let Err(clear_err) = keyring.clear().await {
+                eprintln!("warning: could not clear stale session: {clear_err}");
+            }
+            WalletClient::from_config_async(make_cfg()).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     // Thin shell-resident UserStorage handle for the two `account`
     // operations the facade doesn't surface (raw account list +
-    // update_user_defaults). Same endpoint config — no duplicate
-    // composition of the network stack. The shell `OpenSecretClient` is
-    // retained so `rehydrate_session` can drive its token refresh in
-    // lockstep with the facade (the facade does not expose its own).
-    let os_client = OpenSecretClient::new(os_cfg)?;
-    let token_provider: Arc<dyn TokenProvider + Send + Sync> =
-        Arc::new(OpenSecretTokenProvider::new(os_client.clone()));
+    // update_user_defaults). Built from the SAME `Arc<dyn TokenProvider>`
+    // the facade installed on its own `SupabaseStorage` — one auth surface
+    // in the process, no parallel `OpenSecretClient`.
+    let token_provider = wallet
+        .token_provider()
+        .expect("WalletClient::from_config_async always populates token_provider");
     let user_storage = Arc::new(SupabaseStorage::new(sb_cfg, token_provider)?);
-
-    let keyring = build_session_storage().await;
 
     Ok(CliDeps {
         wallet,
         keyring,
         user_storage,
-        os_client,
     })
+}
+
+/// Classify a `from_config_async` error as a stale-session failure (the
+/// persisted refresh token was rejected during auto-load) vs. a genuine
+/// env/wiring failure (bad config, unreachable `OpenSecret`).
+///
+/// Only the former should trigger keyring-clear + retry. The auth-load
+/// path in `from_config_async` routes `set_session` failures through
+/// `From<AuthError> for WalletError`, producing `Unauthenticated`,
+/// `Auth { code, .. }`, or `Network(_)` — exactly the three this matches.
+/// Other variants (e.g. `Storage`, `Internal`) are wiring problems we
+/// don't try to recover from by clearing the keyring.
+fn is_stale_session_error(e: &WalletError) -> bool {
+    matches!(
+        e,
+        WalletError::Unauthenticated | WalletError::Auth { .. } | WalletError::Network(_)
+    )
 }
 
 /// Resolve a [`SessionStorage`] backend via the fallback chain (verbatim
@@ -172,78 +201,12 @@ async fn probe_keyring(storage: &KeyringSessionStorage) -> Result<(), String> {
     }
 }
 
-/// Drive the shell-resident `OpenSecretClient` to a usable access token
-/// from a refresh token — VERBATIM the pre-migration
-/// `auth::rehydrate_session` body (handshake → `set_tokens`(empty
-/// access, refresh) → `refresh_token`). The facade owns its own client (sessioned
-/// separately via `WalletClient::set_session` / `auth_*`); this keeps the
-/// shell client — which backs the two facade-gap `account` ops — in
-/// session-sync. `clear_on_fail` wipes the keyring entry on a dead
-/// refresh token (same as the prior behavior) so it isn't retried.
-async fn sync_shell_client(
-    deps: &CliDeps,
-    refresh_token: &str,
-    clear_on_fail: bool,
-) -> Result<(), AuthError> {
-    deps.os_client.ensure_handshake().await?;
-    deps.os_client
-        .inner()
-        .set_tokens(String::new(), Some(refresh_token.to_string()))
-        .map_err(auth_error_from_opensecret)?;
-    if let Err(e) = deps.os_client.inner().refresh_token().await {
-        if clear_on_fail {
-            if let Err(clear_err) = deps.keyring.clear().await {
-                eprintln!("warning: could not clear stale session: {clear_err}");
-            }
-        }
-        return Err(auth_error_from_opensecret(e));
-    }
-    Ok(())
-}
-
-/// Load any persisted refresh token from the shell keyring into BOTH the
-/// facade and the shell `OpenSecretClient` so every subcommand inherits
-/// a live session across processes.
-///
-/// The facade's `WalletClient::set_session` performs its own `OpenSecret`
-/// handshake → `set_tokens` → `refresh_token` (byte-identical to the old
-/// `deps.client` body); `sync_shell_client` runs the SAME sequence on
-/// the shell client that backs `account list`/`default`. On refresh
-/// failure the keyring entry is wiped so a dead token isn't retried —
-/// same as the pre-migration `auth::rehydrate_session`.
-///
-/// Returns `true` if a session was hydrated, `false` if the keyring was
-/// empty.
-pub async fn rehydrate_session(deps: &CliDeps) -> Result<bool, AuthError> {
-    let Some(persisted) = deps.keyring.load().await? else {
-        return Ok(false);
-    };
-
-    if let Err(e) = deps
-        .wallet
-        .set_session(Session {
-            user_id: agicash_domain::UserId::from(persisted.user_id),
-            refresh_token: persisted.refresh_token.clone(),
-        })
-        .await
-    {
-        if let Err(clear_err) = deps.keyring.clear().await {
-            eprintln!("warning: could not clear stale session: {clear_err}");
-        }
-        return Err(wallet_err_to_auth(e));
-    }
-
-    sync_shell_client(deps, &persisted.refresh_token, true).await?;
-
-    Ok(true)
-}
-
 /// Persist a freshly-issued session into the shell keyring (the CLI's
 /// equivalent of the iOS shell writing the refresh token to Keychain
-/// after an `auth_*` call) AND sync the shell `OpenSecretClient` so
-/// `account` ops work in the SAME process right after `auth guest/login`
-/// (no second invocation needed — matches the pre-migration behavior
-/// where one client served everything).
+/// after an `auth_*` call). The facade's session slot was already
+/// populated by `auth_guest`/`auth_login`/`auth_signup` itself; this
+/// writes through to durable storage so the NEXT process inherits the
+/// session via `from_config_async`'s auto-load.
 pub async fn persist_session(deps: &CliDeps, session: &Session) -> Result<(), AuthError> {
     deps.keyring
         .store(&PersistedSession {
@@ -251,10 +214,6 @@ pub async fn persist_session(deps: &CliDeps, session: &Session) -> Result<(), Au
             refresh_token: session.refresh_token.clone(),
         })
         .await?;
-    // Best-effort: a fresh auth_* already sessioned the facade client; a
-    // refresh-failure here shouldn't fail the auth command (the keyring
-    // write — the durable cross-process source of truth — succeeded).
-    let _ = sync_shell_client(deps, &session.refresh_token, false).await;
     Ok(())
 }
 
