@@ -40,7 +40,7 @@ tokio = { workspace = true, features = ["sync"] }
 tokio = { version = "1.42", default-features = false, features = ["sync", "macros", "time"] }
 
 [features]
-default = []
+default = ["keyring-storage"]
 # Re-export of `agicash-auth-opensecret`'s `android-file-storage` feature.
 # The `AndroidFileSessionStorage` type `from_config` installs for the
 # `SessionStorageChoice::Android` arm lives behind this feature. It is not
@@ -51,6 +51,15 @@ default = []
 # bindings wrapper enables this on the agicash-ffi dep; iOS + tests leave
 # it off (the cfg-not branch falls back to InMemory).
 android-file-storage = ["agicash-auth-opensecret/android-file-storage"]
+# Re-export of `agicash-auth-opensecret`'s `keyring-storage` feature.
+# Gates the `SessionStorageChoice::Keyring` variant — passing that variant
+# without this feature on is a compile error (operator decision, 2026-05-22).
+# Default-off here: the CLI shell explicitly enables it; the FFI / wasm /
+# Leptos shells deliberately do not. (`agicash-auth-opensecret` itself
+# defaults the feature on, but cargo feature unification means turning it
+# on in CLI doesn't break wasm builds — the `keyring` crate is `cfg`-gated
+# off wasm32 inside `storage.rs`.)
+keyring-storage = ["agicash-auth-opensecret/keyring-storage"]
 # Tier 2 real-service e2e (tests/tier2_e2e.rs). Opt-in, native/local-only:
 # enables the `agicash-testing` ServiceHarness (real cdk-mintd + real
 # OpenSecret enclave, no docker). Without it tier2_e2e.rs compiles to a
