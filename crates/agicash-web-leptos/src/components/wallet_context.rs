@@ -441,7 +441,6 @@ impl WalletData {
             use agicash_realtime::{
                 TokenProviderJwtSource, WalletRealtimeEvent, WalletRealtimeService,
             };
-            use agicash_traits::TokenProvider;
 
             let Some(config) = config else {
                 // No config off-owner → realtime can't authenticate and
@@ -504,7 +503,12 @@ impl WalletData {
                 //    single composition root: cache + driver + apply
                 //    pump + dispatch pump + populate all share this
                 //    `Arc<WalletClient>`. The cache lives inside.
-                let wallet_client = match build_wallet_client(&config, uid).await {
+                //    `build_wallet_client` uses
+                //    `WalletClient::from_config_async` with
+                //    `SessionStorageChoice::Browser`, so the persisted
+                //    refresh token is auto-loaded into the wallet's
+                //    in-memory slot before the wallet is returned.
+                let wallet_client = match build_wallet_client(&config).await {
                     Ok(c) => c,
                     Err(e) => {
                         leptos::logging::log!("WalletData::start: wallet client build failed: {e}");
@@ -518,20 +522,29 @@ impl WalletData {
                 //    to Ready (or Error) before any realtime tick lands.
                 populate_all(&wallet, &wallet_client).await;
 
-                // 3. Wire realtime service.
-                let opensecret = match session_seeded_opensecret_client(&config).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        leptos::logging::log!(
-                            "WalletData::start: opensecret client build failed, \
-                             realtime disabled (initial populate stays): {e}"
-                        );
-                        return;
-                    }
+                // 3. Wire realtime service. The JWT source consumes the
+                //    SAME `Arc<dyn TokenProvider>` the facade installed
+                //    on its own `SupabaseStorage` (via
+                //    `WalletClient::token_provider()`) — one auth
+                //    surface in the process, no parallel
+                //    `OpenSecretClient`. See session-loading-full-shape
+                //    plan 2026-05-22, lane 5.
+                //
+                //    `from_config_async` always populates the token
+                //    provider; a `None` here would mean
+                //    `build_wallet_client` was swapped out for a
+                //    builder-direct path (test harness) without a
+                //    `.token_provider(...)` call. In production this is
+                //    unreachable; we log + skip realtime rather than
+                //    panic so the initial foreground populate still
+                //    stands.
+                let Some(tokens) = wallet_client.token_provider() else {
+                    leptos::logging::log!(
+                        "WalletData::start: wallet.token_provider() is None, \
+                         realtime disabled (initial populate stays)"
+                    );
+                    return;
                 };
-                let tokens: Arc<dyn TokenProvider> = Arc::new(
-                    agicash_auth_opensecret::OpenSecretTokenProvider::new(opensecret),
-                );
                 let jwt = Arc::new(TokenProviderJwtSource(tokens));
                 let factory = Arc::new(WasmTransportFactory);
 
@@ -757,7 +770,7 @@ impl WalletData {
                     }
                 };
                 self.user_id.set(Some(uid));
-                match build_wallet_client(&config, uid).await {
+                match build_wallet_client(&config).await {
                     Ok(c) => {
                         self.wallet_client.set(Some(std::sync::Arc::clone(&c)));
                         c
@@ -1053,60 +1066,6 @@ impl agicash_realtime::TransportFactory for WasmTransportFactory {
     }
 }
 
-/// Build an `OpenSecretClient` **with the persisted browser session
-/// threaded in** — the single fix for the "No refresh token available"
-/// wallet-load failure.
-///
-/// The `OpenSecret` SDK's `SessionManager` is purely in-memory and
-/// per-client (`Arc<RwLock<Option<TokenPair>>>`, all `None` on `new()`);
-/// token *persistence* lives separately in `BrowserSessionStorage`
-/// (`window.localStorage`). A bare `OpenSecretClient::new(..)` is
-/// therefore a clean slate with no refresh token, so the realtime JWT
-/// mint fails with "No refresh token available". Every token-provider
-/// construction site MUST re-seed the refresh token from
-/// `BrowserSessionStorage`; this helper is that seam (still used by the
-/// realtime JWT provider after the cache-consumer migration — storage
-/// reads route through the `WalletClient` facade instead).
-#[cfg(target_arch = "wasm32")]
-async fn session_seeded_opensecret_client(
-    config: &AppConfig,
-) -> Result<agicash_auth_opensecret::OpenSecretClient, String> {
-    use agicash_auth_opensecret::{
-        refresh, BrowserSessionStorage, OpenSecretClient, OpenSecretConfig,
-    };
-    use agicash_traits::SessionStorage;
-
-    let client = OpenSecretClient::new(OpenSecretConfig {
-        base_url: config.opensecret_base_url.clone(),
-        client_id: config.opensecret_client_id,
-    })
-    .map_err(|e| format!("build opensecret client: {e}"))?;
-
-    let session = match BrowserSessionStorage::new().load().await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Err(
-                "no persisted session — refresh token unavailable (please log in again)".into(),
-            )
-        }
-        Err(e) => return Err(format!("session load failed: {e}")),
-    };
-
-    client
-        .inner()
-        .set_tokens(String::new(), Some(session.refresh_token))
-        .map_err(|e| format!("seed refresh token failed: {e}"))?;
-
-    // Exchange the persisted refresh token for a fresh access token in
-    // THIS client's session manager. Without this the manager still has
-    // only the (now-stale-shaped) refresh token and no access token.
-    refresh(&client)
-        .await
-        .map_err(|e| format!("session refresh failed (re-login required): {e}"))?;
-
-    Ok(client)
-}
-
 /// Build a wasm-shell `AgicashWasmWallet` over the SAME composition core
 /// the FFI uses **and** thread the persisted browser session into its
 /// in-memory session slot.
@@ -1196,53 +1155,99 @@ async fn load_session_user_id() -> Result<Option<Uuid>, String> {
 ///   every tick.
 /// - The foreground populate path — initial bring-up + retry.
 ///
-/// `from_config` does NO network I/O at construction (verified by the
-/// `from_config_constructs_without_network` unit test in
-/// `crates/agicash-wallet/src/builder.rs`); `set_session` is the one
-/// async step (handshake + refresh exchange against the browser-
-/// persisted refresh token).
+/// Uses [`WalletClient::from_config_async`] with
+/// `SessionStorageChoice::Browser` so the persisted browser session is
+/// auto-loaded into the in-memory slot on the way out — no manual
+/// `BrowserSessionStorage.load() + set_session()` two-step. The
+/// session-loading-full-shape plan (2026-05-22) lane 5: the realtime JWT
+/// is now sourced from the SAME `wallet.token_provider()` `Arc` the
+/// facade installed on its `SupabaseStorage`.
+///
+/// **Failure policy (clear-on-stale):** if the auto-load step inside
+/// `from_config_async` fails on a stale refresh token / auth backend
+/// blip (`Unauthenticated` / `Auth { .. }` / `Network(_)`), this clears
+/// `BrowserSessionStorage` so the dead token isn't retried on the next
+/// page load and propagates the error to the caller (which surfaces it
+/// to `LoadState::Error`; `ProtectedLayout` then redirects to login on
+/// the next nav). Genuine env/wiring errors propagate without clearing.
+///
+/// Post-construction the wallet's session slot must be non-empty (the
+/// realtime JWT mint needs it). Empty post-`from_config_async` means
+/// the persisted session was cleared between `load_session_user_id()`
+/// and here (race) — surface a re-login error.
 #[cfg(target_arch = "wasm32")]
 async fn build_wallet_client(
     config: &AppConfig,
-    user_id: Uuid,
 ) -> Result<std::sync::Arc<agicash_wallet::WalletClient>, String> {
     use agicash_traits::SessionStorage;
-    use agicash_wallet::{Session, SessionStorageChoice, WalletClient, WalletConfig};
+    use agicash_wallet::{SessionStorageChoice, WalletClient, WalletConfig};
 
     if config.supabase_anon_key.is_empty() {
         return Err("Supabase anon key missing — wallet client skipped".to_string());
     }
 
-    let (wallet, _auth) = WalletClient::from_config(WalletConfig {
+    let make_cfg = || WalletConfig {
         opensecret_url: config.opensecret_base_url.clone(),
         opensecret_client_id: config.opensecret_client_id,
         supabase_url: config.supabase_url.clone(),
         supabase_anon_key: config.supabase_anon_key.clone(),
-        session_storage: SessionStorageChoice::InMemory,
-    })
-    .map_err(|e| format!("build wallet client: {e}"))?;
-
-    let refresh_token = match agicash_auth_opensecret::BrowserSessionStorage::new()
-        .load()
-        .await
-    {
-        Ok(Some(s)) => s.refresh_token,
-        Ok(None) => {
-            return Err(
-                "no persisted session — refresh token unavailable (please log in again)".into(),
-            )
-        }
-        Err(e) => return Err(format!("session load failed: {e}")),
+        session_storage: SessionStorageChoice::Browser,
     };
-    wallet
-        .set_session(Session {
-            user_id: agicash_domain::UserId::from(user_id),
-            refresh_token,
-        })
+
+    let (wallet, _auth) = match WalletClient::from_config_async(make_cfg()).await {
+        Ok(out) => out,
+        Err(e) if is_stale_session_error(&e) => {
+            // Stale persisted session (refresh token rejected, auth
+            // backend blip). Clear the browser session so a dead token
+            // isn't retried on the next page load — same shape as the
+            // CLI's `is_stale_session_error` + clear path
+            // (`7d1900ec`). The caller surfaces the error to
+            // `LoadState::Error`; `ProtectedLayout` redirects to login
+            // on the next nav.
+            if let Err(clear_err) = agicash_auth_opensecret::BrowserSessionStorage::new()
+                .clear()
+                .await
+            {
+                leptos::logging::log!(
+                    "build_wallet_client: could not clear stale session: {clear_err}"
+                );
+            }
+            return Err(format!("session refresh failed (re-login required): {e}"));
+        }
+        Err(e) => return Err(format!("build wallet client: {e}")),
+    };
+
+    // Verify the auto-load actually populated the session slot. If
+    // `BrowserSessionStorage.load()` returned `None` (race: persisted
+    // session cleared between `load_session_user_id()` and here),
+    // `from_config_async` returns Ok with an empty slot — but the
+    // realtime JWT mint downstream needs a session, so surface a
+    // re-login error here rather than failing opaquely later.
+    let status = wallet
+        .auth_status()
         .await
-        .map_err(|e| format!("seed wallet session: {e}"))?;
+        .map_err(|e| format!("auth status check failed: {e}"))?;
+    if !status.logged_in {
+        return Err(
+            "no persisted session — refresh token unavailable (please log in again)".into(),
+        );
+    }
 
     Ok(wallet)
+}
+
+/// Classify a `from_config_async` error as a stale-session failure (the
+/// persisted refresh token was rejected during auto-load) vs. a genuine
+/// env/wiring failure. Mirrors the CLI's `is_stale_session_error`
+/// (`composition.rs` @ `7d1900ec`) — only the former triggers
+/// `BrowserSessionStorage::clear()`.
+#[cfg(target_arch = "wasm32")]
+fn is_stale_session_error(e: &agicash_wallet::WalletError) -> bool {
+    use agicash_wallet::WalletError;
+    matches!(
+        e,
+        WalletError::Unauthenticated | WalletError::Auth { .. } | WalletError::Network(_)
+    )
 }
 
 /// Map each Cashu money-state enum to the uppercase string the DB
