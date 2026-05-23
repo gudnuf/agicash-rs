@@ -417,6 +417,41 @@ final class WalletViewModel {
         }
     }
 
+    /// Outcome shape for `makeReceiveFlow()`. Success carries a freshly
+    /// constructed [`ReceiveFlow`] handle the view drives via
+    /// `dispatch(_:)`; failure carries a presentation-ready string
+    /// already mapped through `ffiErrorMessage`.
+    ///
+    /// The handle is per-interaction — each tap of "Receive" gets a new
+    /// flow. The view owns the handle for its lifetime (`@State`); when
+    /// the view goes away the Rust side drops the inner service.
+    enum ReceiveFlowOutcome {
+        case success(ReceiveFlow)
+        case failure(String)
+    }
+
+    /// Construct a fresh [`ReceiveFlow`] handle for an interactive Cashu
+    /// receive. Mirrors React's `useReceiveCashuTokenAccounts` +
+    /// `claimTokenMutation` pair (`app/features/receive/receive-cashu-token.tsx`)
+    /// — the React code builds an unknown-mint placeholder synchronously
+    /// and persists it on claim-click; the Rust state machine encodes
+    /// that branching in `NeedsMintConfirmation` → `ConfirmAddMint` →
+    /// `AddingMint` → `Swapping` → `Done`.
+    ///
+    /// The view calls this once per receive interaction (one tap of
+    /// "Receive") and holds the returned handle for the duration of the
+    /// flow.
+    func makeReceiveFlow() async -> ReceiveFlowOutcome {
+        do {
+            let flow = try await wallet.receiveFlow()
+            return .success(flow)
+        } catch let err as FfiError {
+            return .failure(ffiErrorMessage(err))
+        } catch {
+            return .failure("unexpected: \(error)")
+        }
+    }
+
     /// Outcome shape for `startLightningQuote`. Success carries the FFI
     /// handle (BOLT-11, quote_id, amount, fee, expires_at) so the
     /// LightningReceiveView can render the QR + breakdown directly;
