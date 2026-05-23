@@ -13,16 +13,20 @@ import SwiftUI
 /// See `DesignSystem/Color+Theme.swift`, `Spacing.swift`, `Radius.swift`,
 /// `Typography.swift` for the full surface.
 enum AppTheme {
-    static let background = Color.brandBackground
-    static let card = Color.brandCard
-    static let muted = Color.brandMuted
-    static let foreground = Color.brandForeground
-    static let mutedForeground = Color.brandMutedForeground
-    static let tertiaryForeground = Color.brandTertiaryForeground
-    static let border = Color.brandBorder
-    static let destructive = Color.brandDestructive
-    static let primary = Color.brandPrimary
-    static let primaryForeground = Color.brandPrimaryForeground
+    // Computed properties so each access resolves against the current
+    // `ThemeStore.shared` state. The `Color.brand*` accessors are themselves
+    // computed; making these `static let` would freeze the first resolved
+    // value across later theme changes.
+    static var background: Color { Color.brandBackground }
+    static var card: Color { Color.brandCard }
+    static var muted: Color { Color.brandMuted }
+    static var foreground: Color { Color.brandForeground }
+    static var mutedForeground: Color { Color.brandMutedForeground }
+    static var tertiaryForeground: Color { Color.brandTertiaryForeground }
+    static var border: Color { Color.brandBorder }
+    static var destructive: Color { Color.brandDestructive }
+    static var primary: Color { Color.brandPrimary }
+    static var primaryForeground: Color { Color.brandPrimaryForeground }
 
     /// `Radius.card` (8pt) — kept for backward compatibility.
     static let cardCornerRadius: CGFloat = Radius.card

@@ -4,6 +4,12 @@ import SwiftUI
 @main
 struct AgicashApp: App {
     @State private var walletState: WalletState
+    /// Runtime theme axes (currency track × color mode). Default
+    /// `(track: .btc, mode: .light)` matches React's `defaultTheme = 'btc'`
+    /// boot — the home screen first paint is deep BTC-blue, not white.
+    /// Injected through `EnvironmentValues.theme`; the user-facing switcher
+    /// + persistence land in a follow-up lane.
+    @State private var theme = ThemeEnvironment(track: .btc, mode: .light)
     /// Tracks reachability via `NWPathMonitor` and forwards online/offline
     /// transitions into the wallet's realtime supervisor (audit
     /// `2026-05-19-realtime-parity.md` Gap-E). Started once at app launch
@@ -24,6 +30,14 @@ struct AgicashApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(state: walletState)
+                .environment(\.theme, theme)
+                // Force a full SwiftUI re-evaluation when the theme axes
+                // change. The `Color.brand*` accessors read from the
+                // global `ThemeStore`, not from observed state, so we use
+                // the theme's hash signature as the view identity. On a
+                // flip the whole tree is reconstructed and re-reads the
+                // new palette. No-op while the axes stay at their defaults.
+                .id(theme.signature)
                 .task { await walletState.bootstrap() }
                 .task {
                     // Drive the reachability stream for the wallet's
