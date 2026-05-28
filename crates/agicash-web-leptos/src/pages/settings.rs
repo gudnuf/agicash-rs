@@ -40,7 +40,7 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
 use crate::app::AccessToken;
-use crate::components::WalletData;
+use crate::components::{ColorModeToggle, WalletData};
 use crate::config::AppConfig;
 use crate::tokens;
 
@@ -125,6 +125,14 @@ pub fn SettingsIndexPage() -> impl IntoView {
             >
                 {move || if is_working.get() { "Signing out…" } else { "Sign Out" }}
             </button>
+
+            // Color-mode switcher — mirrors React's `<ColorModeToggle />` in
+            // the settings `PageFooter` (`app/features/settings/settings.tsx`),
+            // placed below Sign Out. Light / dark / system; persisted via
+            // cookie. Centered like the iOS `ColorModePicker` footer slot.
+            <div style=toggle_row_style()>
+                <ColorModeToggle/>
+            </div>
         </div>
     }
 }
@@ -134,12 +142,28 @@ pub fn SettingsProfilePage() -> impl IntoView {
     settings_stub("Profile", "Edit display name and email.")
 }
 
+/// `/settings/appearance` — mirrors React `app/features/settings/appearance.tsx`:
+/// a header, the current color-mode label, and the `ColorModeToggle`.
 #[component]
 pub fn SettingsAppearancePage() -> impl IntoView {
-    settings_stub(
-        "Appearance",
-        "Light / dark / system theme switcher lands here (Phase 2).",
-    )
+    let theme = expect_context::<crate::components::ThemeState>();
+    view! {
+        <div style=page_style()>
+            <header style=header_style()>
+                <A href="/settings">
+                    <span style=link_style()>"← Settings"</span>
+                </A>
+                <h1 style=heading_style()>"Appearance"</h1>
+                <span/>
+            </header>
+            // React renders `<p>Theme: {colorMode}</p>` (the raw color-mode
+            // value); we mirror it with the capitalized label.
+            <p style=subtle_style()>
+                {move || format!("Theme: {}", theme.color_mode.get().label())}
+            </p>
+            <ColorModeToggle/>
+        </div>
+    }
 }
 
 #[component]
@@ -301,6 +325,13 @@ fn row_style() -> String {
 
 fn chevron_style() -> String {
     format!("color:{};", tokens::COLOR_MUTED_FOREGROUND)
+}
+
+fn toggle_row_style() -> String {
+    format!(
+        "display:flex; justify-content:center; margin-top:{};",
+        tokens::SPACE_L,
+    )
 }
 
 fn signout_button_style(is_working: bool) -> String {

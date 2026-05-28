@@ -6,6 +6,8 @@
 //!   - L3 (primitives): `button`, `numpad`, `sheet`, `share`, `toast`, `currency_toggle`.
 //!   - L4 (receive-token): `cashu_token_paste_view`.
 //!   - L5 (send-token): `send_cashu_view` — Cashu send state machine.
+//!   - L6 (theme switcher): `theme` — runtime body-class swap + cookie
+//!     persistence + the `ColorModeToggle` settings switcher.
 //!
 //! Phase 1 partial ships:
 //! - [`LoginView`] — three-option login chooser (slice 2).
@@ -38,6 +40,7 @@ mod realtime_status_banner;
 mod send_cashu_view;
 mod share_sheet;
 mod sheet;
+mod theme;
 mod toast;
 mod wallet_context;
 
@@ -52,6 +55,7 @@ pub use realtime_status_banner::RealtimeStatusBanner;
 pub use send_cashu_view::SendCashuView;
 pub use share_sheet::{SharePayload, ShareSheet};
 pub use sheet::Sheet;
+pub use theme::{provide_theme, ColorMode, ColorModeToggle, ThemeState, Track};
 pub use toast::{
     use_toast, ToastEntry, ToastHandle, ToastProvider, ToastVariant, DEFAULT_DURATION_MS,
 };
