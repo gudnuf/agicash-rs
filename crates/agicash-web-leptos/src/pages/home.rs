@@ -1,32 +1,39 @@
 //! `/` — protected home route.
 //!
-//! Mirrors iOS `HomeView` (`ios/Agicash/Agicash/HomeView.swift`) which
-//! is the design source of truth, cross-checked against the React
-//! reference `app/routes/_protected._index.tsx` from the archived
-//! react-web-app branch:
+//! Structural mirror of React `app/routes/_protected._index.tsx` (the
+//! design source of truth for all GUI clients), cross-checked against
+//! iOS `HomeView` (`ios/Agicash/Agicash/HomeView.swift`):
 //!
 //! ```text
 //!   ┌─────────────────────────────┐
+//!   │ 🎁  ⛶              🕐  👤  │  ← PageHeader (4 lucide nav icons)
 //!   │                             │
 //!   │           $ 0               │  ← BalanceHero
 //!   │       ≈ 0 sats              │
 //!   │                             │
-//!   │      [    Receive   ]       │  ← HomeActionGrid
-//!   │      [    Send      ]       │     (Secondary / Primary)
+//!   │   [ Receive ] [   Buy   ]   │  ← HomeActionGrid: 2-col then 1
+//!   │   [        Send         ]   │     (Receive+Buy secondary, Send primary)
 //!   │                             │
 //!   └─────────────────────────────┘
 //! ```
 //!
 //! Auth guard lives in `ProtectedLayout`; this view only renders
-//! content. Bottom nav and the surrounding shell come from the parent
-//! layout too. The home page focuses on three things:
+//! content (the protected shell supplies `bg-background`, the realtime
+//! banner, and the bottom nav). The home page focuses on:
 //!
 //! 1. Triggering the wallet refresh on mount.
-//! 2. Rendering the balance hero from whatever load state the wallet
+//! 2. Rendering the page-header chrome — gift / scan / transactions /
+//!    settings nav icons in the React left/right slots, via the
+//!    [`PageHeader`](crate::components::PageHeader) primitive.
+//! 3. Rendering the balance hero from whatever load state the wallet
 //!    context is in (Idle / Loading → spinner; Ready → real numbers;
-//!    Error → inline message + retry).
-//! 3. Rendering the two primary CTAs (Receive / Send) using the L3
-//!    `Button` component, wrapped in client-side `<A/>` links.
+//!    Error → inline message + retry), inside
+//!    [`PageContent`](crate::components::PageContent).
+//! 4. Rendering the action grid: Receive + Buy side-by-side (secondary),
+//!    Send full-width below (primary), matching React's
+//!    `grid grid-cols-2` + full-width Send. Each Receive/Send wraps a
+//!    client-side `<A/>` link; Buy is unimplemented (external) and fires
+//!    a "coming soon" toast.
 //!
 //! ## Data source
 //!
@@ -37,24 +44,24 @@
 //! with actual accounts and this page picks up the numbers reactively
 //! with no edits required here.
 //!
-//! ## Deviations from the lane brief
+//! ## Deviations from React
 //!
-//! - **No account carousel.** Both iOS and the React reference keep
-//!   accounts off home — iOS dropped the carousel intentionally
-//!   (`HomeView.swift` comment: "Web does NOT render an accounts list
-//!   on home — accounts live under `/settings/accounts`."), and React
-//!   shows balance + buttons only. We follow the design source.
-//! - **No recent activity list.** Neither reference renders one; the
-//!   React app links to a separate `/transactions` route from a header
-//!   icon. Skipping cleanly per the brief's "If not, omit cleanly."
-//! - **No header icons (gift cards, scan, transactions, settings).**
-//!   Each is owned by a separate lane / slice.
+//! - **No account carousel / recent-activity list.** Neither React nor
+//!   iOS renders one on home; accounts live under `/settings/accounts`
+//!   and activity behind the transactions header icon.
+//! - **No `MoneyWithConvertedAmount` / `DefaultCurrencySwitcher` /
+//!   `InstallPwaPrompt`.** Those React features are owned by other
+//!   slices; the structural shell (header chrome + action grid) is what
+//!   this lane brings to parity.
 
 use leptos::either::Either;
 use leptos::prelude::*;
 use leptos_router::components::A;
 
-use crate::components::{AccountSummary, Button, ButtonSize, ButtonVariant, LoadState, WalletData};
+use crate::components::{
+    use_toast, AccountSummary, Button, ButtonSize, ButtonVariant, ClockIcon, GiftIcon, LoadState,
+    PageContent, PageHeader, PageHeaderItem, ScanIcon, ToastVariant, UserCircleIcon, WalletData,
+};
 use crate::config::AppConfig;
 use crate::tokens;
 
@@ -109,15 +116,57 @@ pub fn HomePage() -> impl IntoView {
 
     let accounts = wallet.accounts;
 
-    // Page shell is now Tailwind v4. iOS uses Spacing.hero (48px) above
-    // the hero and Spacing.xxl (24px) below; side padding matches the L
-    // (16px) default. Tailwind's `pt-12` = 48px, `pb-6` = 24px, `px-4`
-    // = 16px; `gap-8` = 32px (= Spacing.xxxl). The space-between layout
-    // pushes the action grid toward the bottom of the available area
-    // while the hero floats up.
+    // Layout note: the outer app frame (`h-dvh`, `bg-background`,
+    // realtime banner, bottom nav) is owned by `ProtectedLayout`, which
+    // already renders us inside a `flex flex-col flex-1` content area.
+    // So we do NOT use React's top-level `<Page>` frame here (that would
+    // double up the `h-dvh` sizing inside an already-sized container);
+    // we render `<PageHeader>` + `<PageContent>` directly, exactly the
+    // two children React's `<Page>` wraps on home.
+    //
+    // The header mirrors React's slot layout: left = gift + scan
+    // (`flex gap-6`), right = transactions + settings (`flex gap-6`),
+    // each icon a client-side `<A/>` carrying `text-muted-foreground`.
+    //
+    // `PageContent` mirrors React's home content classes
+    // (`mx-auto items-center justify-between pt-20 sm:justify-center
+    //  sm:gap-32 sm:py-0`) so the hero floats up and the action grid
+    // sinks toward the bottom on mobile, centered on wide viewports.
 
     view! {
-        <div class="flex flex-col items-center justify-between flex-1 pt-12 px-4 pb-6 gap-8">
+        <PageHeader
+            class="z-10 px-4"
+            left=move || view! {
+                <PageHeaderItem class="flex gap-6">
+                    <A href="/gift-cards">
+                        <span class="text-muted-foreground">
+                            <GiftIcon/>
+                        </span>
+                    </A>
+                    <A href="/scan">
+                        <span class="text-muted-foreground">
+                            <ScanIcon/>
+                        </span>
+                    </A>
+                </PageHeaderItem>
+            }
+            right=move || view! {
+                <PageHeaderItem class="flex gap-6">
+                    <A href="/transactions">
+                        <span class="text-muted-foreground">
+                            <ClockIcon/>
+                        </span>
+                    </A>
+                    <A href="/settings">
+                        <span class="text-muted-foreground">
+                            <UserCircleIcon/>
+                        </span>
+                    </A>
+                </PageHeaderItem>
+            }
+        />
+
+        <PageContent class="mx-auto items-center justify-between pt-20 sm:justify-center sm:gap-32 sm:py-0">
             {move || match accounts.get() {
                 LoadState::Idle | LoadState::Loading => {
                     Either::Left(view! { <BalanceLoading/> })
@@ -135,7 +184,7 @@ pub fn HomePage() -> impl IntoView {
             }}
 
             <HomeActionGrid/>
-        </div>
+        </PageContent>
     }
 }
 
@@ -259,28 +308,46 @@ where
 
 // ---- Action grid ----------------------------------------------------------
 
-/// Receive + Send vertical stack. Caps at 288px to match iOS
-/// `HomeActionGrid.frame(maxWidth: 288)`. Each button is wrapped in
-/// the leptos_router `<A/>` so navigation stays client-side.
+/// `[Receive | Buy]` then full-width `Send`. Mirrors React's home grid:
+/// an outer `flex w-72 flex-col gap-4`, an inner `grid grid-cols-2 gap-4`
+/// for Receive + Buy side-by-side (both `secondary`), and Send full-width
+/// below (`default`/primary). `w-72` (288px) matches the iOS
+/// `HomeActionGrid.frame(maxWidth: 288)` cap.
+///
+/// Receive and Send wrap a leptos_router `<A/>` so navigation stays
+/// client-side. Buy is an external/unimplemented flow in React (links to
+/// `/buy` → Cash App); here it fires a "coming soon" toast instead of
+/// navigating to a route this rewrite doesn't yet own.
 #[component]
 fn HomeActionGrid() -> impl IntoView {
-    let column_style = format!(
-        "display:flex; flex-direction:column; gap:{}; width:100%; max-width:288px;",
-        tokens::SPACE_L,
-    );
+    let toast = use_toast();
+    let on_buy = Callback::new(move |_| {
+        toast.push("Buy is coming soon", ToastVariant::Info);
+    });
 
     view! {
-        <div style=column_style>
-            // Receive — Secondary (outlined) per iOS BrandButton variant.
-            // Links to `/receive` parent; the receive lane owns the
-            // carousel that fans out to `/receive/cashu` etc.
-            <A href="/receive">
-                <Button variant=ButtonVariant::Secondary size=ButtonSize::Large>
-                    "Receive"
+        <div class="flex w-72 flex-col gap-4">
+            <div class="grid grid-cols-2 gap-4">
+                // Receive — Secondary (outlined). Links to `/receive`
+                // parent; the receive lane owns the carousel that fans
+                // out to `/receive/cashu` etc.
+                <A href="/receive">
+                    <Button variant=ButtonVariant::Secondary size=ButtonSize::Large>
+                        "Receive"
+                    </Button>
+                </A>
+                // Buy — Secondary (outlined). External/unimplemented; a
+                // toast stands in for the React `/buy` (Cash App) route.
+                <Button
+                    variant=ButtonVariant::Secondary
+                    size=ButtonSize::Large
+                    on_click=on_buy
+                >
+                    "Buy"
                 </Button>
-            </A>
-            // Send — Primary (solid). Links to `/send` placeholder
-            // route; the send-flow lane owns the page.
+            </div>
+            // Send — Primary (solid), full width. Links to `/send`; the
+            // send-flow lane owns the page.
             <A href="/send">
                 <Button variant=ButtonVariant::Primary size=ButtonSize::Large>
                     "Send"

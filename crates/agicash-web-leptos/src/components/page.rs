@@ -75,13 +75,13 @@ pub fn PageHeader(
     #[prop(into, optional)]
     class: Option<String>,
     /// Left-aligned slot (`justify-self-start`).
-    #[prop(optional)]
+    #[prop(optional, into)]
     left: Option<ViewFn>,
     /// Center slot (`justify-self-center`).
-    #[prop(optional)]
+    #[prop(optional, into)]
     center: Option<ViewFn>,
     /// Right-aligned slot (`justify-self-end`, `gap-2`).
-    #[prop(optional)]
+    #[prop(optional, into)]
     right: Option<ViewFn>,
 ) -> impl IntoView {
     let base = "mb-4 grid h-7 w-full grid-cols-[1fr_auto_1fr] items-center";
@@ -89,13 +89,13 @@ pub fn PageHeader(
     view! {
         <header class=class>
             <div class="flex items-center justify-self-start">
-                {left.map(ViewFn::run)}
+                {left.map(|v| v.run())}
             </div>
             <div class="flex items-center justify-self-center">
-                {center.map(ViewFn::run)}
+                {center.map(|v| v.run())}
             </div>
             <div class="flex items-center gap-2 justify-self-end">
-                {right.map(ViewFn::run)}
+                {right.map(|v| v.run())}
             </div>
         </header>
     }
