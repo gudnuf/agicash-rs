@@ -7,13 +7,18 @@ import SwiftUI
 ///   - SettingsNavButton stack: Edit profile, {default account name}, Contacts.
 ///   - Footer: Sign Out CTA, Terms / Privacy links.
 ///
-/// Web also renders a `ColorModeToggle` and a row of social icons (X, Nostr,
-/// GitHub, Discord) in the footer; both are out of scope for the iOS pass
-/// today. The Accounts row navigates to `AccountsView` (the iOS analogue of
-/// the web's `/settings/accounts` route) where the user manages mints and
-/// triggers the Add Mint flow.
+/// The footer also renders the `ColorModePicker` — the iOS analogue of web's
+/// `ColorModeToggle` (`app/features/theme/color-mode-toggle.tsx`), placed in
+/// the same footer slot. The row of social icons (X, Nostr, GitHub, Discord)
+/// remains out of scope for the iOS pass today. The Accounts row navigates to
+/// `AccountsView` (the iOS analogue of the web's `/settings/accounts` route)
+/// where the user manages mints and triggers the Add Mint flow.
 struct SettingsView: View {
     @Bindable var model: WalletViewModel
+
+    /// Live theme state. The color-mode picker writes through this; persistence
+    /// to `UserDefaults` happens inside `ThemeEnvironment`.
+    @Environment(\.theme) private var theme
 
     @State private var confirmingSignOut = false
 
@@ -35,6 +40,8 @@ struct SettingsView: View {
 
                     SettingsFooter(
                         isWorking: model.isWorking,
+                        colorMode: theme.colorMode,
+                        onSetColorMode: { theme.set(colorMode: $0) },
                         onSignOut: { confirmingSignOut = true }
                     )
                     .padding(.horizontal, Spacing.l)
@@ -150,9 +157,12 @@ private struct SettingsNavRow: View {
 }
 
 /// Web `PageFooter`: a Sign Out button in a centered `w-36` (144pt) column,
-/// then a row of "Terms & Privacy" links underneath in muted text.
+/// then the `ColorModeToggle`, then a row of "Terms & Privacy" links in muted
+/// text. We replicate the same stack order.
 private struct SettingsFooter: View {
     let isWorking: Bool
+    let colorMode: ColorMode
+    let onSetColorMode: (ColorMode) -> Void
     let onSignOut: () -> Void
 
     var body: some View {
@@ -164,6 +174,10 @@ private struct SettingsFooter: View {
                 action: onSignOut
             )
             .frame(maxWidth: 144) // matches `w-36` on web.
+
+            // Color-mode switcher — mirrors web's `<ColorModeToggle />` in the
+            // same footer slot.
+            ColorModePicker(colorMode: colorMode, onSelect: onSetColorMode)
 
             // `flex w-full justify-between text-muted-foreground text-sm`
             HStack {
@@ -180,5 +194,54 @@ private struct SettingsFooter: View {
             .frame(maxWidth: 144)
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+/// iOS analogue of web's `ColorModeToggle`
+/// (`app/features/theme/color-mode-toggle.tsx`): a button showing the current
+/// color-mode icon (Sun / Moon / SunMoon) that opens a menu of the three
+/// options (Light / Dark / System), each a labeled icon row. Selecting one
+/// calls `setColorMode`, persisted by `ThemeEnvironment`.
+///
+/// Option set matches React exactly: `colorModes = ['light','dark','system']`
+/// (`theme.constants.ts`). SF Symbols chosen to mirror lucide's Sun / Moon /
+/// SunMoon used on web.
+private struct ColorModePicker: View {
+    let colorMode: ColorMode
+    let onSelect: (ColorMode) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(ColorMode.allCases, id: \.self) { mode in
+                Button {
+                    onSelect(mode)
+                } label: {
+                    Label(label(for: mode), systemImage: symbol(for: mode))
+                }
+            }
+        } label: {
+            Image(systemName: symbol(for: colorMode))
+                .font(.brandBody)
+                .foregroundStyle(Color.brandForeground)
+                .frame(width: 44, height: 44) // tap target; icon-only like web.
+                .accessibilityLabel("Current color mode: \(label(for: colorMode)). Tap to switch.")
+        }
+    }
+
+    /// Mirror lucide `Sun` / `Moon` / `SunMoon`.
+    private func symbol(for mode: ColorMode) -> String {
+        switch mode {
+        case .light: return "sun.max"
+        case .dark: return "moon"
+        case .system: return "circle.lefthalf.filled"
+        }
+    }
+
+    private func label(for mode: ColorMode) -> String {
+        switch mode {
+        case .light: return "Light"
+        case .dark: return "Dark"
+        case .system: return "System"
+        }
     }
 }

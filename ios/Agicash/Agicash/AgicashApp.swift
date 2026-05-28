@@ -4,12 +4,17 @@ import SwiftUI
 @main
 struct AgicashApp: App {
     @State private var walletState: WalletState
-    /// Runtime theme axes (currency track × color mode). Default
-    /// `(track: .btc, mode: .light)` matches React's `defaultTheme = 'btc'`
-    /// boot — the home screen first paint is deep BTC-blue, not white.
-    /// Injected through `EnvironmentValues.theme`; the user-facing switcher
-    /// + persistence land in a follow-up lane.
-    @State private var theme = ThemeEnvironment(track: .btc, mode: .light)
+    /// Runtime theme axes (currency track × color-mode preference). On first
+    /// launch defaults to `(track: .btc, colorMode: .system)`, matching React's
+    /// `defaultTheme = 'btc'` + `defaultColorMode = 'system'`. After the first
+    /// launch the persisted selection is rehydrated from `UserDefaults`.
+    /// Injected through `EnvironmentValues.theme`; the user-facing color-mode
+    /// switcher lives in `SettingsView`.
+    @State private var theme = ThemeEnvironment()
+    /// The OS color scheme, fed into `theme.systemColorMode` so a `.system`
+    /// color-mode preference resolves against the live appearance and tracks
+    /// OS light/dark changes at runtime.
+    @Environment(\.colorScheme) private var colorScheme
     /// Tracks reachability via `NWPathMonitor` and forwards online/offline
     /// transitions into the wallet's realtime supervisor (audit
     /// `2026-05-19-realtime-parity.md` Gap-E). Started once at app launch
@@ -38,6 +43,12 @@ struct AgicashApp: App {
                 // flip the whole tree is reconstructed and re-reads the
                 // new palette. No-op while the axes stay at their defaults.
                 .id(theme.signature)
+                // Mirror the OS appearance into the theme so `.system` color
+                // mode resolves correctly at boot and tracks live OS changes.
+                .onAppear { theme.systemColorMode = (colorScheme == .dark ? .dark : .light) }
+                .onChange(of: colorScheme, initial: false) { _, newValue in
+                    theme.systemColorMode = (newValue == .dark ? .dark : .light)
+                }
                 .task { await walletState.bootstrap() }
                 .task {
                     // Drive the reachability stream for the wallet's
