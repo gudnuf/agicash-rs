@@ -126,6 +126,12 @@ web-sys = { version = "0.3", features = [
     "Storage",
     "ShareData",
     "VisibilityState",
+    # Theme switcher (L6): `HtmlDocument` for cookie get/set, `HtmlElement`
+    # for the `<body>` class swap, `MediaQueryList` for the
+    # `prefers-color-scheme` listener.
+    "HtmlDocument",
+    "HtmlElement",
+    "MediaQueryList",
 ] }
 
 # `getrandom` for the throwaway guest-registration password. Wasm

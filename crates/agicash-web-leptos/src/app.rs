@@ -13,7 +13,7 @@ use leptos_router::{
     path, StaticSegment,
 };
 
-use crate::components::{ProtectedLayout, ToastProvider, WalletData};
+use crate::components::{provide_theme, ProtectedLayout, ToastProvider, WalletData};
 use crate::config::AppConfig;
 use crate::pages::{
     AccountsAddPage, AccountsIndexPage, HomePage, LoginPage, ReceiveCashuPage, ReceivePage,
@@ -73,6 +73,16 @@ pub fn App() -> impl IntoView {
     // Provided as a single context so LoginView + WalletData::refresh
     // (and future consumers) can read the same values.
     provide_context(AppConfig::load());
+
+    // Theme runtime (L6): provide the reactive `ThemeState` (read from
+    // cookies, default `btc` + `system` per React) and install the
+    // body-class swap + cookie-persistence effects + the
+    // `prefers-color-scheme` listener. Called inside the `App` owner so the
+    // effects/context are rooted correctly. `index.html` boots
+    // `<body class="btc">`; this takes over the class on first paint and on
+    // every change. The user-facing switcher is `ColorModeToggle` in the
+    // settings footer (mirrors React's `app/features/theme/` feature).
+    provide_theme();
 
     // Empty on first paint — the LoginView reads + writes this; protected
     // routes redirect to /login when it's None.
