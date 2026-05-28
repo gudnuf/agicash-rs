@@ -93,6 +93,8 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
+    // DataStore (Preferences) — persists the user's theme selection.
+    implementation(libs.androidx.datastore.preferences)
     implementation(libs.jna) { artifact { type = "aar" } }
     // Kotlin classes that the Rust `rustls-platform-verifier` crate invokes
     // via JNI to walk the system trust store. Without this AAR on the
