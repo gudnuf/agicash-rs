@@ -38,6 +38,7 @@ import com.makeprisms.agicash.ui.screens.LoginScreen
 import com.makeprisms.agicash.ui.screens.ReceiveCarouselScreen
 import com.makeprisms.agicash.ui.screens.SendCarouselScreen
 import com.makeprisms.agicash.ui.screens.SettingsScreen
+import com.makeprisms.agicash.ui.theme.ThemeViewModel
 import com.makeprisms.agicash.wallet.WalletViewModel
 
 /**
@@ -46,17 +47,21 @@ import com.makeprisms.agicash.wallet.WalletViewModel
  * signed-in surface.
  */
 @Composable
-fun AgicashRoot(viewModel: WalletViewModel) {
+fun AgicashRoot(viewModel: WalletViewModel, themeViewModel: ThemeViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     when (val s = state) {
         is WalletViewModel.BootState.Pending -> CenteredSpinner("Starting Agicash...")
         is WalletViewModel.BootState.Failed -> FatalErrorView(s.message)
-        is WalletViewModel.BootState.Ready -> AuthGate(viewModel, s.phase)
+        is WalletViewModel.BootState.Ready -> AuthGate(viewModel, themeViewModel, s.phase)
     }
 }
 
 @Composable
-private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
+private fun AuthGate(
+    viewModel: WalletViewModel,
+    themeViewModel: ThemeViewModel,
+    phase: WalletViewModel.Phase,
+) {
     when (phase) {
         is WalletViewModel.Phase.SignedOut -> LoginScreen(viewModel)
         is WalletViewModel.Phase.SignedIn -> {
@@ -66,7 +71,7 @@ private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
             // measures identically to today on the happy path.
             Column(Modifier.fillMaxSize()) {
                 RealtimeStatusBanner(viewModel)
-                Box(Modifier.weight(1f)) { SignedInShell(viewModel) }
+                Box(Modifier.weight(1f)) { SignedInShell(viewModel, themeViewModel) }
             }
         }
         is WalletViewModel.Phase.Error -> ErrorView(viewModel, phase.message)
@@ -84,7 +89,7 @@ private fun AuthGate(viewModel: WalletViewModel, phase: WalletViewModel.Phase) {
  * top-level Home screen — same iOS feel.
  */
 @Composable
-private fun SignedInShell(viewModel: WalletViewModel) {
+private fun SignedInShell(viewModel: WalletViewModel, themeViewModel: ThemeViewModel) {
     // Receive / Send are presented as full-screen overlays over the
     // bottom-tab shell. iOS presents them as `.sheet`s from HomeView;
     // this app already established full-screen-route-over-sheet as the
@@ -138,7 +143,7 @@ private fun SignedInShell(viewModel: WalletViewModel) {
                     onReceive = { overlay = Overlay.RECEIVE },
                     onSend = { overlay = Overlay.SEND },
                 )
-                Tab.SETTINGS -> SettingsTabHost(viewModel)
+                Tab.SETTINGS -> SettingsTabHost(viewModel, themeViewModel)
             }
         }
     }
@@ -153,12 +158,13 @@ private enum class Overlay { NONE, RECEIVE, SEND }
  *   - addMint   — Accounts → Add Mint (full-screen here vs iOS sheet)
  */
 @Composable
-private fun SettingsTabHost(viewModel: WalletViewModel) {
+private fun SettingsTabHost(viewModel: WalletViewModel, themeViewModel: ThemeViewModel) {
     val nav = rememberNavController()
     NavHost(navController = nav, startDestination = "settings") {
         composable("settings") {
             SettingsScreen(
                 viewModel = viewModel,
+                themeViewModel = themeViewModel,
                 onOpenAccounts = { nav.navigate("accounts") },
             )
         }

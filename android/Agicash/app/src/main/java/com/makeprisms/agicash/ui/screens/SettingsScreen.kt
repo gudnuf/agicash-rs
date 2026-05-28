@@ -45,7 +45,10 @@ import com.makeprisms.agicash.ui.theme.BrandButton
 import com.makeprisms.agicash.ui.theme.BrandButtonVariant
 import com.makeprisms.agicash.ui.theme.BrandColors
 import com.makeprisms.agicash.ui.theme.BrandTypography
+import com.makeprisms.agicash.ui.theme.ColorMode
+import com.makeprisms.agicash.ui.theme.ColorModeToggle
 import com.makeprisms.agicash.ui.theme.Spacing
+import com.makeprisms.agicash.ui.theme.ThemeViewModel
 import com.makeprisms.agicash.wallet.WalletViewModel
 
 /**
@@ -55,7 +58,10 @@ import com.makeprisms.agicash.wallet.WalletViewModel
  *   - `SettingsNavStack`  — three rows: Edit profile, Accounts (the
  *     only wired destination), Contacts.
  *   - `SettingsFooter`    — Sign Out CTA in a centered 144dp column,
- *     plus a Terms / & / Privacy footer line.
+ *     the color-mode switcher below it, plus a Terms / & / Privacy line.
+ *     Mirrors React's `Settings` PageFooter (`app/features/settings/
+ *     settings.tsx`) which stacks Sign Out → `<ColorModeToggle />` → the
+ *     Terms/Privacy row.
  *
  * The Accounts row navigates via `onOpenAccounts`. The shell
  * (`AgicashRoot`) wires that into the NavHost so a back tap returns
@@ -65,11 +71,13 @@ import com.makeprisms.agicash.wallet.WalletViewModel
 @Composable
 fun SettingsScreen(
     viewModel: WalletViewModel,
+    themeViewModel: ThemeViewModel,
     onOpenAccounts: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val accounts by viewModel.accounts.collectAsStateWithLifecycle()
     val isWorking by viewModel.isWorking.collectAsStateWithLifecycle()
+    val theme by themeViewModel.selection.collectAsStateWithLifecycle()
     var confirmingSignOut by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) { viewModel.refreshAccounts() }
@@ -107,6 +115,8 @@ fun SettingsScreen(
             Spacer(Modifier.height(Spacing.xxl))
             SettingsFooter(
                 isWorking = isWorking,
+                colorMode = theme.mode,
+                onColorModeSelect = themeViewModel::setColorMode,
                 onSignOut = { confirmingSignOut = true },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -239,11 +249,15 @@ private fun SettingsNavRow(
 
 /**
  * iOS `SettingsFooter`: Sign Out button in a 144dp centered column,
- * Terms / & / Privacy line below in muted text.
+ * the color-mode switcher below it, then a Terms / & / Privacy line in
+ * muted text. Matches React's `Settings` PageFooter order: Sign Out →
+ * ColorModeToggle → Terms/Privacy (`app/features/settings/settings.tsx`).
  */
 @Composable
 private fun SettingsFooter(
     isWorking: Boolean,
+    colorMode: ColorMode,
+    onColorModeSelect: (ColorMode) -> Unit,
     onSignOut: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -258,6 +272,11 @@ private fun SettingsFooter(
             variant = BrandButtonVariant.Primary,
             isLoading = isWorking,
             modifier = Modifier.widthIn(max = 144.dp),
+        )
+
+        ColorModeToggle(
+            colorMode = colorMode,
+            onSelect = onColorModeSelect,
         )
 
         Row(
